@@ -2,6 +2,7 @@
 #include "luthien/Bootstrap.h"
 #include "luth/core/EditorHooks.h"
 #include "luth/core/types/LuthMath.h"
+#include "luth/core/diagnostics/Log.h"
 #include "luth/scene/Components.h"
 #include "luth/scene/Scene.h"
 #include "luthien/Editor.h"
@@ -72,6 +73,17 @@ namespace
             out.gridLineThickness = s.gridLineThickness;
 
             out.previewAnimationInEditor = s.previewAnimationInEditor;
+
+            out.physicsShapesSelected   = s.physicsShapesSelected;
+            out.physicsShapesAll        = s.physicsShapesAll;
+            out.physicsAABBsSelected    = s.physicsAABBsSelected;
+            out.physicsAABBsAll         = s.physicsAABBsAll;
+            out.physicsCoMSelected      = s.physicsCoMSelected;
+            out.physicsCoMAll           = s.physicsCoMAll;
+            out.physicsColorMode        = s.physicsColorMode;
+            out.physicsUniformColor     = s.physicsUniformColor;
+            out.physicsDebugSegments    = s.physicsDebugSegments;
+            out.physicsAlphaUnselected  = s.physicsAlphaUnselected;
         }
 
         // Play-mode state forwarded from PlayModeController
@@ -83,6 +95,13 @@ namespace
             if (auto* pp = Editor::GetPanel<ProjectPanel>())
                 return pp->GetCurrentDirectory();
             return {};
+        }
+
+        // Surface engine notices in the console panel; future work can route to a
+        // floating toast widget without touching the engine call site.
+        void OnFrameDebuggerNotice(const std::string& message) override
+        {
+            LH_CORE_INFO("[FrameDebugger] {}", message);
         }
 
         // Project launcher

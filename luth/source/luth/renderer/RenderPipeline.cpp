@@ -45,9 +45,7 @@ namespace Luth
 
     RenderPipeline::~RenderPipeline() = default;
 
-    // =========================================================================
-    //  Lifecycle — Initialize / Shutdown
-    // =========================================================================
+    // ── Lifecycle — Initialize / Shutdown ──
 
     void RenderPipeline::Initialize(u32 viewportWidth, u32 viewportHeight)
     {
@@ -59,6 +57,7 @@ namespace Luth
 
         BoneMatrixBuffer::Init();
         m_EditorOverlays.Init(*this);
+        m_DebugDraw.Init(*this);
         m_PostProcess.Init(*this);
 
         // Lighting owns Set 3 + shadow map + IBL + skybox VB/SPVs. Engine ships no HDR;
@@ -84,6 +83,7 @@ namespace Luth
         m_Lighting.BuildPipelines(geoLayouts);
         m_Geometry.BuildPipelines(geoLayouts);
         m_EditorOverlays.BuildPipelines(geoLayouts);
+        m_DebugDraw.BuildPipelines();
 
         m_GTAO.Init(*this);
 
@@ -122,7 +122,8 @@ namespace Luth
             // its outline/grid pipelines below.
             const bool ppHandled       = m_PostProcess.OnShaderReloaded(name, spv);
             const bool overlaysHandled = m_EditorOverlays.OnShaderReloaded(name, spv, geoLayouts);
-            if (handled || ppHandled || overlaysHandled)
+            const bool debugHandled    = m_DebugDraw.OnShaderReloaded(name, spv);
+            if (handled || ppHandled || overlaysHandled || debugHandled)
             {
                 if      (name == "debugBlit.frag")  m_System.GetFrameDebugger().blitFragSpv  = spv;
                 else if (name == "debugDepth.frag") m_System.GetFrameDebugger().depthFragSpv = spv;
@@ -169,6 +170,7 @@ namespace Luth
         m_System.GetFrameDebugger().Shutdown(device);
 
         // Subsystems own their layouts/pools/samplers/pipelines.
+        m_DebugDraw.Shutdown();
         m_EditorOverlays.Shutdown();
         m_PostProcess.Shutdown();
         m_GTAO.Shutdown();
@@ -267,6 +269,8 @@ namespace Luth
         RG::ResourceHandle finalOutput = view.drawSelectionOutline
                                          ? m_EditorOverlays.AddOutlinePass(rg, ldrOutput, maskOutput, geoOutput.depth)
                                          : ldrOutput;
+        if (view.drawDebugShapes)
+            finalOutput = m_DebugDraw.AddDebugDrawPass(rg, finalOutput);
         if (view.emitImGuiPass)
             AddImGuiPass(rg, finalOutput);
 
@@ -303,8 +307,8 @@ namespace Luth
         // capture source's RG installs the sink, not the editor's by default.
         if (view.captureRequested && m_System.GetFrameDebugger().state == DebuggerState::CaptureRequested)
         {
-            // Phase 14D — ensure the debug sampler exists for ImGui archive previews.
-            // Idempotent: returns immediately once blitPipeline is set.
+            // Ensure the debug sampler exists for ImGui archive previews. Idempotent — returns
+            // immediately once blitPipeline is already set.
             m_Debugger->InitDebugBlitResources();
 
             // Invalidate per-draw and depth preview caches. Cache keys are
@@ -319,11 +323,10 @@ namespace Luth
                                             VulkanContext::Get().GetAllocator());
             m_System.GetFrameDebugger().RegisterTrackedRT("SceneColor");
             m_System.GetFrameDebugger().RegisterTrackedRT("SceneDepth");
-            // Phase 13 ShadowPass imports per-cascade resources named
-            // "ShadowMap.C<i>" (one per cascade, single-layer view onto
-            // the shared 4-layer array). Track each variant so the sink
-            // archives them — without this, cascade nodes have no
-            // primary output and the panel shows "no output preview".
+            // ShadowPass imports per-cascade resources named "ShadowMap.C<i>" (one per cascade,
+            // each a single-layer view onto the shared 4-layer array). Track each variant so the
+            // sink archives them — without this, cascade nodes have no primary output and the
+            // panel shows "no output preview".
             for (u32 ci = 0; ci < k_ShadowCascadeCount; ++ci)
                 m_System.GetFrameDebugger().RegisterTrackedRT("ShadowMap.C" + std::to_string(ci));
             m_System.GetFrameDebugger().RegisterTrackedRT("LDROutput");
@@ -381,9 +384,8 @@ namespace Luth
         // Finalize capture (only the source view — matches the sink gate above).
         if (view.captureRequested && m_System.GetFrameDebugger().state == DebuggerState::CaptureRequested)
         {
-            // Phase 14C — captured*Draws / drawLimit removed.
-            // Per-draw replay (Phase 14E) re-derives draw inputs from the
-            // CapturedDrawCall records + frozen indirect/object SSBOs.
+            // captured*Draws / drawLimit are gone. Per-draw replay re-derives draw inputs from
+            // the CapturedDrawCall records together with the frozen indirect/object SSBOs.
 
             // Copy resource and timing info from the graph snapshot
             m_System.GetFrameDebugger().capturedFrame.resources      = m_GraphSnapshot.resources;
@@ -405,17 +407,45 @@ namespace Luth
             // auto-recapture comparison (see top of Update).
             m_System.GetFrameDebugger().FinalizeCapture(m_Global.GetCachedViewProj());
 
-            // Phase 14F — stamp CSM state into the captured frame so the
-            // cascade detail panel can show GPU-true values from the moment
-            // of capture, even if the user later twiddles light settings.
-            m_System.GetFrameDebugger().capturedFrame.cascadeSplitsViewZ = m_Global.GetCascades().splitsViewZ;
-            m_System.GetFrameDebugger().capturedFrame.shadowBias         = m_Global.GetShadowParams().shadowBias;
-            m_System.GetFrameDebugger().capturedFrame.shadowNormalBias   = m_Global.GetShadowParams().shadowNormalBias;
-            m_System.GetFrameDebugger().capturedFrame.cascadeTexelSize   = m_Global.GetCascades().texelSize;
+            // Stamp CSM state into the captured frame so the cascade detail panel always shows
+            // GPU-true values from the moment of capture, even if the user later twiddles light
+            // settings on the live editor side.
+            auto& cf = m_System.GetFrameDebugger().capturedFrame;
+            cf.cascadeSplitsViewZ = m_Global.GetCascades().splitsViewZ;
+            cf.shadowBias         = m_Global.GetShadowParams().shadowBias;
+            cf.shadowNormalBias   = m_Global.GetShadowParams().shadowNormalBias;
+            cf.cascadeTexelSize   = m_Global.GetCascades().texelSize;
             for (u32 i = 0; i < k_ShadowCascadeCount; ++i)
-                m_System.GetFrameDebugger().capturedFrame.lightSpaceMatrix[i] = m_Global.GetCascades().lightSpaceMatrix[i];
+                cf.lightSpaceMatrix[i] = m_Global.GetCascades().lightSpaceMatrix[i];
 
-            m_System.GetFrameDebugger().capturedFrame.valid = true;
+            // Snapshot captured-view metadata + Set 0 binding sources for replay.
+            // invariant: replay reads these instead of m_CurrentViewResources / live IBL
+            // textures, since the live state reflects whichever view ran last and IBL
+            // can change mid-Freeze.
+            cf.capturedView.targets         = view.targets;
+            cf.capturedView.viewResourcesId = m_CurrentViewResources ? m_CurrentViewResources->id : 0;
+            cf.capturedView.viewIndex       = view.viewIndex;
+            if (view.targets && view.targets->GetSceneColor())
+            {
+                cf.capturedView.width  = view.targets->GetSceneColor()->GetWidth();
+                cf.capturedView.height = view.targets->GetSceneColor()->GetHeight();
+            }
+            m_Global.GetLastUboBytes(cf.capturedGlobalUboBytes);
+            cf.capturedIrradiance     = m_Lighting.GetIrradianceMap();
+            cf.capturedPrefiltered    = m_Lighting.GetPrefilteredMap();
+            cf.capturedBRDF           = m_Lighting.GetBRDFLut();
+            cf.capturedGTAOFinal      = m_CurrentViewResources ? m_CurrentViewResources->gtaoFinal : nullptr;
+            cf.capturedIblIntensity   = view.camera.iblIntensity;
+            cf.capturedSkyboxIntensity = view.camera.skyboxIntensity;
+            // Resolve descendants once at capture; replay reads this without
+            // touching m_CurrentView (stack-allocated, dangles in Frozen).
+            {
+                std::unordered_set<entt::entity> resolved;
+                m_EditorOverlays.CollectSelectedHandles(view.camera.selectedEntities, resolved);
+                cf.capturedSelectionHandles.assign(resolved.begin(), resolved.end());
+            }
+
+            cf.valid = true;
             // Snapshot which source produced this capture so viewport overlays
             // survive the user toggling requestedSource between captures.
             m_System.GetFrameDebugger().capturedSource = m_System.GetFrameDebugger().requestedSource;
@@ -589,19 +619,13 @@ namespace Luth
         if (m_Lighting.GetBRDFLut())        m_NamedTextures["BRDF_LUT"]       = m_Lighting.GetBRDFLut();
     }
 
-    // =========================================================================
-    // Main Update
-    // =========================================================================
-
     std::shared_ptr<Texture> RenderPipeline::GetNamedTexture(const std::string& name) const
     {
         auto it = m_NamedTextures.find(name);
         return (it != m_NamedTextures.end()) ? it->second : nullptr;
     }
 
-    // =========================================================================
-    //  Frame debugger — forwarders into FrameDebuggerContext
-    // =========================================================================
+    // ── Frame debugger — forwarders into FrameDebuggerContext ──
 
     VkImageView RenderPipeline::GetPerDrawPreviewView()  const { return m_Debugger->GetPerDrawPreviewView(); }
     u64         RenderPipeline::GetPerDrawPreviewKey()   const { return m_Debugger->GetPerDrawPreviewKey(); }
@@ -622,9 +646,7 @@ namespace Luth
         m_Debugger->BlitArchivedDepthToPreview(archiveIdx, layer, nearZ, farZ);
     }
 
-    // =========================================================================
-    //  Public-API forwarders into subsystems (preserve caller compat)
-    // =========================================================================
+    // ── Public-API forwarders into subsystems (preserve caller compat) ──
 
     void RenderPipeline::UpdateGlobalUniforms(const CameraParams& camera,
                                               const CascadeData& cascades,

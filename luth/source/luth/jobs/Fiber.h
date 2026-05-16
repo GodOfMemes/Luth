@@ -19,7 +19,7 @@
 
 namespace Luth::JobSystem
 {
-    // Forward declare — implemented in JobSystem.cpp via FLS
+    // Forward declared — implemented in JobSystem.cpp via FLS.
     struct JobContext;
     JobContext* GetCurrentJobContext();
 
@@ -70,6 +70,11 @@ namespace Luth::JobSystem
     }
 #endif
 
+    // Win32 fiber wrapper used by the worker scheduler. Each Fiber owns a 2 MB stack (sized for
+    // heavy importers like Assimp), an FLS-backed JobContext for per-fiber state, and an intrusive
+    // NextWaiting pointer so the counter wait list can stay lock-free. The State atomic guards the
+    // Free / Running / Suspended transitions during sub-job and yield races.
+    // See arch/fiber-system.md for the V1-V6 hazard model.
     struct Fiber
     {
         void* Handle = nullptr;

@@ -19,6 +19,7 @@
 #include "luth/renderer/subsystems/GTAOSubsystem.h"
 #include "luth/renderer/subsystems/PostProcessSubsystem.h"
 #include "luth/renderer/subsystems/EditorOverlaysSubsystem.h"
+#include "luth/renderer/subsystems/DebugDrawSubsystem.h"
 #include "luth/memory/GPUTaggedPageAllocator.h"
 
 #include <entt/entt.hpp>
@@ -55,6 +56,7 @@ namespace Luth
         u32           viewIndex            = 0;
         bool          drawGrid             = true;
         bool          drawSelectionOutline = true;
+        bool          drawDebugShapes      = false;  // off by default; scene view enables explicitly
         bool          emitImGuiPass        = true;
         // Set by the view's owner when the user has requested a Frame Debugger
         // capture and selected this view (Scene or Game) as the source. Drives
@@ -71,6 +73,10 @@ namespace Luth
     // without mid-frame vkUpdateDescriptorSets aliasing.
     struct ViewResources
     {
+        // Identity token minted at creation; survives resize, dies with
+        // ReleaseViewResources. invariant: replay validates against this
+        // to catch FrameTargets-pointer reuse after panel close.
+        u64 id     = 0;
         u32 width  = 0;
         u32 height = 0;
 
@@ -113,16 +119,11 @@ namespace Luth
         std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> gridDescSet{};
     };
 
-    // Owns the per-frame render-graph assembly and execution. Created by
-    // RenderingSystem in its ctor and invoked once per frame from Update
-    // after BuildGPUObjectBuffer / DrawListBuilder::Build have populated
-    // the inputs.
-    //
-    // RenderPipeline is tightly coupled to RenderingSystem in v1 of this
-    // split (sub-task D of epic arch-renderer-split): it reads rendering
-    // resources (pipelines, descriptor sets, SPIR-V, samplers) through a
-    // RenderingSystem& reference. Sub-task E migrates those resources
-    // onto RenderPipeline itself.
+    // Orchestrates per-frame render-graph assembly and execution. Created by RenderingSystem and
+    // invoked once per frame after the DrawList and GPUObjectBuffer have been populated. Owns six
+    // per-domain subsystems (Global, Lighting, Geometry, GTAO, PostProcess, EditorOverlays); each
+    // subsystem contributes its render-graph passes and manages the descriptor lifecycle for the
+    // Sets it owns. See arch/rendering-pipeline.md.
     class RenderPipeline
     {
     public:
@@ -258,6 +259,17 @@ namespace Luth
         ViewResources& EnsureViewResources(FrameTargets& targets);
         void           ReleaseViewResources(FrameTargets& targets);
 
+        // True iff `targets` has a cached ViewResources whose identity token
+        // matches `expectedId`. Replay path uses this to validate that the
+        // captured FrameTargets is still the same instance — pointer reuse
+        // after panel close + reopen would mint a different id.
+        bool HasViewResources(FrameTargets* targets, u64 expectedId) const;
+
+        // Lookup without minting — returns nullptr if `targets` isn't in the
+        // map. Used by replay to fetch the captured view's resources.
+        ViewResources*       GetViewResources(FrameTargets* targets);
+        const ViewResources* GetViewResources(FrameTargets* targets) const;
+
     private:
         // Split allocation + per-group descriptor writes for readability.
         void AllocateViewResources(ViewResources& vr, FrameTargets& targets);
@@ -271,6 +283,7 @@ namespace Luth
         GTAOSubsystem           m_GTAO;
         PostProcessSubsystem    m_PostProcess;
         EditorOverlaysSubsystem m_EditorOverlays;
+        DebugDrawSubsystem      m_DebugDraw;
 
     public:
         EditorOverlaysSubsystem&       GetEditorOverlays()       { return m_EditorOverlays; }

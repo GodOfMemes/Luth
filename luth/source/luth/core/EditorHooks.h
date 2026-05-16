@@ -13,10 +13,10 @@ namespace Luth
     class Window;
     class Scene;
 
-    /// Editor-owned simulation state. Engine queries this via IEditorHooks to
-    /// decide whether game systems (Animation, future Physics / Scripting)
-    /// should tick on the current frame. A headless runtime leaves the hook
-    /// registry empty and the engine defaults to "always tick".
+    // Editor-owned simulation state. The engine queries this via IEditorHooks to decide whether
+    // game systems (Animation, future Physics, Scripting) should tick on the current frame.
+    // A headless runtime leaves the hook registry empty, in which case the engine defaults to
+    // "always tick".
     enum class PlayState
     {
         Editing,
@@ -24,9 +24,16 @@ namespace Luth
         Paused,
     };
 
-    /// Per-frame snapshot of editor-owned state the engine feeds into
-    /// RenderingSystem. When no editor is registered, stays default-constructed
-    /// and the engine uses identity camera + empty selection.
+    // Physics debug-visualization colour scheme. Used by PhysicsSystem's debug-draw passes; the
+    // editor selects the mode via Preferences and forwards it through EditorViewportState. Uniform
+    // applies physicsUniformColor to every body. ByMotionType uses fixed greys/blues/greens.
+    // BySleepState matches Jolt's SleepColor (static grey, kinematic green, dynamic-active yellow,
+    // sleeping red) and queries JPH::BodyInterface::IsActive per body.
+    enum class PhysicsDebugColorMode : u8 { Uniform, ByMotionType, BySleepState };
+
+    // Per-frame snapshot of editor-owned state that the engine feeds into RenderingSystem. When
+    // no editor is registered the struct stays default-constructed, so the runtime build sees an
+    // identity camera and empty selection.
     struct EditorViewportState
     {
         bool      hasCamera        = false;
@@ -57,13 +64,27 @@ namespace Luth
         // characters animate in the scene view. Flip off for strict
         // "game systems only run during Play" behavior.
         bool      previewAnimationInEditor = true;
+
+        // Physics debug visualization. Paired toggles per pass: render bodies of selected entities,
+        // and render bodies of all entities (overrides selected when on). Colour scheme + segment
+        // count + uniform colour shape what each pass looks like; alpha-unselected dims non-selected
+        // bodies when "All" is on so the selected one still pops.
+        bool                  physicsShapesSelected  = true;
+        bool                  physicsShapesAll       = false;
+        bool                  physicsAABBsSelected   = false;
+        bool                  physicsAABBsAll        = false;
+        bool                  physicsCoMSelected     = false;
+        bool                  physicsCoMAll          = false;
+        PhysicsDebugColorMode physicsColorMode       = PhysicsDebugColorMode::Uniform;
+        Vec4                  physicsUniformColor    = { 0.40f, 0.86f, 0.37f, 1.0f };
+        u32                   physicsDebugSegments   = 32;
+        float                 physicsAlphaUnselected = 0.6f;
     };
 
-    /// Interface the engine uses to drive the editor without depending on
-    /// luthien/ headers. The editor library (Luthien.lib) provides a concrete
-    /// implementation and registers it via EditorHooks::Register before App
-    /// construction. A headless/runtime-only build leaves the registry empty
-    /// and the engine skips editor-specific behavior.
+    // Interface the engine uses to drive the editor without ever depending on luthien/ headers.
+    // Luthien.lib provides the concrete implementation and registers it via EditorHooks::Register
+    // before App is constructed. A headless or runtime-only build leaves the registry empty and
+    // the engine quietly skips editor-specific behavior. See arch/editor.md for the contract.
     struct IEditorHooks
     {
         virtual ~IEditorHooks() = default;
@@ -99,6 +120,12 @@ namespace Luth
         // Returns empty path if no panel is available.
         virtual std::filesystem::path GetProjectCurrentDir() = 0;
 
+        // Engine-side notice surfaced to the editor UI (e.g. status bar, log).
+        // Default no-op so runtime-only builds (no editor) can ignore it.
+        // Currently used by FrameDebuggerContext when a captured view is closed
+        // mid-Freeze and capture is auto-cleared.
+        virtual void OnFrameDebuggerNotice(const std::string& /*message*/) {}
+
         // Project launcher
         virtual void ShowProjectLauncher() = 0;
         virtual bool HasPendingProject() = 0;
@@ -110,13 +137,12 @@ namespace Luth
 
     namespace EditorHooks
     {
-        /// Registered by Luthien.lib's bootstrap before App is constructed.
-        /// Passing nullptr clears the registration (rarely useful).
+        // Registered by Luthien.lib's bootstrap before App is constructed. Passing nullptr clears
+        // the registration (rarely useful in practice — exists for symmetry).
         void Register(IEditorHooks* hooks);
 
-        /// Returns the registered hook, or nullptr if no editor is linked
-        /// (runtime-only build) or hooks haven't been registered yet.
-        /// Call sites must nullptr-check.
+        // Returns the registered hook, or nullptr if no editor is linked (runtime-only build) or
+        // if hooks haven't been registered yet. All call sites must nullptr-check.
         IEditorHooks* Get();
     }
 }

@@ -51,6 +51,7 @@ namespace Luth
             BufferLayout layout = { { ShaderDataType::Float3, "a_Position" } };
             auto bindings = layout.GetBindingDescriptions();
             auto attribs  = layout.GetAttributeDescriptions();
+            // Stride mirrors MakePBRVertexLayout: Position3 + Normal3 + TexCoord0_2 + TexCoord1_2 + Tangent3.
             if (!bindings.empty()) bindings[0].stride = sizeof(float) * (3 + 3 + 2 + 2 + 3);
             return { std::move(bindings), std::move(attribs) };
         }
@@ -114,6 +115,11 @@ namespace Luth
         allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
         allocInfo.pSetLayouts        = layouts;
         vkAllocateDescriptorSets(device, &allocInfo, m_ObjectSSBODescSet.data());
+        for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+        {
+            char name[48]; std::snprintf(name, sizeof(name), "Geometry.ObjectSSBO.Slot%u", i);
+            VulkanContext::SetDebugName(m_ObjectSSBODescSet[i], name);
+        }
     }
 
     void GeometrySubsystem::InitCullPipeline()
@@ -154,6 +160,11 @@ namespace Luth
         allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
         allocInfo.pSetLayouts        = layouts;
         vkAllocateDescriptorSets(device, &allocInfo, m_CullDescSet.data());
+        for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+        {
+            char name[48]; std::snprintf(name, sizeof(name), "Geometry.Cull.Slot%u", i);
+            VulkanContext::SetDebugName(m_CullDescSet[i], name);
+        }
 
         // PC: 6 frustum planes (96B) + objectCount + destOffset = 104B.
         VkPushConstantRange pcRange{};

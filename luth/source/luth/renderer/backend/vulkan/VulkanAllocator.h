@@ -12,6 +12,10 @@ typedef struct VmaAllocation_T* VmaAllocation;
 
 namespace Luth
 {
+    // Static facade over VMA (Vulkan Memory Allocator). Owns the global VmaAllocator instance
+    // and a small set of typed helpers for buffer / image allocation, persistently-mapped
+    // sequential buffers (the GPU tagged-heap backing), and incremental flush. Allocations land
+    // under MemoryTracker's Category::GPU bucket exactly once per backing.
     struct GPUMemoryStats
     {
         u64 UsedBytes;

@@ -13,9 +13,7 @@
 namespace Luth
 {
 
-    // =========================================================================
-    // Construction / Destruction
-    // =========================================================================
+    // ── Construction / Destruction ──
 
     RenderingSystem::RenderingSystem(u32 viewportWidth, u32 viewportHeight)
     {
@@ -60,8 +58,8 @@ namespace Luth
         m_FrameDebugger.DestroyArchives();
         m_FrameDebugger.state = DebuggerState::Inactive;
         m_FrameDebugger.capturedFrame.Clear();
-        // Phase 14E — drop the per-draw replay cache key so the next capture
-        // starts clean (preview texture itself is reused across captures).
+        // Drop the per-draw replay cache key so the next capture starts clean —
+        // the preview texture itself is reused across captures.
         m_Pipeline->ResetPreviewCacheKeys();
     }
 
@@ -73,9 +71,7 @@ namespace Luth
     u32         RenderingSystem::GetDepthPreviewWidth()    const { return m_Pipeline->GetDepthPreviewWidth(); }
     u32         RenderingSystem::GetDepthPreviewHeight()   const { return m_Pipeline->GetDepthPreviewHeight(); }
 
-    // =========================================================================
-    // Project lifecycle
-    // =========================================================================
+    // ── Project lifecycle ──
 
     void RenderingSystem::OnProjectLoaded()
     {
@@ -88,9 +84,7 @@ namespace Luth
         m_Pipeline->GetShaderWatcher().RemoveProjectDir();
     }
 
-    // =========================================================================
-    // Per-frame dispatcher
-    // =========================================================================
+    // ── Per-frame dispatcher ──
 
     void RenderingSystem::Update(Scene* scene)
     {
@@ -104,8 +98,8 @@ namespace Luth
         // and ran twice per frame when both Scene + Game viewports were open.
         m_Pipeline->GetShaderWatcher().Poll();
 
-        // --- Frame Debugger: Frozen state ---
-        // Phase 14C — strict snapshot model with auto-recapture on camera move.
+        // ── Frame Debugger: Frozen state ──
+        // Strict snapshot model with auto-recapture on camera move.
         //
         // While Frozen, the live render graph is NOT rebuilt or re-executed.
         // The LDR output target retains the LAST CAPTURED image (no other code
@@ -136,9 +130,26 @@ namespace Luth
                 currentProj[1][1] *= -1.0f;
                 Mat4 currentViewProj = currentProj * m_CameraParams.view;
 
-                cameraMoved = std::memcmp(&currentViewProj,
-                                          &m_FrameDebugger.capturedFrame.captureViewProj,
-                                          sizeof(Mat4)) != 0;
+                // Pack viewProj + IBL intensities into one struct for a single
+                // memcmp. Catches user inspector tweaks to Sun/Sky settings
+                // mid-Freeze. Cascade splits / shadow bias would need the
+                // lighting system to recompute during Frozen — out of scope.
+                struct CompareKey
+                {
+                    Mat4  viewProj;
+                    float iblIntensity;
+                    float skyboxIntensity;
+                    float _pad[2] = { 0.0f, 0.0f };
+                };
+                CompareKey live{};
+                live.viewProj        = currentViewProj;
+                live.iblIntensity    = m_CameraParams.iblIntensity;
+                live.skyboxIntensity = m_CameraParams.skyboxIntensity;
+                CompareKey captured{};
+                captured.viewProj        = m_FrameDebugger.capturedFrame.captureViewProj;
+                captured.iblIntensity    = m_FrameDebugger.capturedFrame.capturedIblIntensity;
+                captured.skyboxIntensity = m_FrameDebugger.capturedFrame.capturedSkyboxIntensity;
+                cameraMoved = std::memcmp(&live, &captured, sizeof(CompareKey)) != 0;
 
                 // Throttle to ~10 Hz at 60 fps. Per-recapture GPU work
                 // (~10 vkCmdCopyImage + barriers, mostly cascade depth)
@@ -200,6 +211,7 @@ namespace Luth
         sceneView.viewIndex            = 0;
         sceneView.drawGrid             = m_GridVisible;
         sceneView.drawSelectionOutline = true;
+        sceneView.drawDebugShapes      = true;
         sceneView.emitImGuiPass        = true;
         // Capture-source gate: only the scene view installs the archive sink
         // when the user has chosen Scene as the source. Game capture lives on
@@ -232,9 +244,7 @@ namespace Luth
         Renderer::EndPrimaryCmdAndSubmit(primaryCmd, frameIndex);
     }
 
-    // =========================================================================
-    // Per-view record
-    // =========================================================================
+    // ── Per-view record ──
 
     void RenderingSystem::RecordView(const RenderView& view, void* primaryCmd)
     {
@@ -279,9 +289,7 @@ namespace Luth
         vkCmdPipelineBarrier2(static_cast<VkCommandBuffer>(primaryCmd), &dep);
     }
 
-    // =========================================================================
-    // Resize
-    // =========================================================================
+    // ── Resize ──
 
     void RenderingSystem::Resize(u32 width, u32 height)
     {

@@ -34,8 +34,12 @@ Temp/
 # Editor persisted state (per-user, not shippable)
 editor_settings.json
 
+recent_projects.json
+
 # Pipeline / asset caches (rebuilt on demand)
 samples/cache/
+
+layouts/
 
 # OS
 .DS_Store

@@ -92,8 +92,8 @@ namespace Luth
         if (!m_CpuScratch) return;
         if (baseIndex + count > TOTAL_MATRICES) return;
 
-        // Per-entity baseIndex is unique → concurrent fiber writes hit disjoint ranges.
-        // No lock needed (same property as the v2.8.9 mapped-buffer write).
+        // Per-entity baseIndex is unique → concurrent fiber writes hit disjoint ranges,
+        // so no lock is needed against other UploadBones callers on the same frame.
         memcpy(m_CpuScratch + baseIndex * MATRIX_SIZE, matrices, count * MATRIX_SIZE);
     }
 
@@ -185,5 +185,10 @@ namespace Luth
         allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
         allocInfo.pSetLayouts        = layouts.data();
         vkAllocateDescriptorSets(device, &allocInfo, m_DescriptorSets.data());
+        for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+        {
+            char name[48]; std::snprintf(name, sizeof(name), "BoneMatrix.Slot%u", i);
+            VulkanContext::SetDebugName(m_DescriptorSets[i], name);
+        }
     }
 }
