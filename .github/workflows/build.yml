@@ -1,6 +1,10 @@
 name: Build
 
-on: push
+on:
+  push:
+    branches: [feature-linux-support]
+  pull_request:
+    branches: [feature-linux-support]
 
 jobs:
   build:
