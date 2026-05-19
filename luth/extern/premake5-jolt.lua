@@ -53,6 +53,9 @@ project "Jolt"
    filter "system:windows"
       vectorextensions "AVX2"
       buildoptions { "/utf-8" }
+   filter "system:linux"
+      buildoptions { "-march=x86-64-v3" }
+      filter{}
 
    filter "configurations:Debug"
       defines { "JPH_ENABLE_ASSERTS", "JPH_DEBUG_RENDERER", "_DEBUG" }

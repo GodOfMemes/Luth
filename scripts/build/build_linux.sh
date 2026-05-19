@@ -7,7 +7,10 @@ if ! command -v make &> /dev/null; then
     exit 1
 fi
 
-pushd ../.. > /dev/null
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &> /dev/null && pwd)"
+
+pushd "${REPO_ROOT}" > /dev/null
 make "$@"
 popd > /dev/null
 

@@ -64,6 +64,7 @@ project "Runtime"
       "ImGuizmo",
       "Tracy",
       "spirv-cross",
+      "Jolt",
 
       --"vulkan-1",
       "shaderc_shared"

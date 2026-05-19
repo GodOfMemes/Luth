@@ -13,6 +13,7 @@ project "Luth"
       buildoptions { "/utf-8" }
    filter "system:linux"
       defines { "STBI_NO_SIMD" }
+      buildoptions { "-march=x86-64-v3" }
    filter {}
 
    defines
