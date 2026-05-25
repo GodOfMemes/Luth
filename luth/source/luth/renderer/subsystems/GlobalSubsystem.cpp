@@ -22,14 +22,18 @@ namespace Luth
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[0].descriptorCount = 1;
-        bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        // COMPUTE added so VolumetricSubsystem's inject pass can sample camera/CSM uniforms.
+        bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT
+                               | VK_SHADER_STAGE_COMPUTE_BIT;
 
         for (u32 i = 1; i <= 4; ++i)
         {
             bindings[i].binding = i;
             bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             bindings[i].descriptorCount = 1;
-            bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            // COMPUTE added so VolumetricSubsystem's inject pass can sample IBL irradiance (b1)
+            // for the 2nd-order multi-scatter ambient term.
+            bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
         }
 
         bindings[5].binding = 5;
@@ -79,6 +83,28 @@ namespace Luth
         ubo.projection = camera.projection;
         ubo.projection[1][1] *= -1.0f;  // Vulkan Y-flip (shader only, not ImGuizmo)
         ubo.viewProjection = ubo.projection * ubo.view;
+        // Per-view prev-VP + viewport size — stored on ViewResources, NOT on GlobalSubsystem. A single
+        // global cross-contaminates between Scene + Game panels (huge motion vectors for static geometry).
+        // Frame 0: prevViewProj is Identity → motion nonsense for one frame, settles by frame 1.
+        ViewResources* vr = m_Pipeline->GetCurrentViewResources();
+        if (vr) {
+            ubo.prevViewProjection = vr->prevViewProj;
+            vr->prevViewProj       = ubo.viewProjection;
+            ubo.viewportSize       = Vec2(static_cast<float>(vr->width), static_cast<float>(vr->height));
+            // Cross-frame near/far cache — read for the resolve pass's reprojection. Bootstrap to
+            // current frame's values if uninitialized so frame 0's slice reconstruction is sane.
+            const f32 pNearZ = (vr->prevNearZ != 0.0f) ? vr->prevNearZ : camera.nearZ;
+            const f32 pFarZ  = (vr->prevFarZ  != 0.0f) ? vr->prevFarZ  : camera.farZ;
+            ubo.prevViewParams = Vec4(pNearZ, pFarZ, 0.0f, 0.0f);
+            vr->prevNearZ = camera.nearZ;
+            vr->prevFarZ  = camera.farZ;
+        } else {
+            ubo.prevViewProjection = ubo.viewProjection;  // no view yet → zero motion
+            ubo.viewportSize       = Vec2(0.0f);
+            ubo.prevViewParams     = Vec4(camera.nearZ, camera.farZ, 0.0f, 0.0f);
+        }
+        ubo.nearZ = camera.nearZ;
+        ubo.farZ  = camera.farZ;
         ubo.cameraPos = camera.position;
         ubo.time = Time::GetTime();
         for (u32 i = 0; i < k_ShadowCascadeCount; ++i)
@@ -93,6 +119,26 @@ namespace Luth
         ubo.debugVisualizeCascades = shadowParams.debugVisualizeCascades ? 1.0f : 0.0f;
         ubo.cascadeBlendWidth      = shadowParams.cascadeBlendWidth;
 
+        // Volumetric fog params — distance fog + height fog + multi-scatter + temporal/sun-absorption/
+        // sky tunables. heightFogParams.w still carries multiScatterIntensity for back-compat with
+        // shaders that haven't migrated to volTemporalParams yet.
+        const VolumetricSettings& vs = m_Pipeline->GetSystem().GetVolumetricSettings();
+        ubo.distanceFogColorDensity = Vec4(vs.distanceFogColor, vs.distanceFogDensity);
+        ubo.distanceFogParams       = Vec4(vs.distanceFogStart, vs.distanceFogMaxOpacity,
+                                           vs.distanceFogEnabled ? 1.0f : 0.0f, 0.0f);
+        ubo.heightFogColorDensity   = Vec4(vs.heightFogColor, vs.heightFogDensity);
+        ubo.heightFogParams         = Vec4(vs.heightFogRefHeight, vs.heightFogFalloff,
+                                           vs.heightFogEnabled ? 1.0f : 0.0f, vs.multiScatterIntensity);
+        ubo.volTemporalParams       = Vec4(vs.anisotropy,
+                                           vs.temporalAlpha,
+                                           static_cast<f32>(vs.sunFogAbsorptionSteps),
+                                           vs.skyFogStrength);
+        ubo.volNoiseParams          = Vec4(vs.noiseScale, vs.noiseStrength, 0.0f, 0.0f);
+        ubo.volNoiseWind            = Vec4(vs.noiseWind, 0.0f);
+        ubo.volScatterParams        = Vec4(vs.scatteringIntensity, 0.0f, 0.0f, 0.0f);
+
+        // m_CachedViewProj is read this frame by cull-compute (frustum) and the frame debugger.
+        // Per-view; gets overwritten on each view's UpdateUBO and consumed by the same view's Execute.
         m_CachedViewProj = ubo.viewProjection;
 
         // Cache GPU-true bytes for the frame debugger's per-view UBO snapshot.
@@ -100,7 +146,6 @@ namespace Luth
         m_LastUboBytes.resize(sizeof(GlobalUniforms));
         std::memcpy(m_LastUboBytes.data(), &ubo, sizeof(GlobalUniforms));
 
-        ViewResources* vr = m_Pipeline->GetCurrentViewResources();
         if (!vr || vr->globalDescriptorSet[0] == VK_NULL_HANDLE) return;
 
         auto* jobCtx = JobSystem::GetCurrentJobContext();

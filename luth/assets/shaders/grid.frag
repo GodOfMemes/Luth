@@ -10,6 +10,7 @@ layout(location = 0) out vec4 outColor;
 
 layout(set = 0, binding = 0) uniform GridGlobals {
     mat4 viewProjection;
+    mat4 prevViewProjection;  // shares Set 0 binding 0 with GlobalUniforms — must mirror layout
     mat4 view;
     mat4 projection;
     vec3 cameraPos;
@@ -23,6 +24,9 @@ layout(set = 0, binding = 0) uniform GridGlobals {
     float skyboxIntensity;
     float debugVisualizeCascades;
     float cascadeBlendWidth;
+    vec2  viewportSize;
+    float nearZ;
+    float farZ;
 } ubo;
 
 layout(set = 0, binding = 1) uniform sampler2D u_SceneDepth;

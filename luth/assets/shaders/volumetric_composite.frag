@@ -1,0 +1,61 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+// Volumetric fog composite. All fog (FogVolume + distance + height) is voxelized in the inject
+// pass — the atlas accumulates per-voxel density × tint × phase × shadow → integrate's volTransmit
+// and volScatter contain the full result. Composite samples the atlas at the fragment's view-Z
+// and emits a (fogColor, fogOpacity) pair shaped for the engine's standard alpha-blend equation
+// (src*src.a + dst*(1-src.a)) — equivalent to Beer-Lambert:
+//   final = sceneColor * volTransmit + scatter
+// where fogOpacity = 1 - volTransmit and fogColor = volScatter / fogOpacity (protected against /0).
+
+#include "common/globals.glsl"
+
+layout(location = 0) in vec2 v_TexCoord;
+layout(location = 0) out vec4 outColor;
+
+layout(set = 1, binding = 0) uniform sampler2D sceneDepth;
+layout(set = 1, binding = 1) uniform sampler3D volInScatter;
+
+// Push constant kept for forward-compat (future features may need invView); harmless at zero cost.
+layout(push_constant) uniform PC {
+    mat4 invView;
+} pc;
+
+float DepthToViewZ(float ndcDepth) {
+    // Inverse of glm::perspectiveRH_ZO (Vulkan depth range 0..1).
+    return (ubo.nearZ * ubo.farZ) / (ndcDepth * (ubo.nearZ - ubo.farZ) + ubo.farZ);
+}
+
+// Slicing math replicated from volumetric_inject_density.comp.
+float ViewZToAtlasSlice(float viewZ) {
+    return clamp(log(max(viewZ, ubo.nearZ) / ubo.nearZ)
+               / log(ubo.farZ / ubo.nearZ), 0.0, 1.0);
+}
+
+void main() {
+    float ndcDepth = texture(sceneDepth, v_TexCoord).r;
+    float viewZ    = DepthToViewZ(ndcDepth);
+    bool  isSky    = ndcDepth >= 0.9999;
+
+    // Sample the integrated + resolved atlas.
+    float sliceW = ViewZToAtlasSlice(viewZ);
+    vec4 volS = texture(volInScatter, vec3(v_TexCoord, sliceW));
+    vec3  volScatter  = volS.rgb;
+    float volTransmit = volS.a;
+
+    // Distance-fog max-opacity still respected as an overall cap on how much fog can hide the
+    // underlying scene (useful for keeping silhouettes visible in dense fog).
+    float dfMaxOpa = ubo.distanceFogParams.y;
+
+    float fogOpacity = clamp(1.0 - volTransmit, 0.0, max(dfMaxOpa, 0.001));
+    // Sky-pixel fog strength cap — scales fog opacity at the far slice so the skybox can stay
+    // visible in dense fog. 1.0 = full fog on sky (skybox can disappear); 0.0 = no fog on sky.
+    if (isSky) {
+        float skyStrength = ubo.volTemporalParams.w;
+        fogOpacity *= skyStrength;
+    }
+    vec3 fogColor = (fogOpacity > 1e-5) ? volScatter / fogOpacity : vec3(0.0);
+    outColor = vec4(fogColor, fogOpacity);
+}
+

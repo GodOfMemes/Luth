@@ -2,6 +2,8 @@
 #include "luth/renderer/RenderPipeline.h"
 #include "luth/renderer/debug/FrameDebuggerContext.h"
 #include "luth/scene/systems/RenderingSystem.h"
+#include "luth/scene/systems/SystemRegistry.h"
+#include "luth/scene/systems/LightingSystem.h"
 #include "luth/renderer/Renderer.h"
 #include "luth/renderer/material/MaterialSystem.h"
 #include "luth/renderer/resources/BoneMatrixBuffer.h"
@@ -21,6 +23,7 @@
 #include "luth/resources/AssetManager.h"
 #include "luth/resources/AssetDatabase.h"
 #include "luth/resources/FileSystem.h"
+#include "luth/core/FrameData.h"
 #include "luth/core/types/LuthMath.h"
 #include "luth/core/time/Time.h"
 #include "luth/core/diagnostics/Profiler.h"
@@ -86,6 +89,7 @@ namespace Luth
         m_DebugDraw.BuildPipelines();
 
         m_GTAO.Init(*this);
+        m_Volumetric.Init(*this);
 
         // Shader hot-reload callback: pulls fresh SPIR-V into the cached blob
         // and rebuilds pipelines that use it. Fires after ShaderLibrary::Reload
@@ -117,7 +121,8 @@ namespace Luth
             // returns true). Debug shaders + IBL precompute remain RP residual.
             const bool handled = m_Lighting.OnShaderReloaded(name, spv, geoLayouts)
                               || m_Geometry.OnShaderReloaded(name, spv, geoLayouts)
-                              || m_GTAO.OnShaderReloaded(name, spv);
+                              || m_GTAO.OnShaderReloaded(name, spv)
+                              || m_Volumetric.OnShaderReloaded(name, spv);
             // PostProcess returns false for fullscreen.vert so EditorOverlays still gets to rebuild
             // its outline/grid pipelines below.
             const bool ppHandled       = m_PostProcess.OnShaderReloaded(name, spv);
@@ -173,6 +178,7 @@ namespace Luth
         m_DebugDraw.Shutdown();
         m_EditorOverlays.Shutdown();
         m_PostProcess.Shutdown();
+        m_Volumetric.Shutdown();
         m_GTAO.Shutdown();
         m_Geometry.Shutdown();
         m_Lighting.Shutdown();
@@ -248,6 +254,55 @@ namespace Luth
         // graph can schedule it in parallel with the shadow cascades.
         RG::ResourceHandle prepassDepth = m_Geometry.AddDepthPrepass(rg, hIndirectBuf);
 
+        // Slim G-buffer — opaque normal/roughness/motion/matID. Reads prepass depth
+        // with EQUAL test; foundation for A.5 TAA + Phase B/C RT denoise + D RT reflections.
+        // Live ShadeMode toggle consumes slimGB downstream (in the AddSlimVizPass call below).
+        SlimGBufferOutput slimGB = m_Geometry.AddSlimGBufferPass(rg, hIndirectBuf, prepassDepth);
+
+        // Forward+ cluster AABB builder + light-to-cluster assignment. Both async-compute; the
+        // assign pass consumes the build pass's AABB + grid handles directly (no re-import — see
+        // arch hazard 1). UploadLightSSBO must run BEFORE AddLightAssignPass so the assign pass
+        // can bind the same VkBuffer to its b0 read; WriteSet3PerView lands afterwards once all
+        // three per-view tagged-heap regions are known.
+        Memory::GPUSubRegion lightSSBORegion{};
+        if (auto* lighting = SystemRegistry::GetSystem<LightingSystem>())
+            lightSSBORegion = m_Lighting.UploadLightSSBO(lighting->GetLights());
+        LightingSubsystem::ClusterBuildOutputs clusters = m_Lighting.AddClusterBuildPass(rg);
+        LightingSubsystem::LightAssignOutputs  assign   = m_Lighting.AddLightAssignPass(rg, clusters);
+        m_Lighting.WriteSet3PerView(lightSSBORegion, clusters.gridRegion, assign.indexRegion);
+
+        // Volumetric chain — gated by per-view editor toggle. When off the inject + integrate +
+        // composite passes skip entirely; sceneColor flows through unchanged. injectOut hoisted
+        // to outer scope so the debug viz pass below can reference the density atlas handle.
+        const bool volumetricEnabled = view.camera.enableVolumetricFog;
+        VolumetricSubsystem::InjectOutputs injectOut{};
+        RG::ResourceHandle volInScatterHandle{};  // post-integrate scratch (viz mode 1 samples this)
+        RG::ResourceHandle volResolvedHandle{};   // post-resolve (composite + viz sample)
+        if (volumetricEnabled && m_CurrentViewResources)
+        {
+            const u32 frameAbs = static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex());
+            Memory::GPUSubRegion fogVolumeRegion{};
+            if (auto* lighting = SystemRegistry::GetSystem<LightingSystem>())
+                fogVolumeRegion = m_Volumetric.UploadFogVolumeSSBO(lighting->GetFogVolumes());
+            // Density pass binds FogVolume SSBO; scatter pass binds Light/ClusterGrid/LightIndex.
+            // Resolve/composite/viz b1-or-b2 parity-rewrite to ping-pong HistA/B for temporal
+            // accumulation. Cycled slots keep rewrites disjoint from in-flight prior frame reads.
+            m_Volumetric.WriteInjectDensityPerFrame(fogVolumeRegion);
+            m_Volumetric.WriteInjectScatterPerFrame(lightSSBORegion, clusters.gridRegion, assign.indexRegion);
+            m_Volumetric.WriteResolvePerFrame(*m_CurrentViewResources, frameAbs);
+            m_Volumetric.WriteCompositePerFrame(*m_CurrentViewResources, *view.targets, frameAbs);
+            m_Volumetric.WriteVizPerFrame(*m_CurrentViewResources, frameAbs);
+            // Density pass writes volDensity; scatter pass reads it (via shared ResourceNode so RG
+            // inserts the barrier) and samples it along the sun ray for proper density-aware
+            // absorption. Scatter samples shadow cascades via descriptor binding 5 — per-cascade
+            // RG Reads emit the DSA → SHADER_READ_ONLY transitions. Atlas handles chain through
+            // integrate + resolve so RG transitions are coherent end-to-end.
+            injectOut.density   = m_Volumetric.AddInjectDensityPass(rg);
+            injectOut.inScatter = m_Volumetric.AddInjectScatterPass(rg, injectOut.density, shadowHandles);
+            volInScatterHandle  = m_Volumetric.AddIntegratePass(rg, injectOut);
+            volResolvedHandle   = m_Volumetric.AddResolvePass(rg, volInScatterHandle);
+        }
+
         // GTAO chain runs every frame so the Set 0 binding-4 sampler sees
         // a valid SHADER_READ_ONLY layout (the `gtao.enabled` flag in the
         // UBO is what disables the modulation inside pbr.frag). ~0.3-1 ms
@@ -262,11 +317,41 @@ namespace Luth
                                          ? m_EditorOverlays.AddSelectionMaskPass(rg)
                                          : SelectionMaskOutput{};
         RG::ResourceHandle skyboxColor = m_Lighting.AddSkyboxPass(rg, geoOutput.color, geoOutput.depth);
-        RG::ResourceHandle bloomResult = m_PostProcess.AddBloomPasses(rg, skyboxColor); // bloom reads PRE-grid color so grid lines don't bloom
-        RG::ResourceHandle gridColor   = view.drawGrid
-                                         ? m_EditorOverlays.AddGridPass(rg, skyboxColor, geoOutput.depth)
+        // Volumetric composite — blends fog into sceneColor (alpha-blend equation) BEFORE bloom so
+        // bright in-scattered fog can bloom and the grid pass overlays unfogged grid lines.
+        // Skipped when the editor toggle is off — downstream uses skyboxColor unchanged.
+        RG::ResourceHandle fogColor    = (volumetricEnabled && m_CurrentViewResources)
+                                         ? m_Volumetric.AddCompositePass(rg, skyboxColor, prepassDepth, volResolvedHandle)
                                          : skyboxColor;
-        RG::ResourceHandle ldrOutput   = m_PostProcess.AddCompositePass(rg, gridColor, bloomResult);
+        RG::ResourceHandle bloomResult = m_PostProcess.AddBloomPasses(rg, fogColor); // bloom reads PRE-grid color so grid lines don't bloom
+        RG::ResourceHandle gridColor   = view.drawGrid
+                                         ? m_EditorOverlays.AddGridPass(rg, fogColor, geoOutput.depth)
+                                         : fogColor;
+        RG::ResourceHandle ldrOutput = m_PostProcess.AddCompositePass(rg, gridColor, bloomResult);
+
+        // Slim G-buffer ShadeMode toggles overwrite LDROutput with a decoded attachment.
+        // Mode index = enum offset from ShadeMode::SlimNormal (0..3). Motion scale hardcoded —
+        // the frame-debugger panel exposes a slider for per-capture tuning; live viz uses a
+        // sensible default matching the existing thumbnail UX.
+        const ShadeMode shadeMode = m_System.GetShadeMode();
+        if (shadeMode >= ShadeMode::SlimNormal && shadeMode <= ShadeMode::SlimMaterialID)
+        {
+            const u32 slimMode = static_cast<u32>(shadeMode) - static_cast<u32>(ShadeMode::SlimNormal);
+            ldrOutput = m_PostProcess.AddSlimVizPass(rg, ldrOutput, slimGB, slimMode, /*motionScale*/20.0f);
+        }
+        else if (shadeMode == ShadeMode::ClustersDensity)
+        {
+            ldrOutput = m_Lighting.AddClusterVizPass(rg, ldrOutput, prepassDepth);
+        }
+        else if ((shadeMode == ShadeMode::VolumetricDensity ||
+                  shadeMode == ShadeMode::VolumetricInScatter) &&
+                 volumetricEnabled && m_CurrentViewResources)
+        {
+            const u32 vizMode = (shadeMode == ShadeMode::VolumetricDensity) ? 0u : 1u;
+            ldrOutput = m_Volumetric.AddVizPass(rg, ldrOutput, injectOut.density,
+                                                volResolvedHandle, prepassDepth, vizMode);
+        }
+
         RG::ResourceHandle finalOutput = view.drawSelectionOutline
                                          ? m_EditorOverlays.AddOutlinePass(rg, ldrOutput, maskOutput, geoOutput.depth)
                                          : ldrOutput;
@@ -336,6 +421,11 @@ namespace Luth
             m_System.GetFrameDebugger().RegisterTrackedRT("GTAOLinearDepth");
             m_System.GetFrameDebugger().RegisterTrackedRT("GTAORawAO");
             m_System.GetFrameDebugger().RegisterTrackedRT("GTAOFinal");
+            // Slim G-buffer attachments (Phase A.2). Archive sink copies all 4 after the pass.
+            m_System.GetFrameDebugger().RegisterTrackedRT("SlimNormal");
+            m_System.GetFrameDebugger().RegisterTrackedRT("SlimRoughness");
+            m_System.GetFrameDebugger().RegisterTrackedRT("SlimMotion");
+            m_System.GetFrameDebugger().RegisterTrackedRT("SlimMaterialID");
             rg.SetArchiveSink(&m_System.GetFrameDebugger());
         }
 
@@ -618,10 +708,19 @@ namespace Luth
         if (auto it = m_ViewResources.find(&m_System.GetSceneTargets()); it != m_ViewResources.end()) {
             if (it->second.bloomA) m_NamedTextures["BloomA"] = it->second.bloomA;
             if (it->second.bloomB) m_NamedTextures["BloomB"] = it->second.bloomB;
+            if (it->second.volDensity)          m_NamedTextures["VolDensity"]           = it->second.volDensity;
+            if (it->second.volInScatter)        m_NamedTextures["VolInScatter"]         = it->second.volInScatter;
+            if (it->second.volInScatterHistA)   m_NamedTextures["VolInScatterHistA"]   = it->second.volInScatterHistA;
+            if (it->second.volInScatterHistB)   m_NamedTextures["VolInScatterHistB"]   = it->second.volInScatterHistB;
         }
         if (m_Lighting.GetIrradianceMap())  m_NamedTextures["IrradianceMap"]  = m_Lighting.GetIrradianceMap();
         if (m_Lighting.GetPrefilteredMap()) m_NamedTextures["PrefilteredMap"] = m_Lighting.GetPrefilteredMap();
         if (m_Lighting.GetBRDFLut())        m_NamedTextures["BRDF_LUT"]       = m_Lighting.GetBRDFLut();
+        // Slim G-buffer attachments (Phase A.2). Empty until SlimGBufferPass writes them (commit 4).
+        if (m_System.GetSceneTargets().GetSlimNormal())     m_NamedTextures["SlimNormal"]     = m_System.GetSceneTargets().GetSlimNormal();
+        if (m_System.GetSceneTargets().GetSlimRoughness())  m_NamedTextures["SlimRoughness"]  = m_System.GetSceneTargets().GetSlimRoughness();
+        if (m_System.GetSceneTargets().GetSlimMotion())     m_NamedTextures["SlimMotion"]     = m_System.GetSceneTargets().GetSlimMotion();
+        if (m_System.GetSceneTargets().GetSlimMaterialID()) m_NamedTextures["SlimMaterialID"] = m_System.GetSceneTargets().GetSlimMaterialID();
     }
 
     std::shared_ptr<Texture> RenderPipeline::GetNamedTexture(const std::string& name) const
@@ -651,6 +750,15 @@ namespace Luth
         m_Debugger->BlitArchivedDepthToPreview(archiveIdx, layer, nearZ, farZ);
     }
 
+    void RenderPipeline::BlitArchivedSlimToPreview(u32 archiveIdx, u32 mode, float scale)
+    {
+        m_Debugger->BlitArchivedSlimToPreview(archiveIdx, mode, scale);
+    }
+
+    VkImageView RenderPipeline::GetSlimPreviewView()   const { return m_Debugger->GetSlimPreviewView(); }
+    u32         RenderPipeline::GetSlimPreviewWidth()  const { return m_Debugger->GetSlimPreviewWidth(); }
+    u32         RenderPipeline::GetSlimPreviewHeight() const { return m_Debugger->GetSlimPreviewHeight(); }
+
     // ── Public-API forwarders into subsystems (preserve caller compat) ──
 
     void RenderPipeline::UpdateGlobalUniforms(const CameraParams& camera,
@@ -658,11 +766,6 @@ namespace Luth
                                               const DirectionalLightShadowParams& shadowParams)
     {
         m_Global.UpdateUBO(camera, cascades, shadowParams);
-    }
-
-    void RenderPipeline::UploadLightUBO(const LightUniforms& lights)
-    {
-        m_Lighting.UploadLightUBO(lights);
     }
 
     void RenderPipeline::BuildGPUObjectBuffer(const RenderSnapshot& snapshot)

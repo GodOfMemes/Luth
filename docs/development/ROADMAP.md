@@ -85,6 +85,13 @@
 | v2.11.0 | `custom-fibers` | Custom x86_64 MASM context switch + `VirtualAlloc` stacks replaces Win32 fibers so ASan can track per-fiber stack bounds. TIB ArbitraryUserPointer (`gs:[0x28]`) replaces Win32 FLS. ~5× faster switch (secondary win) | 2026-05-19 |
 | v2.11.1 | `foundation-testing` | 28-case stress harness (V1–V6, AtomicCounter, LinearAllocator, TaggedPageAllocator, SpinLock, MPMCQueue, WorkStealingDeque) under DebugASan; caught two engine bugs inline | 2026-05-20 |
 | v2.12.0 | `async-compute-queue` | Three-queue Vulkan foundation (graphics + async-compute + transfer) with per-view 3-submit topology, RG queue routing + cross-queue barrier rule (TOP_OF_PIPE substitution on the reader's pre-barrier), CONCURRENT sharing opt-in per cross-queue resource, GTAO chain routed to async compute, UploadContext routed to dedicated transfer queue (DMA engine on discrete GPUs) | 2026-05-20 |
+| v3.0.0 | `bindless-migration` | rt-renderer arc opens. `bufferDeviceAddress` enabled (feature + VMA bit + `SHADER_DEVICE_ADDRESS_BIT` on mesh + tagged-heap buffers; addresses cached on `VKVertex`/`VKIndexBuffer`). Set 1 binding 1 = `VK_DESCRIPTOR_TYPE_SAMPLER` array (32 slots, 4 canonical samplers at fixed 0-3 + `BindSampler`/`UnbindSampler` LIFO over 4-31). `GPUMaterialData` extended to 8 map indices + flag repack (UV 8-15 → 16-23, new HAS_* bits 5-7). `thumbnail_mesh` migrated to bindless sampling (net −120 LOC). All compose with existing primitives — no new allocator/sync/descriptor set | 2026-05-22 |
+| v3.0.1 | `slim-gbuffer` | rt-renderer A.2. New `SlimGBufferPass` after `DepthPrepass` writes RG16F oct-normal + R8 roughness + RG16F NDC motion + R16U matID at viewport res; depth-EQUAL against prepass, opaque-only. Three pieces of new state: `prevViewProjection` in `GlobalUniforms` (per-view storage on `ViewResources`, not global — fixed mid-effort after multi-view contamination surfaced), `prevModel` in `GPUObjectData` (render-side `m_PrevModelByEntity` cache), dual-region `BoneMatrixBuffer` for prev-frame bones (sibling 2 MB scratch + 2× GPU region per frame; `prevBoneOffset = boneOffset + 32768` reuses former `_pad` slot). Frame-debugger decoders (`debugSlimDecode` / `debugSlimMatID`) + 4 `ShadeMode` toggles (live `SlimVizPass` blits selected attachment to LDR). `R16_Uint` + `RG16_Float` formats threaded through `Texture` + `RG::TextureFormat` enums. No new allocator/sync/descriptor set; no Set 0/1/4/5 reshape. Cutout coverage deferred (cutouts fail depth-EQUAL — prepass clears to 1.0) | 2026-05-22 |
+| v3.0.2 | `forward-plus` | rt-renderer A.3. Olsson 3D clustered lighting replaces the fixed 64-light `LightUBO`. View frustum split into `16 × 9 × 24 = 3456` clusters; `ClusterBuildPass` (async-compute, `cluster_build.comp`) writes per-cluster view-space AABBs via log depth slicing; `LightAssignPass` (async-compute, `light_assign.comp`) sphere-vs-AABB per cluster + `atomicAdd`-packs per-cluster light indices. PBR fragment derives cluster ID from `gl_FragCoord` + Olsson-linearized depth and loops only the cluster's lights. Per-cluster cap raised from 64 to `k_MaxLightsPerCluster = 128`. Set 3 reshaped 2 → 4 bindings (LightSSBO std430 header+flexible array, ClusterGrid uvec2 SSBO, LightIndex uint SSBO, shadow sampler at b3) and moved to per-view `ViewResources::lightDescSet` (cluster grid + index differ between Scene + Game panel views). `LightUniforms` deleted; `LightGatherer` + `CaptureSnapshot` 64-cap dropped. `ShadeMode::ClustersDensity` true 3D depth-sampled heat-map (`cluster_viz.frag` samples SceneDepth, computes per-fragment Olsson slice, tints by count). All composes with `GPUTaggedPageAllocator` + per-frame-descriptor-set-cycling + async-compute queue topology — no new allocator/sync primitive. Two bugs caught in smoke (BufferHandle 1-based indexing; lost SubRegion offsets in cluster bindings) → new RG hazard documented (BufferHandle is for barrier tracking, not descriptor binding) | 2026-05-22 |
+| v3.0.3 | `volumetric-fog` | rt-renderer A.4. Wronski frustum voxel volumetric fog. Per-view 160×90×128 RGBA16F 3D atlas; two async-compute passes (`VolumetricInjectPass` writes per-voxel dir-light + cluster point lights + CSM shadow attenuation + local `Component::FogVolume` modulation; `VolumetricIntegratePass` walks Z front-to-back accumulating Beer-Lambert transmittance + in-scatter). Graphics composite pass blends the integrated atlas into HDR sceneColor via standard alpha blend — shader emits `(fogColor, fogOpacity)` so `src·src.a + dst·(1-src.a)` produces the desired Beer-Lambert composite without feedback loops or scratch HDR targets. Analytic global distance + height fog layered in composite. `VKTexture` gains generalized 3D ctor (`VK_IMAGE_TYPE_3D` + `VK_IMAGE_VIEW_TYPE_3D` branching, null sampler). New `VolumetricSubsystem` sibling to GTAOSubsystem; new `Component::FogVolume` tagged-union (Box / Sphere) with inspector drawer; `EditorSettings.enableVolumetricFog` master toggle gates the chain. Persistent atlases via VMA, per-frame FogVolume SSBO via `GPUTaggedPageAllocator`. Temporal accumulation + Hillaire multi-scatter + ShadeMode debug viz deferred to follow-up `volumetric-fog-polish` (atlas slot allocated, hooks present). Two benign validation issues documented (sceneDepth DSA-vs-SHADER_READ across queue cycle; inject UAB on per-frame rewrites) — non-blocking, owned by follow-up | 2026-05-23 |
+| v3.0.4 | `volumetric-validation` | Closes the v3.0.3 known-issue VUIDs. Originally scoped as `rg-depth-handoff` after the v3.0.3 history misdiagnosed VUID-09600 as a sceneDepth cross-queue layout-handoff bug; targeted instrumentation revealed the offending VkImage was actually the shadow map (`arrayLayer=3`), not sceneDepth. Four fixes: (1) `RenderGraph::Execute` image barriers now set `srcQueueFamilyIndex = dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED` per `VUID-VkImageMemoryBarrier2-image-04071` for CONCURRENT-shared images — buffer barriers + 30+ other sites already did this, central RG was the outlier. (2) `AddInjectPass` takes `shadowHandles[]` and declares per-cascade `ReadStorageImage` so the solver emits `DSA → SHADER_READ_ONLY` barriers (silences VUID-09600 on shadow array). (3) `AddIntegratePass` reuses inject's atlas handles (no double `ImportResource` — arch hazard #1) and returns post-write `inScatter`; `AddCompositePass` takes it and declares `builder.Read` (silences VUID-09600 on volInScatter). (4) Inject descriptor layout bindings 2-5 get `UPDATE_AFTER_BIND` flag + layout `UPDATE_AFTER_BIND_POOL` flag (silences VUID-03047 on per-frame rewrites). New 4th hazard entry in `arch/rendering-pipeline.md`. Follow-up noted: `isCrossQueue` only tracks `lastWriter`, missing the read-then-write-cross-queue case — harmless under semaphore-driven sync, picked up in a future RG hardening pass | 2026-05-23 |
+| v3.0.5 | `volumetric-fog-polish` (initial) | rt-renderer A.4 follow-up. Lands the three deferred sub-tasks from `volumetric-fog` (Hillaire multi-scatter scalar, temporal accumulation, ShadeMode debug viz) plus 9 audit-driven fixes. Load-bearing change: **temporal accumulation moved to a dedicated `VolumetricResolve` compute pass** after integrate (the initial inject-time blend produced energy non-conservation, ~15% of correct brightness under stationary camera). Resolve reads scratch + reprojected prev-resolved + Karis 3×3×3 clamp + temporalAlpha blend → parity-ping-pong over `volInScatterHistA/B`. Plus: HG phase function (g configurable), point-light 1/d², sun-fog 4-step absorption ray-march, IBL irradiance for proper Wronski multi-scatter (replaces misnamed multiplicative boost), emit-term physics fix, half-step transmittance for slice-center alignment, composite invView push constant, sky-fog opacity cap, configurable atlas resolution (Quality enum Low/Medium/High), shader `#include` support via shaderc IncluderInterface, all 11 settings exposed in RenderPanel + tooltips, FogVolume viewport gizmos, tone-mapped viz output, k_ClusterSlicesZ 24→48 (halves Z-banding granularity) | 2026-05-24 |
+| v3.0.6 | `volumetric-fog-polish` (follow-up) | rt-renderer A.4 follow-up², driven by post-v3.0.5 smoke testing. **Inject pass split into two compute passes** (density + scatter) joined by RG barrier — unlocks sampling the density atlas at neighboring voxels for proper Hillaire-style sun-ray absorption (the v3.0.5 single-pass `SunFogTransmittance` was dead-code: `steps` cancelled out of the math, producing the same `exp(-0.5·farZ·voxelDensity)` regardless of step count). Density pass writes `vec4(density, tint.rgb)` to volDensity (tint packed into `.gba`); scatter pass reads via sampler3D for CSM+HG+multi-scatter math + along-the-sun-ray density samples. **Canonical inject/integrate math contract**: drops spurious `× density` in scatter — integrate's `(1 − exp(−σ_t · dt))` already supplies the σ_t path factor (Wronski 2014 / Hillaire 2015); pre-multiplying double-applied σ_t and dimmed fog by ~10× at density 0.1. CONTRACT comment in both shaders + new "Cross-pass numerical contracts" hazard in `arch/rendering-pipeline.md`. New `scatteringIntensity` post-canonical artistic multiplier (UE5 / Frostbite-style knob) for the off-axis brightness lift HG inherently leaves dim. New 3D Worley-FBM density-modulation noise (128³ bake at Init, world-space sample with wind drift). Default settings recalibrated for canonical math (density 0.1, anisotropy 0.7, multi-scatter 0.15, sun-steps 2, scatteringIntensity 15, Quality High). Three intervening fixes: shader compile errors on first scene load, cluster_build/light_assign SLICES_Z mismatch, viz desc-pool silent overflow | 2026-05-25 |
 
 ---
 
@@ -92,19 +99,66 @@
 
 Effort scale (scope/difficulty, not calendar time): **S** = small, contained · **M** = some design decisions · **L** = significant refactor or new system · **XL** = full new subsystem.
 
-### Renderer pipeline (linear dependency chain)
+### Active series — `rt-renderer` (Mode A, v3.0.0)
 
-| Pri | Epic | Issue | Target | Effort | Deps |
-|---|---|---|---|---|---|
-| 1 | `forward-plus` | [#54](https://github.com/Hekbas/Luth/issues/54) | v2.13.0 | L | `async-compute-queue` ✅ |
-| 2 | `gpu-particles` | [#57](https://github.com/Hekbas/Luth/issues/57) | v2.14.0 | L | `forward-plus` |
+RT-first renderer modernization arc. Clustered Forward+ with bindless throughout, hardware ray tracing for shadows / GI / reflections, full Wronski volumetrics, ReSTIR + SVGF denoising, path-traced reference mode. Target showcase: Bhaal Temple, fully RT-lit. RT-mandatory (raises minimum HW to RT-capable GPU — counted toward the MAJOR bump).
+
+Mode A — series start bumps `Version.h` to `3.0.0` (`bindless-migration`). Intermediate efforts PATCH-bump from there (`v3.0.1` onwards), tag-only — no per-effort Release. Milestone Release at series end.
+
+Umbrella issue: [#TBD] (sub-effort issues created on demand; commits use `Part of #<umbrella>` trailer).
+
+**Phase A — Modern foundation**
+
+| Effort | Issue | Size | Notes |
+|---|---|---|---|
+| A.1 `bindless-migration` | NEW | L | Descriptor indexing across all shaders; foundational for cluster light lookups + RT material handles |
+| A.2 `slim-gbuffer` | NEW | M | Normal + roughness + motion vectors + material ID; feeds TAA + RT denoising |
+| A.3 `forward-plus` ✅ | [#54](https://github.com/Hekbas/Luth/issues/54) | L | Clustered lighting + light assignment (existing #54 scope) — shipped v3.0.2 |
+| A.4 `volumetric-fog` ✅ | [#130](https://github.com/Hekbas/Luth/issues/130) | L | Wronski frustum voxel; light injection + integrate + composite — shipped v3.0.3 (+ `volumetric-fog-polish` v3.0.5/v3.0.6 [#132](https://github.com/Hekbas/Luth/issues/132) added temporal resolve, split inject + canonical math contract, scatter intensity knob, noise modulation) |
+| A.5 `image-quality` | NEW | M | TAA (Karis14) + specular AA (Tokuyoshi19) + ACES/AgX tone-map A/B |
+
+**Phase B — Hardware RT foundation**
+
+| Effort | Issue | Size | Notes |
+|---|---|---|---|
+| B.1 `rt-extensions` | NEW | M | `VK_KHR_acceleration_structure` + `ray_tracing_pipeline` integration |
+| B.2 `blas-tlas` | NEW | L | Per-mesh BLAS + per-frame TLAS rebuild for dynamic objects |
+| B.3 `rt-shadows` | NEW | L | Replace raster CSM with RT shadow rays (CSM path retired) |
+
+**Phase C — RT global illumination**
+
+| Effort | Issue | Size | Notes |
+|---|---|---|---|
+| C.1 `restir-di` | NEW | XL | Bitterli 2020 — direct lighting reservoir resampling |
+| C.2 `svgf-denoiser` | NEW | XL | Schied 2017 + A-SVGF; denoiser abstraction layer for future NRD swap |
+| C.3 `restir-gi` | NEW | XL | Ouyang 2021 — indirect bounce reservoirs |
+
+**Phase C.5 — Path-traced reference mode**
+
+| Effort | Issue | Size | Notes |
+|---|---|---|---|
+| C.5 `path-trace-reference` | NEW | M | Ground-truth PT mode reusing C.* infrastructure; validates RT GI convergence |
+
+**Phase D — RT reflections + atmospheric polish**
+
+| Effort | Issue | Size | Notes |
+|---|---|---|---|
+| D.1 `rt-reflections` | NEW | L | Stochastic ray reflections + denoise (supersedes planned SSR) |
+| D.2 `volumetric-rt-shadows` | NEW | M | Shadow rays from voxel volume cells |
+| D.3 `gpu-particles` | [#57](https://github.com/Hekbas/Luth/issues/57) | L | Compute sim; showcase-sized scope (fire / ember / smoke / motes in god ray) |
+
+**Out of arc (deferred to follow-up series)**
+
+- `character-shading` — skin (Jimenez15) + hair (Karis16 + Marschner03) + cloth (Estevez17). Triggered by adding a character to Bhaal Temple
+- `gpu-driven` — mesh shaders + meshlet baker + HiZ occlusion (Framework 5 alignment)
+- `virtual-geometry` — Nanite-class virtualized geometry; long-tail
 
 ### Gameplay enablement
 
 | Pri | Epic | Issue | Target | Effort | Deps |
 |---|---|---|---|---|---|
-| 4 | `scripting` (C# or Lua) | NEW | v2.15.0 | XL | — |
-| 5 | `prefab-system` | NEW | v2.15.x | M | `scripting` |
+| 4 | `scripting` (C# or Lua) | NEW | v3.1.0 | XL | `rt-renderer` |
+| 5 | `prefab-system` | NEW | v3.1.x | M | `scripting` |
 
 Scripting unblocks the `PlayerControllerSystem` stub deletion and is the prerequisite for most gameplay-side future ideas.
 
@@ -112,7 +166,7 @@ Scripting unblocks the `PlayerControllerSystem` stub deletion and is the prerequ
 
 | Pri | Epic | Issue | Target | Effort | Deps |
 |---|---|---|---|---|---|
-| 6 | `animation-controller-v2` | [#94](https://github.com/Hekbas/Luth/issues/94) | v2.16.0 | XL | `animation-quick-pass` ✅ |
+| 6 | `animation-controller-v2` | [#94](https://github.com/Hekbas/Luth/issues/94) | v3.2.0 | XL | `animation-quick-pass` ✅ |
 
 ### Polish (no fixed slot — opportunistic)
 
@@ -120,8 +174,9 @@ Scripting unblocks the `PlayerControllerSystem` stub deletion and is the prerequ
 |---|---|---|---|
 | `procedural-sky` | NEW | M | Independent; drop into any quiet renderer slot |
 | `jiggle-bones` | [#61](https://github.com/Hekbas/Luth/issues/61) | M | Benefits from `jolt-physics` ✅ colliders |
-| `fxaa-taa` | [#72](https://github.com/Hekbas/Luth/issues/72) | M | TAA pairs with GTAO temporal accumulation |
-| `rg-aliasing` (optional) | NEW | M | Defer unless `forward-plus` pressures transient VRAM |
+| `rg-aliasing` (optional) | NEW | M | Defer unless `rt-renderer` Phase A/D pressures transient VRAM |
+
+> `fxaa-taa` ([#72](https://github.com/Hekbas/Luth/issues/72)) — TAA absorbed into rt-renderer Phase A.5; FXAA dropped (TAA is strictly better given motion vectors land in Phase A.2).
 
 > Detailed design lives in `docs/development/epics/<slug>.md` (local, never committed) once an epic enters plan-mode. The arch docs ([`arch/`](arch/)) are the canonical reference for system invariants.
 

@@ -18,6 +18,7 @@
 #include "luth/renderer/subsystems/LightingSubsystem.h"
 #include "luth/renderer/subsystems/GeometrySubsystem.h"
 #include "luth/renderer/subsystems/GTAOSubsystem.h"
+#include "luth/renderer/subsystems/VolumetricSubsystem.h"
 #include "luth/renderer/subsystems/PostProcessSubsystem.h"
 #include "luth/renderer/subsystems/EditorOverlaysSubsystem.h"
 #include "luth/renderer/subsystems/DebugDrawSubsystem.h"
@@ -101,6 +102,21 @@ namespace Luth
         std::shared_ptr<Texture> gtaoEdges;
         std::shared_ptr<Texture> gtaoFinal;
 
+        // Volumetric fog atlases (RGBA16F). View-frustum-aligned; persistent across frames so the
+        // resolve pass can reproject + blend with prev frame's resolved output. Allocated via the
+        // 3D VKTexture ctor (STORAGE + SAMPLED, null internal sampler — VolumetricSubsystem owns
+        // the shared linear-clamp sampler). Dims pulled from VolumetricSettings::quality preset.
+        //
+        // volInScatter is the scratch atlas — inject writes pre-integrate per-voxel scatter, then
+        // integrate reads + writes the post-integrate cumulative in-place. volInScatterHistA/B
+        // ping-pong as the temporal-resolve I/O pair: each frame the resolve pass reads one as
+        // "prev resolved" and writes the other as "current resolved". Composite + viz sample the
+        // "current resolved" atlas of the active frame parity.
+        std::shared_ptr<Texture> volDensity;
+        std::shared_ptr<Texture> volInScatter;
+        std::shared_ptr<Texture> volInScatterHistA;
+        std::shared_ptr<Texture> volInScatterHistB;
+
         // Bloom extract / blur / composite — bind view's SceneColor +
         // bloomA/B + shared PP UBO. Cycled — UpdateUBO writes binding 2 of
         // all 4 sets atomically against the per-frame slot.
@@ -118,6 +134,64 @@ namespace Luth
         // scene view (game view's subgraph skips both passes via flags).
         VkDescriptorSet outlineDescSet = VK_NULL_HANDLE;
         std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> gridDescSet{};
+
+        // Slim G-buffer live viz (ShadeMode toggle). Single set, written once at AllocateViewResources
+        // time pointing at the 4 slim FrameTargets. Bindings: 0=normal, 1=roughness, 2=motion, 3=matID.
+        VkDescriptorSet slimVizDescSet = VK_NULL_HANDLE;
+
+        // Forward+ cluster compute descriptor sets. Cycled — each frame the cluster AABB + grid
+        // tagged-heap regions get rewritten into the slot's bindings before dispatch.
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> clusterBuildDescSet{};
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> lightAssignDescSet{};
+
+        // Volumetric inject density pass. Cycled — b1 (FogVolume SSBO) rewrites per frame against
+        // a fresh tagged-heap region; b0 + b2 are stable per-view.
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> volInjectDensityDescSet{};
+
+        // Volumetric inject scatter pass. Cycled — b2-b4 (Light, ClusterGrid, LightIndex SSBOs)
+        // rewrite per frame; b0/b1/b5 stable. Reads volDensity written by the density pass via the
+        // shared ResourceNode (RG inserts the barrier).
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> volInjectScatterDescSet{};
+
+        // Volumetric integrate pass. Cycled; reads + writes volInScatter (scratch) in-place.
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> volIntegrateDescSet{};
+
+        // Volumetric resolve pass. Cycled; reads scratch + prev history (parity), writes curr
+        // history (parity). Temporal accumulation happens here, post-integrate.
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> volResolveDescSet{};
+
+        // Volumetric composite. Cycled — b1 (in-scatter sampler) parity-picks the resolved history
+        // atlas (HistA or HistB). b0 (sceneDepth sampler) is stable across slots.
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> volCompositeDescSet{};
+
+        // Volumetric debug viz. Cycled — b2 follows the same ping-pong parity as composite.
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> volVizDescSet{};
+
+        // Set 3 (Lighting). Per-view because cluster grid + light index are per-view; LightSSBO
+        // also lives in a per-view tagged-heap region. b3 (shadow sampler) written once at view
+        // alloc time, propagates to all slots. b0/b1/b2 rebound each frame by UploadLightingResources.
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> lightDescSet{};
+
+        // Cluster debug viz: single set, 1 binding = SceneDepth sampler. Stable per-view; written
+        // by WriteClusterVizView at AllocateViewResources time.
+        VkDescriptorSet clusterVizDescSet = VK_NULL_HANDLE;
+
+        // Per-view previous-frame view-projection — feeds ubo.prevViewProjection for motion vectors.
+        // GlobalSubsystem::m_CachedViewProj is shared across views, so multi-view rendering (Scene +
+        // Game panel) cross-contaminates the prev-VP. Per-view storage keeps each view's prev-VP
+        // independent. Identity-initialized → frame 0 has nonsense motion, settles by frame 1.
+        Mat4 prevViewProj{ 1.0f };
+
+        // Prev-frame near/far for the resolve pass's reprojection slice math — needed because the
+        // current frame's nearZ/farZ may differ if camera FOV/clip planes animate.
+        f32 prevNearZ = 0.0f;
+        f32 prevFarZ  = 0.0f;
+
+        // Volumetric atlas dimensions live here so changing VolumetricSettings::quality at runtime
+        // re-allocates the atlases (mirrors width/height resize handling). volQualityCached tracks
+        // the value at last allocation; EnsureViewResources compares + recreates on mismatch.
+        u32 volDimX = 0, volDimY = 0, volDimZ = 0;
+        u32 volQualityCached = ~0u;
     };
 
     // Orchestrates per-frame render-graph assembly and execution. Created by RenderingSystem and
@@ -181,14 +255,11 @@ namespace Luth
         void BuildGPUObjectBuffer(const RenderSnapshot& snapshot);
         u32  EnsureMaterialRegistered(std::shared_ptr<Material> material);
 
-        // Uploads LightUniforms to the light UBO. Called from RenderingSystem::
-        // Update after LightingSystem populates the struct.
-        void UploadLightUBO(const LightUniforms& lights);
-
         // Editor + frame-debugger lookups (RenderingSystem forwards to these).
         std::shared_ptr<Texture> GetNamedTexture(const std::string& name) const;
         void ReplayPassUpToDraw(u32 passIdx, u32 localDrawIdx);
         void BlitArchivedDepthToPreview(u32 archiveIdx, int layer, float nearZ, float farZ);
+        void BlitArchivedSlimToPreview(u32 archiveIdx, u32 mode, float scale);
 
         // Maps consumed by DrawListBuilder (populated by BuildGPUObjectBuffer).
         const std::unordered_map<UUID, u32, UUIDHash>& GetMaterialSlotMap() const { return m_Geometry.GetMaterialSlotMap(); }
@@ -282,6 +353,7 @@ namespace Luth
         LightingSubsystem       m_Lighting;
         GeometrySubsystem       m_Geometry;
         GTAOSubsystem           m_GTAO;
+        VolumetricSubsystem     m_Volumetric;
         PostProcessSubsystem    m_PostProcess;
         EditorOverlaysSubsystem m_EditorOverlays;
         DebugDrawSubsystem      m_DebugDraw;
@@ -310,6 +382,9 @@ namespace Luth
         VkImageView GetDepthPreviewView()    const;
         u32         GetDepthPreviewWidth()   const;
         u32         GetDepthPreviewHeight()  const;
+        VkImageView GetSlimPreviewView()     const;
+        u32         GetSlimPreviewWidth()    const;
+        u32         GetSlimPreviewHeight()   const;
         const RG::RenderGraphSnapshot& GetGraphSnapshot() const { return m_GraphSnapshot; }
 
         // Resets the per-draw preview cache key — called from RS::ExitCapture.

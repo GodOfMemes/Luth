@@ -489,10 +489,12 @@ namespace Luth::RG
             case TextureFormat::BGRA8_Unorm:       return VK_FORMAT_B8G8R8A8_UNORM;
             case TextureFormat::R8_Unorm:          return VK_FORMAT_R8_UNORM;
             case TextureFormat::RGBA16_Float:      return VK_FORMAT_R16G16B16A16_SFLOAT;
+            case TextureFormat::RG16_Float:        return VK_FORMAT_R16G16_SFLOAT;
             case TextureFormat::R32_Float:         return VK_FORMAT_R32_SFLOAT;
             case TextureFormat::D32_Float:         return VK_FORMAT_D32_SFLOAT;
             case TextureFormat::D24_Unorm_S8_Uint: return VK_FORMAT_D24_UNORM_S8_UINT;
             case TextureFormat::R32_Uint:          return VK_FORMAT_R32_UINT;
+            case TextureFormat::R16_Uint:          return VK_FORMAT_R16_UINT;
             default:                               return VK_FORMAT_R8G8B8A8_UNORM;
         }
     }
@@ -681,14 +683,16 @@ namespace Luth::RG
 
                 VkImageMemoryBarrier2& vkBarrier = imgBarriers[imgBarrierCount++];
                 vkBarrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-                vkBarrier.srcStageMask  = srcStage;
-                vkBarrier.srcAccessMask = srcAccess;
-                vkBarrier.dstStageMask  = dstStage;
-                vkBarrier.dstAccessMask = dstAccess;
-                vkBarrier.oldLayout     = GetLayout(b.before);
-                vkBarrier.newLayout     = GetLayout(b.after);
-                vkBarrier.image         = res.image;
-                vkBarrier.subresourceRange = { GetAspect(res.desc.format), 0, 1, res.baseArrayLayer, res.layerCount };
+                vkBarrier.srcStageMask        = srcStage;
+                vkBarrier.srcAccessMask       = srcAccess;
+                vkBarrier.dstStageMask        = dstStage;
+                vkBarrier.dstAccessMask       = dstAccess;
+                vkBarrier.oldLayout           = GetLayout(b.before);
+                vkBarrier.newLayout           = GetLayout(b.after);
+                vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                vkBarrier.image               = res.image;
+                vkBarrier.subresourceRange    = { GetAspect(res.desc.format), 0, 1, res.baseArrayLayer, res.layerCount };
             }
 
             for (const auto& b : pass.bufferPreBarriers)
@@ -740,14 +744,16 @@ namespace Luth::RG
 
                     VkImageMemoryBarrier2& vkBarrier = imgBarriers[imgBarrierCount++];
                     vkBarrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-                    vkBarrier.srcStageMask    = srcStage;
-                    vkBarrier.srcAccessMask   = srcAccess;
-                    vkBarrier.dstStageMask    = dstStage;
-                    vkBarrier.dstAccessMask   = dstAccess;
-                    vkBarrier.oldLayout       = GetLayout(b.before);
-                    vkBarrier.newLayout       = GetLayout(b.after);
-                    vkBarrier.image           = res.image;
-                    vkBarrier.subresourceRange = { GetAspect(res.desc.format), 0, 1, res.baseArrayLayer, res.layerCount };
+                    vkBarrier.srcStageMask        = srcStage;
+                    vkBarrier.srcAccessMask       = srcAccess;
+                    vkBarrier.dstStageMask        = dstStage;
+                    vkBarrier.dstAccessMask       = dstAccess;
+                    vkBarrier.oldLayout           = GetLayout(b.before);
+                    vkBarrier.newLayout           = GetLayout(b.after);
+                    vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    vkBarrier.image               = res.image;
+                    vkBarrier.subresourceRange    = { GetAspect(res.desc.format), 0, 1, res.baseArrayLayer, res.layerCount };
                 }
                 VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
                 dep.imageMemoryBarrierCount = imgBarrierCount;

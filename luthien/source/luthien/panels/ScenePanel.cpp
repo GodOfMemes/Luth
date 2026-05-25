@@ -202,7 +202,12 @@ namespace Luth
 
                 // Debug split — icon toggles current<->lastDebugMode; chevron picks the mode.
                 {
-                    const bool dbgActive = (curMode == (int)ShadeMode::Normals) || (curMode == (int)ShadeMode::EntityID);
+                    const bool dbgActive = (curMode == (int)ShadeMode::Normals)
+                                        || (curMode == (int)ShadeMode::EntityID)
+                                        || (curMode >= (int)ShadeMode::SlimNormal && curMode <= (int)ShadeMode::SlimMaterialID)
+                                        || (curMode == (int)ShadeMode::ClustersDensity)
+                                        || (curMode == (int)ShadeMode::VolumetricDensity)
+                                        || (curMode == (int)ShadeMode::VolumetricInScatter);
                     bool dbgState = dbgActive;
                     if (UI::SplitToggleButton("Debug", ICON_FA_BUG, "Debug Render Modes", &dbgState,
                         [&]() {
@@ -214,6 +219,40 @@ namespace Luth
                             if (ImGui::RadioButton("EntityID", curMode == (int)ShadeMode::EntityID)) {
                                 settings.lastDebugMode = (u8)ShadeMode::EntityID;
                                 m_RenderingSystem->SetShadeMode(ShadeMode::EntityID);
+                            }
+                            ImGui::Separator();
+                            ImGui::TextDisabled("Slim G-buffer");
+                            if (ImGui::RadioButton("Slim Normal",       curMode == (int)ShadeMode::SlimNormal)) {
+                                settings.lastDebugMode = (u8)ShadeMode::SlimNormal;
+                                m_RenderingSystem->SetShadeMode(ShadeMode::SlimNormal);
+                            }
+                            if (ImGui::RadioButton("Slim Roughness",    curMode == (int)ShadeMode::SlimRoughness)) {
+                                settings.lastDebugMode = (u8)ShadeMode::SlimRoughness;
+                                m_RenderingSystem->SetShadeMode(ShadeMode::SlimRoughness);
+                            }
+                            if (ImGui::RadioButton("Slim Motion",       curMode == (int)ShadeMode::SlimMotion)) {
+                                settings.lastDebugMode = (u8)ShadeMode::SlimMotion;
+                                m_RenderingSystem->SetShadeMode(ShadeMode::SlimMotion);
+                            }
+                            if (ImGui::RadioButton("Slim Material ID",  curMode == (int)ShadeMode::SlimMaterialID)) {
+                                settings.lastDebugMode = (u8)ShadeMode::SlimMaterialID;
+                                m_RenderingSystem->SetShadeMode(ShadeMode::SlimMaterialID);
+                            }
+                            ImGui::Separator();
+                            ImGui::TextDisabled("Forward+ Clusters");
+                            if (ImGui::RadioButton("Cluster Density",   curMode == (int)ShadeMode::ClustersDensity)) {
+                                settings.lastDebugMode = (u8)ShadeMode::ClustersDensity;
+                                m_RenderingSystem->SetShadeMode(ShadeMode::ClustersDensity);
+                            }
+                            ImGui::Separator();
+                            ImGui::TextDisabled("Volumetric Fog");
+                            if (ImGui::RadioButton("Vol Density",       curMode == (int)ShadeMode::VolumetricDensity)) {
+                                settings.lastDebugMode = (u8)ShadeMode::VolumetricDensity;
+                                m_RenderingSystem->SetShadeMode(ShadeMode::VolumetricDensity);
+                            }
+                            if (ImGui::RadioButton("Vol In-Scatter",    curMode == (int)ShadeMode::VolumetricInScatter)) {
+                                settings.lastDebugMode = (u8)ShadeMode::VolumetricInScatter;
+                                m_RenderingSystem->SetShadeMode(ShadeMode::VolumetricInScatter);
                             }
                             ImGui::PopFont();
                         }))

@@ -14,6 +14,7 @@
 #include "luth/renderer/rendergraph/FrameCapture.h"
 #include "luth/renderer/lighting/LightTypes.h"
 #include "luth/renderer/settings/PostProcessSettings.h"
+#include "luth/renderer/settings/VolumetricSettings.h"
 
 #include <entt/entt.hpp>
 #include <memory>
@@ -28,6 +29,7 @@ namespace Luth
     // Per-frame global shader inputs (Set 0 UBO). Layout mirrors GLSL binding.
     struct GlobalUniforms {
         Mat4 viewProjection;
+        Mat4 prevViewProjection;  // frame N reads frame N-1's VP (motion vectors + TAA reprojection)
         Mat4 view;
         Mat4 projection;
         Vec3 cameraPos;
@@ -41,14 +43,59 @@ namespace Luth
         float     skyboxIntensity;
         float     debugVisualizeCascades;
         float     cascadeBlendWidth;
+        Vec2      viewportSize;        // pixels (W, H) — fragment cluster ID, screen-space reconstruction
+        float     nearZ;
+        float     farZ;
+        // Volumetric fog params. rgb/a packing keeps the std140 ride efficient — 4 vec4 = 64 B.
+        // .a of distanceFogColorDensity / heightFogColorDensity carries density (single-channel).
+        // distanceFogParams: x = start, y = maxOpacity, z = enabled flag (0/1), w = pad.
+        // heightFogParams:   x = refHeight, y = falloff, z = enabled flag, w = multiScatterIntensity.
+        Vec4 distanceFogColorDensity;
+        Vec4 distanceFogParams;
+        Vec4 heightFogColorDensity;
+        Vec4 heightFogParams;
+        // x = anisotropy (HG g), y = temporalAlpha, z = sunFogAbsorptionSteps (cast),
+        // w = skyFogStrength.
+        Vec4 volTemporalParams;
+        // x = prevNearZ, y = prevFarZ, z/w = pad. Cached for cross-frame reprojection so the resolve
+        // pass can reconstruct prev view-Z without assuming nearZ/farZ are constant.
+        Vec4 prevViewParams;
+        // x = noiseScale (world-space frequency, 1/wavelength_m), y = noiseStrength (0..1 modulation
+        // amplitude), z/w pad. Drives the Worley-FBM density-noise term in the inject shader.
+        Vec4 volNoiseParams;
+        // xyz = wind direction × speed (m/s) — animates the noise sample UV over time, w pad.
+        Vec4 volNoiseWind;
+        // x = scatteringIntensity (post-canonical artistic multiplier on inject_scatter's output;
+        // matches UE5 "Scattering Distribution" / Frostbite multiplier). yzw reserved.
+        Vec4 volScatterParams;
     };
 
-    enum class ShadeMode : u8 { Lit = 0, Unlit, Wireframe, Normals, EntityID };
+    enum class ShadeMode : u8 {
+        Lit = 0, Unlit, Wireframe, Normals, EntityID,
+        // Slim G-buffer live viz — bypasses tonemap and blits the selected attachment to LDR.
+        // Implemented in PostProcessSubsystem::AddSlimVizPass via slim_viz.frag.
+        SlimNormal, SlimRoughness, SlimMotion, SlimMaterialID,
+        // Forward+ cluster density viz — samples SceneDepth to compute the per-fragment 3D cluster
+        // ID and heat-maps the cluster's light count over LDR. LightingSubsystem::AddClusterVizPass.
+        ClustersDensity,
+        // Volumetric fog atlas viz — samples SceneDepth to derive the Wronski slice, then reads
+        // the per-view fog atlas. Two modes: density heat-map and integrated in-scatter radiance.
+        VolumetricDensity, VolumetricInScatter
+    };
 
     struct GeometryOutput {
         RG::ResourceHandle color;
         RG::ResourceHandle depth;
         RG::ResourceHandle entityID;
+    };
+
+    // SlimGBufferPass outputs — written between DepthPrepass and GTAO Prefilter. Consumed by
+    // A.5 TAA (motion), Phase B/C RT denoisers (normal + roughness), D RT reflections (normal).
+    struct SlimGBufferOutput {
+        RG::ResourceHandle normal;     // RG16F — octahedral world-space normal
+        RG::ResourceHandle roughness;  // R8    — perceptual roughness
+        RG::ResourceHandle motion;     // RG16F — NDC delta (currNDC - prevNDC)
+        RG::ResourceHandle materialID; // R16U  — bindless material slot
     };
 
     struct SelectionMaskOutput {
@@ -91,6 +138,9 @@ namespace Luth
         }
         PostProcessSettings& GetPostProcessSettings() { return m_PostProcessSettings; }
         const PostProcessSettings& GetPostProcessSettings() const { return m_PostProcessSettings; }
+
+        VolumetricSettings& GetVolumetricSettings() { return m_VolumetricSettings; }
+        const VolumetricSettings& GetVolumetricSettings() const { return m_VolumetricSettings; }
 
         u64 GetFrameAllocatorUsage() const { return m_FrameAllocator->GetUsedMemory(); }
         u64 GetFrameAllocatorTotal() const { return m_FrameAllocator->GetTotalSize(); }
@@ -163,6 +213,11 @@ namespace Luth
         u32         GetDepthPreviewWidth()  const;
         u32         GetDepthPreviewHeight() const;
 
+        void        BlitArchivedSlimToPreview(u32 archiveIdx, u32 mode, float scale);
+        VkImageView GetSlimPreviewView()    const;
+        u32         GetSlimPreviewWidth()   const;
+        u32         GetSlimPreviewHeight()  const;
+
     private:
         // Run the per-view prep chain (lighting fit, PrepareForTargets, UBO uploads) and record the subgraph
         // into the view's QueueRecorders triplet. Returns true iff the graph routed any pass to async-compute —
@@ -194,6 +249,7 @@ namespace Luth
 
         // Editor-facing state.
         PostProcessSettings m_PostProcessSettings;
+        VolumetricSettings  m_VolumetricSettings;
         ShadeMode           m_ShadeMode    = ShadeMode::Lit;
         bool                m_GridVisible  = true;
 

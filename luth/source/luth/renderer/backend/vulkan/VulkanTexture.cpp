@@ -27,6 +27,7 @@ namespace Luth
             case TextureFormat::D32_Float:       return VK_FORMAT_D32_SFLOAT;
             case TextureFormat::D24_Unorm_S8_Uint: return VK_FORMAT_D24_UNORM_S8_UINT;
             case TextureFormat::R32_Uint:        return VK_FORMAT_R32_UINT;
+            case TextureFormat::R16_Uint:        return VK_FORMAT_R16_UINT;
             default:                             return VK_FORMAT_R8G8B8A8_UNORM;
         }
     }
@@ -94,6 +95,13 @@ namespace Luth
         CreateViewAndSampler();
     }
 
+    VKTexture::VKTexture(u32 width, u32 height, u32 depth, TextureFormat format, VkImageUsageFlags extraUsage)
+        : m_Width(width), m_Height(height), m_Depth(depth), m_Format(format), m_ExtraUsage(extraUsage)
+    {
+        CreateImage(nullptr);
+        CreateViewAndSampler();
+    }
+
     VKTexture::~VKTexture()
     {
         // Must precede image/view/sampler teardown so the pump cannot deref freed handles.
@@ -138,14 +146,25 @@ namespace Luth
             }
         }
 
+        const bool isVolume = (m_Depth > 1);
+
         VkImageCreateInfo imageInfo{};
         imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        imageInfo.imageType = VK_IMAGE_TYPE_2D;
         imageInfo.extent.width = m_Width;
         imageInfo.extent.height = m_Height;
-        imageInfo.extent.depth = 1;
         imageInfo.mipLevels = m_MipLevels;
-        imageInfo.arrayLayers = m_ArrayLayers;
+        if (isVolume)
+        {
+            imageInfo.imageType = VK_IMAGE_TYPE_3D;
+            imageInfo.extent.depth = m_Depth;
+            imageInfo.arrayLayers = 1;        // 3D images use depth, not layers
+        }
+        else
+        {
+            imageInfo.imageType = VK_IMAGE_TYPE_2D;
+            imageInfo.extent.depth = 1;
+            imageInfo.arrayLayers = m_ArrayLayers;
+        }
         imageInfo.format = vkFmt;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -160,6 +179,14 @@ namespace Luth
             imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
                             | VK_IMAGE_USAGE_SAMPLED_BIT
                             | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        }
+        else if (isVolume)
+        {
+            // 3D atlases never render-target — only compute writes + shader reads.
+            // Caller-supplied extraUsage carries STORAGE_BIT.
+            imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                            | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                            | VK_IMAGE_USAGE_SAMPLED_BIT;
         }
         else
         {
@@ -242,6 +269,7 @@ namespace Luth
     {
         const bool isDepth = IsDepthFormat(m_Format);
         const bool isCubemap = (m_ArrayLayers == 6) && (m_CreateFlags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT);
+        const bool isVolume = (m_Depth > 1);
         VkFormat vkFmt = ToVkFormat(m_Format);
 
         VkImageViewCreateInfo viewInfo{};
@@ -249,6 +277,8 @@ namespace Luth
         viewInfo.image = m_Image;
         if (isCubemap)
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+        else if (isVolume)
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
         else if (m_ArrayLayers > 1 && isDepth)
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         else
@@ -278,9 +308,17 @@ namespace Luth
             return;
         }
 
-        // Integer textures (e.g. R32_Uint entity ID buffer) need nearest filtering
-        // and are not registered in bindless (sampled via dedicated descriptor).
-        if (m_Format == TextureFormat::R32_Uint)
+        // 3D atlases (volumetric in-scatter / density / history) carry no internal sampler —
+        // the owning subsystem supplies a linear-clamp sampler at descriptor-write time.
+        if (isVolume)
+        {
+            m_Sampler = VK_NULL_HANDLE;
+            return;
+        }
+
+        // Integer textures (e.g. R32_Uint entity ID buffer, R16_Uint slim G-buffer material ID)
+        // need nearest filtering and are not registered in bindless (sampled via dedicated descriptor).
+        if (m_Format == TextureFormat::R32_Uint || m_Format == TextureFormat::R16_Uint)
         {
             VkSamplerCreateInfo intSamplerInfo{};
             intSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -384,6 +422,7 @@ namespace Luth
             case TextureFormat::R32_Float: return "R32_Float";
             case TextureFormat::D32_Float: return "D32_Float";
             case TextureFormat::R32_Uint:  return "R32_Uint";
+            case TextureFormat::R16_Uint:  return "R16_Uint";
             default: return "Unknown";
         }
     }

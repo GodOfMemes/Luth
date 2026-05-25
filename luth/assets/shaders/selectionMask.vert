@@ -6,6 +6,7 @@ layout(location = 0) in vec3 a_Position;
 
 layout(set = 0, binding = 0) uniform GlobalUniforms {
     mat4 viewProjection;
+    mat4 prevViewProjection;  // frame N-1's VP — motion vectors + TAA reprojection
     mat4 view;
     mat4 projection;
     vec3 cameraPos;
@@ -19,6 +20,9 @@ layout(set = 0, binding = 0) uniform GlobalUniforms {
     float skyboxIntensity;
     float debugVisualizeCascades;
     float cascadeBlendWidth;
+    vec2  viewportSize;       // pixels — cluster ID + screen-space recon
+    float nearZ;
+    float farZ;
 } ubo;
 
 layout(push_constant) uniform PushConstants {
