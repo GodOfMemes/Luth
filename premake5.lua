@@ -16,10 +16,11 @@ workspace "Luth"
       "Dist"
    }
 
-   flags
+   --[[flags
 	{
-		"MultiProcessorCompile"
-	}
+		"multiprocessorcompile"
+	}]]
+	multiprocessorcompile(on)
 
    -- MSVC ASan emits container-annotation symbols into every TU that uses std::string/vector.
    -- Mixed ASan/non-ASan static libs trip LNK2038 annotate_string/vector mismatches; defining
