@@ -6,7 +6,9 @@ project "LuthTests"
    targetdir ("%{wks.location}/bin/" .. outputdir .. "/%{prj.name}")
    objdir ("%{wks.location}/bin-int/" .. outputdir .. "/%{prj.name}")
 
-   buildoptions { "/utf-8" }
+   filter "toolset:msc*"
+      buildoptions { "/utf-8" }
+   filter {}
 
    -- Mirror Luth/Jolt instruction-set defines so Jolt headers compile
    -- consistently with the lib (ABI mismatch otherwise).
@@ -48,11 +50,17 @@ project "LuthTests"
       "Luth",
       "Jolt",
       "Tracy",
-      "vulkan-1",
+      --"vulkan-1",
       "shaderc_shared",
-      "ws2_32",
-      "dbghelp"
+      --"ws2_32",
+      --"dbghelp"
    }
+
+   filter "system:windows"
+      links { "vulkan-1", "ws2_32", "dbghelp" }
+   filter "system:linux"
+      links { "vulkan" }
+   filter {}
 
    filter "configurations:Debug"
       defines { "LUTH_BUILD_DEBUG", "TRACY_ENABLE", "TRACY_FIBERS", "TRACY_ON_DEMAND",

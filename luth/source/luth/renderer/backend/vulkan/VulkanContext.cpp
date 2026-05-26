@@ -337,7 +337,8 @@ namespace Luth
                      && avail12.timelineSemaphore
                      && avail12.bufferDeviceAddress
                      && avail13.dynamicRendering
-                     && avail13.synchronization2;
+                     && avail13.synchronization2
+                     && avail13.shaderDemoteToHelperInvocation;
         if (!ok)
         {
             LH_CORE_CRITICAL("Required Vulkan 1.1/1.2/1.3 features missing on selected device — "
@@ -345,7 +346,7 @@ namespace Luth
                 "descriptorBindingSampledImageUpdateAfterBind={} descriptorBindingStorageBufferUpdateAfterBind={} "
                 "descriptorBindingStorageImageUpdateAfterBind={} descriptorBindingUniformBufferUpdateAfterBind={} "
                 "runtimeDescriptorArray={} shaderSampledImageArrayNonUniformIndexing={} timelineSemaphore={} "
-                "bufferDeviceAddress={} dynamicRendering={} synchronization2={}",
+                "bufferDeviceAddress={} dynamicRendering={} synchronization2={} shaderDemoteToHelperInvocation={}",
                 (bool)avail11.shaderDrawParameters,
                 (bool)avail12.descriptorBindingPartiallyBound,
                 (bool)avail12.descriptorBindingSampledImageUpdateAfterBind,
@@ -357,7 +358,8 @@ namespace Luth
                 (bool)avail12.timelineSemaphore,
                 (bool)avail12.bufferDeviceAddress,
                 (bool)avail13.dynamicRendering,
-                (bool)avail13.synchronization2);
+                (bool)avail13.synchronization2,
+                (bool)avail13.shaderDemoteToHelperInvocation);
         }
 
         // One VkDeviceQueueCreateInfo per distinct family. Up to 3 (graphics + async-compute + async-transfer);
@@ -420,6 +422,7 @@ namespace Luth
         features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
         features13.dynamicRendering = VK_TRUE;
         features13.synchronization2 = VK_TRUE;
+        features13.shaderDemoteToHelperInvocation = VK_TRUE;
         features13.pNext = &features12;
 
         VkDeviceCreateInfo createInfo{};

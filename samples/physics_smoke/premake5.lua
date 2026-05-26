@@ -83,7 +83,16 @@ project "JobSysProof"
       defines { "LUTH_BUILD_DEBUG", "JPH_ENABLE_ASSERTS", "JPH_DEBUG_RENDERER" }
       runtime "Release"
       symbols "on"
+   filter { "configurations:DebugASan", "toolset:msc*" }
       editandcontinue "Off"
       buildoptions { "/fsanitize=address" }
+   filter { "configurations:DebugASan", "system:linux" }
+      buildoptions {
+         "-fsanitize=address",
+         "-fno-omit-frame-pointer"
+      }
+      linkoptions {
+         "-fsanitize=address"
+      }
 
    filter {}

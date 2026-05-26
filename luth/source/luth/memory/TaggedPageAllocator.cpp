@@ -5,6 +5,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <sys/mman.h>
 #endif
 
 namespace Luth::Memory
@@ -40,6 +43,8 @@ namespace Luth::Memory
             MemoryTracker::RecordFree(Category::FrameTagged, PAGE_SIZE);
             #ifdef _WIN32
             VirtualFree(page->Base, 0, MEM_RELEASE);
+            #else
+            munmap(page->Base, PAGE_SIZE);
             #endif
             delete page;
         }
@@ -50,6 +55,8 @@ namespace Luth::Memory
             MemoryTracker::RecordFree(Category::FrameTagged, PAGE_SIZE);
             #ifdef _WIN32
             VirtualFree(page->Base, 0, MEM_RELEASE);
+            #else
+            munmap(page->Base, PAGE_SIZE);
             #endif
             delete page;
         }
@@ -130,6 +137,10 @@ namespace Luth::Memory
             page = new Page();
             #ifdef _WIN32
             page->Base = VirtualAlloc(nullptr, PAGE_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            #else
+            page->Base = mmap(nullptr, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            page->Base = page->Base == MAP_FAILED ? nullptr : page->Base;
             #endif
             
             if (!page->Base)

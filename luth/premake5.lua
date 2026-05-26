@@ -38,12 +38,21 @@ project "Luth"
       "source/**.h",
       "source/**.cpp",
       "source/**.asm",
+      "source/**.s",
    }
 
    filter "system:windows"
-      removefiles { "source/luth/platform/LinWindow.cpp" }
+      removefiles 
+      { 
+         "source/luth/platform/LinWindow.cpp",
+         "source/**.s"
+      }
    filter "system:linux"
-      removefiles { "source/luth/platform/WinWindow.cpp" }
+      removefiles 
+      { 
+         "source/luth/platform/WinWindow.cpp",
+         "source/**.asm"
+      }
    filter {}
    
    includedirs
@@ -96,7 +105,7 @@ project "Luth"
    filter "system:windows"
       links { "vulkan-1", "ws2_32", "dbghelp" }
    filter "system:linux"
-      links { "vulkan" }
+      links { "vulkan", "pthread" }
    filter {}
 
    filter "configurations:Debug"

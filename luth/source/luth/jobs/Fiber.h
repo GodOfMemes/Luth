@@ -11,6 +11,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <pthread.h>
 #endif
 
 // ASan fiber-switch annotations. Paired around each jump_fcontext switch so the
