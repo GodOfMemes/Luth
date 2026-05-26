@@ -108,7 +108,7 @@ namespace Luth::JobSystem::Platform
     #endif
     }
 
-    inline void WaitOnAddress(std::atomic<u32>* address, const u32* compare, size_t size, u32 timeoutMs)
+    inline void WaitOnAddress(std::atomic<u32>* address, u32* compare, size_t size, u32 timeoutMs)
     {
     #ifdef _WIN32
         ::WaitOnAddress(address, compare, size, timeoutMs);

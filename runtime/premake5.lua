@@ -72,10 +72,10 @@ project "Runtime"
 
    filter "system:windows"
       links { "vulkan-1" }
-      postbuildcommands { "{COPY} " .. LibraryDir["vulkan"] .. "/shaderc_shared.dll %{cfg.targetdir}" }
+      postbuildcommands { "{COPYFILE} " .. LibraryDir["vulkan"] .. "/shaderc_shared.dll %{cfg.targetdir}" }
    filter "system:linux"
       links { "vulkan", "dl", "pthread" }
-      postbuildcommands { "{COPY} " .. LibraryDir["vulkan"] .. "/libshaderc_shared.so %{cfg.targetdir}" }
+      postbuildcommands { "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libshaderc_shared.so %{cfg.targetdir}" }
    filter {}
 
    filter "configurations:Debug"
