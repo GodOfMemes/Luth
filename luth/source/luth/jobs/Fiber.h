@@ -4,6 +4,7 @@
 #include "luth/core/diagnostics/Log.h"
 #include "luth/jobs/FiberPrimitive.h"
 #include "luth/jobs/FiberStackAllocator.h"
+#include "luth/jobs/JobPlatform.h"
 
 #include <atomic>
 #include <cassert>
@@ -58,6 +59,7 @@ namespace Luth::JobSystem
         // Stack region owned by Stack — its Region is null for fibers wrapping an existing
         // OS-thread stack via CaptureCurrentThreadAsFiber (we don't own that stack).
         void* Context = nullptr;
+        JobContext* OwnerContext = nullptr;
         FiberStack Stack{};
 
         Fiber() : State(0) {}
@@ -75,8 +77,10 @@ namespace Luth::JobSystem
             StackBottom = other.StackBottom;
             StackSize = other.StackSize;
             Context = other.Context;
+            OwnerContext = other.OwnerContext;
             Stack = other.Stack;
             other.Context = nullptr;
+            other.OwnerContext = nullptr;
             other.Stack = FiberStack{};
         }
 
@@ -95,8 +99,10 @@ namespace Luth::JobSystem
                 StackBottom = other.StackBottom;
                 StackSize = other.StackSize;
                 Context = other.Context;
+                OwnerContext = other.OwnerContext;
                 Stack = other.Stack;
                 other.Context = nullptr;
+                other.OwnerContext = nullptr;
                 other.Stack = FiberStack{};
             }
             return *this;
@@ -122,6 +128,7 @@ namespace Luth::JobSystem
             f.State = 0;
             f.WaitCounter = nullptr;
             f.WaitTarget = 0;
+            f.OwnerContext = ownerCtx;
 
             f.Stack = AllocateFiberStack(stackSize);
             if (!f.Stack.UsableBottom)
@@ -132,8 +139,10 @@ namespace Luth::JobSystem
             f.StackBottom = f.Stack.UsableBottom;
             f.StackSize = f.Stack.UsableSize;
             f.Context = make_fcontext(f.Stack.StackTop, f.Stack.UsableSize, entry, args);
+            #ifdef _WIN32
             // Patch the save area so first jump_fcontext restores ownerCtx into gs:[0x28].
             fcontext_set_owner(f.Context, ownerCtx);
+            #endif
 
             return f;
         }
@@ -142,6 +151,7 @@ namespace Luth::JobSystem
         {
             FreeFiberStack(f.Stack);
             f.Context = nullptr;
+            f.OwnerContext = nullptr;
             f.StackBottom = nullptr;
             f.StackSize = 0;
         }
@@ -170,6 +180,10 @@ namespace Luth::JobSystem
                                             to.StackBottom, to.StackSize);
             #endif
 
+            #ifndef _WIN32
+            Platform::SetCurrentContext(to.OwnerContext);
+            #endif
+
             jump_fcontext(&from.Context, to.Context);
 
             #if defined(__SANITIZE_ADDRESS__)
@@ -188,11 +202,10 @@ namespace Luth::JobSystem
             f.State = 1;
             f.WaitCounter = nullptr;
             f.WaitTarget = 0;
+            f.OwnerContext = ownerCtx;
             f.CaptureCurrentStackBounds();
 
-            #ifdef _WIN32
-            __writegsqword(0x28, reinterpret_cast<uintptr_t>(ownerCtx));
-            #endif
+            Platform::SetCurrentContext(ownerCtx);
 
             return f;
         }
@@ -207,6 +220,19 @@ namespace Luth::JobSystem
             ::GetCurrentThreadStackLimits(&low, &high);
             StackBottom = reinterpret_cast<void*>(low);
             StackSize = static_cast<size_t>(high - low);
+            #elif defined(__linux__)
+            pthread_attr_t attr;
+            if (pthread_getattr_np(pthread_self(), &attr) == 0)
+            {
+                void* stackAddr = nullptr;
+                size_t stackSize = 0;
+                if (pthread_attr_getstack(&attr, &stackAddr, &stackSize) == 0)
+                {
+                    StackBottom = stackAddr;
+                    StackSize = stackSize;
+                }
+                pthread_attr_destroy(&attr);
+            }
             #endif
         }
     };

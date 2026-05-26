@@ -1,6 +1,7 @@
 #pragma once
 
 #include "luth/core/types/LuthTypes.h"
+#include "luth/jobs/JobPlatform.h"
 #include <atomic>
 #include <array>
 #include <new> // std::hardware_destructive_interference_size
@@ -68,9 +69,7 @@ namespace Luth
 
             // V4: Signal that new work is available
             m_Generation.fetch_add(1, std::memory_order_release);
-#ifdef _WIN32
-            WakeByAddressSingle(&m_Generation);
-#endif
+            JobSystem::Platform::WakeByAddressSingle(&m_Generation);
 
             return true;
         }

@@ -1,6 +1,7 @@
 #include "luthpch.h"
 #include "luth/jobs/JobSystem.h"
 #include "luth/jobs/Fiber.h"
+#include "luth/jobs/JobPlatform.h"
 #include "luth/jobs/SpinLock.h"
 #include "luth/jobs/MPMCQueue.h"
 #include "luth/jobs/WorkStealingDeque.h"
@@ -51,7 +52,7 @@ namespace Luth::JobSystem
 
     static void SetCurrentContext(JobContext* ctx)
     {
-        __writegsqword(0x28, reinterpret_cast<uintptr_t>(ctx));
+        Platform::SetCurrentContext(ctx);
     }
 
     // Forward-declare; body needs s_Data which is defined below.
@@ -258,9 +259,7 @@ namespace Luth::JobSystem
                 // the WaitOnAddress in WorkerThreadLoop's idle path.
                 s_Data.HighQueue.GetGeneration();
                 u32 gen = s_Data.HighQueue.GetGeneration();
-                #ifdef _WIN32
-                WakeByAddressSingle(s_Data.HighQueue.GetGenerationPtr());
-                #endif
+                Platform::WakeByAddressSingle(s_Data.HighQueue.GetGenerationPtr());
 
                 waitingFiber = next;
             }
@@ -285,7 +284,7 @@ namespace Luth::JobSystem
 
     // ── Fiber Entry Point ──
 
-    static void WINAPI FiberEntryPoint(void* args)
+    static void FiberEntryPoint(void* args)
     {
         Job* jobPtr = (Job*)args;
 
@@ -476,7 +475,6 @@ namespace Luth::JobSystem
             }
 
             // Priority 5: idle — wait for work (V4)
-            #ifdef _WIN32
             {
                 // V4: Compare-and-wait pattern to prevent lost wakeups
                 u32 gen = s_Data.HighQueue.GetGeneration();
@@ -493,16 +491,13 @@ namespace Luth::JobSystem
 
                 // Sleep until generation changes (new work arrives)
                 SetWorkerState(workerIndex, WorkerState::Sleeping);
-                WaitOnAddress(
+                Platform::WaitOnAddress(
                     s_Data.HighQueue.GetGenerationPtr(),
                               &gen,
                               sizeof(gen),
                               1 // 1ms timeout to check for shutdown
                 );
             }
-            #else
-            _mm_pause();
-            #endif
         }
 
         LH_PROFILE_FIBER_LEAVE;
@@ -514,6 +509,12 @@ namespace Luth::JobSystem
     {
         if (numThreads == 0) numThreads = std::thread::hardware_concurrency() - 1;
         if (numThreads < 1) numThreads = 1;
+
+        if (!Platform::InitializeContextStorage())
+        {
+            LH_CORE_CRITICAL("JobSystem context storage initialization failed");
+            return;
+        }
 
         s_Data.ThreadCount = numThreads + 1; // +1 for main thread (index 0)
         s_Data.Running = true;
@@ -569,9 +570,7 @@ namespace Luth::JobSystem
         LH_PROFILE_FIBER_LEAVE;
 
         // Wake all sleeping workers
-        #ifdef _WIN32
-        WakeByAddressAll(s_Data.HighQueue.GetGenerationPtr());
-        #endif
+        Platform::WakeByAddressAll(s_Data.HighQueue.GetGenerationPtr());
 
         for (u32 i = 1; i < s_Data.ThreadCount; ++i)
         {
@@ -584,6 +583,7 @@ namespace Luth::JobSystem
             Fiber::Destroy(s_Data.FiberPool[i]);
 
         s_Data.Workers.clear();
+        Platform::ShutdownContextStorage();
         LH_CORE_INFO("JobSystem shut down.");
     }
 
@@ -835,7 +835,7 @@ namespace Luth::JobSystem
 
     JobContext* GetCurrentJobContext()
     {
-        return reinterpret_cast<JobContext*>(__readgsqword(0x28));
+        return Platform::GetCurrentContext();
     }
 
     void SetGlobalCommandPool(CommandAllocatorPool* pool)
