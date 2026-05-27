@@ -6,6 +6,7 @@
 #include "luth/memory/MemoryTracker.h"
 
 #include <algorithm>
+#include <array>
 #include <exception>
 #include <memory>
 #include <queue>
@@ -88,6 +89,17 @@ namespace Luth
             GetBus(bus).ProcessEvents();
         }
 
+        // Drop any queued events and subscribers without dispatching.
+        static void Flush(BusType bus) {
+            GetBus(bus).Flush();
+        }
+
+        // Drop all queued events and subscribers without dispatching.
+        static void FlushAll() {
+            for (size_t i = 0; i < static_cast<size_t>(BusType::COUNT); ++i)
+                GetBus(static_cast<BusType>(i)).Flush();
+        }
+
         class BusInstance {
         public:
             template<typename T, typename... Args>
@@ -149,6 +161,20 @@ namespace Luth
                     DispatchEvent(*event, typeID);
                     processingQueue.pop();
                 }
+            }
+
+            void Flush() {
+                std::queue<std::pair<EventPtr, EventTypeID>> pending;
+                {
+                    std::lock_guard<std::mutex> lock(m_QueueLock);
+                    pending.swap(m_EventQueue);
+                }
+
+                while (!pending.empty())
+                    pending.pop();
+
+                m_Subscribers.clear();
+                m_NextSubId = 0;
             }
 
             template<typename T>
