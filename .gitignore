@@ -39,7 +39,13 @@ recent_projects.json
 # Pipeline / asset caches (rebuilt on demand)
 samples/cache/
 
+# Editor layout caches + per-project cache dir (per-user, rebuilt on demand)
 layouts/
+samples/.luth/
+
+# NVIDIA Nsight Aftermath GPU crash dumps (diagnostic artifacts, never committed)
+*.nv-gpudmp
+*.nvdbg
 
 # OS
 .DS_Store
