@@ -49,6 +49,7 @@ project "LuthTests"
    {
       "Luth",
       "Jolt",
+      "glfw",
       "Tracy",
       --"vulkan-1",
       "shaderc_shared",
