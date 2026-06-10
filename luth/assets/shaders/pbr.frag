@@ -111,6 +111,21 @@ layout(set = 3, binding = 3) uniform sampler2DArrayShadow shadowMap;
 // (e.g., CSM-mode-only frames) don't affect the cascade path.
 layout(set = 3, binding = 4) uniform sampler2D sunShadowMask;
 
+// CONTRACT: diIrradiance stores DEMODULATED diffuse irradiance E = Li * NdotL * W (no albedo,
+// no 1/PI) — see restir_shade.comp. Remodulated here as E * (albedo * (1-metallic) / PI), sampled
+// only when restirParams.x > 0.5; else the per-cluster point-light loop runs.
+layout(set = 3, binding = 5) uniform sampler2D diIrradiance;
+
+// ReSTIR GI demodulated indirect-diffuse irradiance — same contract as diIrradiance. ADDED to Lo
+// (alongside DI, not instead of) when restirParams.y > 0.5; remodulated identically.
+layout(set = 3, binding = 6) uniform sampler2D giIrradiance;
+
+// CONTRACT: reflRadiance stores the DEMODULATED reflected radiance (rt_reflections.comp). Composited below
+// as a DIRECT specular reflection that supersedes the prefiltered-env IBL specular above the roughness
+// cutoff — added at full strength (×ao, ×reflWeight), NOT scaled by iblIntensity (it's a traced scene
+// reflection, not an IBL approximation). The denoiser owns the slot; reflParams.x gates the consumption.
+layout(set = 3, binding = 7) uniform sampler2D reflRadiance;
+
 uint ComputeClusterID(vec4 fragCoord, vec2 viewportPx, float nearZ, float farZ) {
     // Linearize the perspective depth in fragCoord.z; Olsson logarithmic slice index.
     float linDepth = (nearZ * farZ) / (farZ - fragCoord.z * (farZ - nearZ));
@@ -465,22 +480,37 @@ void main()
         Lo += CalculateLight(normalize(-lights.dirLight.direction), dirRadiance, V, N, albedo.rgb, metallic, roughness) * sr.shadow;
     }
 
-    // Forward+ point lights: cluster ID from screen position + linearized depth → fetch (offset,
-    // count) → loop only the lights overlapping this cluster.
-    uint  clusterID = ComputeClusterID(gl_FragCoord, ubo.viewportSize, ubo.nearZ, ubo.farZ);
-    uvec2 oc        = clusterGrid.clusters[clusterID];
-    uint  baseIdx   = oc.x;
-    uint  lightCnt  = oc.y;
-    for (uint k = 0u; k < lightCnt; ++k)
+    // Point lights. restirParams.x > 0.5 → sample the demodulated DI image (remodulate by diffuse-
+    // albedo/PI, CONTRACT above); else the unshadowed Forward+ cluster loop.
+    if (ubo.restirParams.x > 0.5)
     {
-        PointLightData pl = lights.points[lightIndex.indices[baseIdx + k]];
-        vec3  toLight   = pl.position - v_WorldPos;
-        float dist      = length(toLight);
-        float atten     = 1.0 / max(dist * dist, 0.0001);
-        float rolloff   = pow(1.0 - clamp(dist / pl.range, 0.0, 1.0), 2.0);
-        vec3  ptRadiance = pl.color * pl.intensity * atten * rolloff;
-        if (dot(ptRadiance, ptRadiance) > 0.0001)
-            Lo += CalculateLight(normalize(toLight), ptRadiance, V, N, albedo.rgb, metallic, roughness);
+        // Diffuse albedo = baseColor * (1 - metallic); metals carry no Lambertian diffuse.
+        Lo += texture(diIrradiance, gl_FragCoord.xy / ubo.viewportSize).rgb * (albedo.rgb * (1.0 - metallic) / PI);
+    }
+    else
+    {
+        uint  clusterID = ComputeClusterID(gl_FragCoord, ubo.viewportSize, ubo.nearZ, ubo.farZ);
+        uvec2 oc        = clusterGrid.clusters[clusterID];
+        uint  baseIdx   = oc.x;
+        uint  lightCnt  = oc.y;
+        for (uint k = 0u; k < lightCnt; ++k)
+        {
+            PointLightData pl = lights.points[lightIndex.indices[baseIdx + k]];
+            vec3  toLight   = pl.position - v_WorldPos;
+            float dist      = length(toLight);
+            float atten     = 1.0 / max(dist * dist, 0.0001);
+            float rolloff   = pow(1.0 - clamp(dist / pl.range, 0.0, 1.0), 2.0);
+            vec3  ptRadiance = pl.color * pl.intensity * atten * rolloff;
+            if (dot(ptRadiance, ptRadiance) > 0.0001)
+                Lo += CalculateLight(normalize(toLight), ptRadiance, V, N, albedo.rgb, metallic, roughness);
+        }
+    }
+
+    // ReSTIR GI — demodulated indirect diffuse, ADDED on top of the direct term (independent of the
+    // DI gate). Same remodulation as DI: E * (diffuse-albedo / PI).
+    if (ubo.restirParams.y > 0.5)
+    {
+        Lo += texture(giIrradiance, gl_FragCoord.xy / ubo.viewportSize).rgb * (albedo.rgb * (1.0 - metallic) / PI);
     }
 
     // IBL ambient lighting
@@ -492,16 +522,30 @@ void main()
     vec3 irradiance = texture(irradianceMap, N).rgb;
     vec3 diffuseIBL = irradiance * albedo.rgb;
 
-    // Specular IBL
+    // Specular IBL — RT reflections (D.1) swap in for the prefiltered env below the roughness cutoff
+    // (smoothstep fade to IBL); the split-sum env-BRDF (F·brdf.x + brdf.y) then applies once to whichever.
     const float MAX_REFLECTION_LOD = 4.0;
     vec3 R = reflect(-V, N);
     vec3 prefilteredColor = textureLod(prefilteredMap, R, roughness * MAX_REFLECTION_LOD).rgb;
     vec2 brdf = texture(brdfLUT, vec2(max(dot(N, V), 0.0), roughness)).rg;
-    vec3 specularIBL = prefilteredColor * (F * brdf.x + brdf.y);
+    vec3 envBRDF = F * brdf.x + brdf.y;
+    vec3 specularIBL = prefilteredColor * envBRDF;
 
     vec3 ambient = (kD * diffuseIBL + specularIBL) * ao * ubo.iblIntensity;
-
     vec3 color = ambient + Lo;
+
+    // RT specular reflection (D.1) — reflRad is the actual traced reflected radiance (scene-lit by its own
+    // NEE + occluded by the ray), so it is DECOUPLED from iblIntensity (the IBL artistic knob): point-lit
+    // surroundings reflect at full strength even when the env intensity is low. It SUPERSEDES the
+    // prefiltered-env IBL specular above the roughness cutoff — add reflRad·envBRDF and subtract the
+    // iblSpecular it replaces, both ×ao (contact) ×reflWeight (roughness fade). reflRad's env-on-miss
+    // already tracks iblIntensity, so sky reflections stay consistent across the RT↔IBL fade.
+    if (ubo.reflParams.x > 0.5)
+    {
+        float reflWeight = 1.0 - smoothstep(ubo.reflParams.y, ubo.reflParams.z, roughness);
+        vec3  reflRad    = texture(reflRadiance, gl_FragCoord.xy / ubo.viewportSize).rgb;
+        color += (reflRad * envBRDF - specularIBL * ubo.iblIntensity) * ao * reflWeight;
+    }
 
     // Debug viz: replace final color with the raw AO buffer so the user can
     // see the GTAO result in isolation (togglable from the Render panel).

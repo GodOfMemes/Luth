@@ -358,8 +358,49 @@ namespace Luth
             maskImgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
 
+        // Binding 5 (ReSTIR DI) — per-view demodulated diffuse irradiance, post-denoise. Bound to
+        // vr.svgfDenoised (the denoiser output), not vr.restirDI: the denoiser owns this slot whenever
+        // ReSTIR is on (it passes the raw DI through when denoising is toggled off), so the bind is
+        // static and the A/B is denoise-vs-raw with no descriptor swap. Reused mask sampler (linear
+        // clamp-to-edge). pbr.frag reads it only when restirParams.x > 0.5; the denoise pass leaves the
+        // image in GENERAL, the GeometryPass Read transitions it to SHADER_READ_ONLY_OPTIMAL.
+        VkDescriptorImageInfo diImgInfo{};
+        if (vr.svgfDenoised)
+        {
+            auto vkDI = std::static_pointer_cast<VKTexture>(vr.svgfDenoised);
+            diImgInfo.sampler     = m_SunShadowMaskSampler;
+            diImgInfo.imageView   = vkDI->GetImageView();
+            diImgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+
+        // Binding 6 (ReSTIR GI) — post-denoise GI irradiance. Bound to vr.svgfGiDenoised (the GI
+        // denoiser owns this slot, mirroring b5/DI): the bind is static and the A/B is denoise-vs-raw
+        // with no descriptor swap (the denoiser passes the raw GI through when disabled). Same reused
+        // mask sampler. pbr.frag adds it only when restirParams.y > 0.5; the GeometryPass Read
+        // transitions it from the denoiser's GENERAL to SHADER_READ_ONLY_OPTIMAL.
+        VkDescriptorImageInfo giImgInfo{};
+        if (vr.svgfGiDenoised)
+        {
+            auto vkGI = std::static_pointer_cast<VKTexture>(vr.svgfGiDenoised);
+            giImgInfo.sampler     = m_SunShadowMaskSampler;
+            giImgInfo.imageView   = vkGI->GetImageView();
+            giImgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+
+        // Binding 7 (RT reflections, D.1) — post-denoise specular radiance. Bound to vr.svgfSpecDenoised
+        // (the specular denoiser owns the slot, mirroring b5/b6). pbr.frag composites it into the split-sum
+        // specular IBL when reflParams.x > 0.5; the GeometryPass Read transitions it to SHADER_READ_ONLY.
+        VkDescriptorImageInfo reflImgInfo{};
+        if (vr.svgfSpecDenoised)
+        {
+            auto vkRefl = std::static_pointer_cast<VKTexture>(vr.svgfSpecDenoised);
+            reflImgInfo.sampler     = m_SunShadowMaskSampler;
+            reflImgInfo.imageView   = vkRefl->GetImageView();
+            reflImgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+
         VkDevice device = VulkanContext::Get().GetDevice();
-        VkWriteDescriptorSet writes[MAX_FRAMES_IN_FLIGHT * 2] = {};
+        VkWriteDescriptorSet writes[MAX_FRAMES_IN_FLIGHT * 5] = {};
         u32 writeCount = 0;
         for (u32 s = 0; s < MAX_FRAMES_IN_FLIGHT; ++s)
         {
@@ -379,6 +420,39 @@ namespace Luth
                 writes[writeCount].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 writes[writeCount].descriptorCount = 1;
                 writes[writeCount].pImageInfo      = &maskImgInfo;
+                ++writeCount;
+            }
+
+            if (diImgInfo.imageView != VK_NULL_HANDLE)
+            {
+                writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                writes[writeCount].dstSet          = vr.lightDescSet[s];
+                writes[writeCount].dstBinding      = 5;
+                writes[writeCount].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                writes[writeCount].descriptorCount = 1;
+                writes[writeCount].pImageInfo      = &diImgInfo;
+                ++writeCount;
+            }
+
+            if (giImgInfo.imageView != VK_NULL_HANDLE)
+            {
+                writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                writes[writeCount].dstSet          = vr.lightDescSet[s];
+                writes[writeCount].dstBinding      = 6;
+                writes[writeCount].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                writes[writeCount].descriptorCount = 1;
+                writes[writeCount].pImageInfo      = &giImgInfo;
+                ++writeCount;
+            }
+
+            if (reflImgInfo.imageView != VK_NULL_HANDLE)
+            {
+                writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                writes[writeCount].dstSet          = vr.lightDescSet[s];
+                writes[writeCount].dstBinding      = 7;
+                writes[writeCount].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                writes[writeCount].descriptorCount = 1;
+                writes[writeCount].pImageInfo      = &reflImgInfo;
                 ++writeCount;
             }
         }
@@ -512,14 +586,19 @@ namespace Luth
 
         // Set 3 layout: b0 = LightSSBO (header + flexible PointLightData[]), b1 = ClusterGridSSBO,
         // b2 = LightIndexSSBO, b3 = cascade shadow sampler (sampler2DArrayShadow, PCF), b4 = RT
-        // sun shadow mask (sampler2D R8, populated when ShadowingMode::RtShadows is active).
-        VkDescriptorSetLayoutBinding bindings[5] = {};
+        // sun shadow mask (sampler2D R8, populated when ShadowingMode::RtShadows is active), b5 =
+        // ReSTIR DI demodulated irradiance (sampler2D RGBA16F, sampled when restirParams.x > 0.5),
+        // b6 = ReSTIR GI demodulated indirect diffuse (sampler2D RGBA16F, added when restirParams.y > 0.5).
+        VkDescriptorSetLayoutBinding bindings[8] = {};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[0].descriptorCount = 1;
-        // RAYGEN added so rt_sun_shadows.rgen can read lights.dirLight.direction. Cluster grid +
-        // light index (b1, b2) intentionally stay fragment-only; raygen doesn't iterate clusters.
-        bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        // RAYGEN added so rt_sun_shadows.rgen can read lights.dirLight.direction. COMPUTE added so
+        // the ReSTIR DI passes (restir_initial/shade.comp) can read points[] + pointLightCount when
+        // this layout binds as their Set 1. Cluster grid + light index (b1, b2) intentionally stay
+        // fragment-only; neither raygen nor ReSTIR iterates clusters.
+        bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR
+                               | VK_SHADER_STAGE_COMPUTE_BIT;
         bindings[1].binding = 1;
         bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[1].descriptorCount = 1;
@@ -537,29 +616,44 @@ namespace Luth
         bindings[4].descriptorCount = 1;
         bindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT
                                | VK_SHADER_STAGE_RAYGEN_BIT_KHR;  // raygen may also read for ReSTIR DI (C.1)
+        bindings[5].binding = 5;
+        bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[5].descriptorCount = 1;
+        bindings[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;  // ReSTIR DI image — pbr.frag only
+        bindings[6].binding = 6;
+        bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[6].descriptorCount = 1;
+        bindings[6].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;  // ReSTIR GI image — pbr.frag only
+        bindings[7].binding = 7;
+        bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[7].descriptorCount = 1;
+        bindings[7].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;  // RT reflections image (D.1) — pbr.frag only
 
         // b0/b1/b2 are SSBOs rebound per-frame and are bound by BOTH graphics passes (PBR fragment)
         // AND the AsyncCompute RT raygen (set=1 in the RT pipeline-layout). The cycled-slot protocol
         // alone is no longer sufficient — the second pending reference from the compute submission
         // means vkUpdateDescriptorSets sees the set as in-use even when writing the "next" slot.
         // UAB on the rewritten bindings satisfies VUID-vkUpdateDescriptorSets-None-03047 cleanly.
-        // b3 + b4 (samplers) stay flag-less — they're per-view stable, not rewritten per frame.
-        VkDescriptorBindingFlags bindingFlags[5] = {
+        // b3-b5 (samplers) stay flag-less — they're per-view stable, not rewritten per frame.
+        VkDescriptorBindingFlags bindingFlags[8] = {
             VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,  // b0 LightSSBO
             VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,  // b1 ClusterGrid
             VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,  // b2 LightIndex
             0,                                            // b3 cascade sampler
             0,                                            // b4 sun shadow mask sampler
+            0,                                            // b5 ReSTIR DI sampler
+            0,                                            // b6 ReSTIR GI sampler
+            0,                                            // b7 RT reflections sampler
         };
         VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsCI{
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO };
-        bindingFlagsCI.bindingCount  = 5;
+        bindingFlagsCI.bindingCount  = 8;
         bindingFlagsCI.pBindingFlags = bindingFlags;
 
         VkDescriptorSetLayoutCreateInfo lightLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         lightLayoutInfo.pNext        = &bindingFlagsCI;
         lightLayoutInfo.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
-        lightLayoutInfo.bindingCount = 5;
+        lightLayoutInfo.bindingCount = 8;
         lightLayoutInfo.pBindings    = bindings;
         vkCreateDescriptorSetLayout(device, &lightLayoutInfo, nullptr, &m_LightSetLayout);
 

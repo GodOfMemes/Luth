@@ -23,7 +23,12 @@
 #include "luth/renderer/subsystems/EditorOverlaysSubsystem.h"
 #include "luth/renderer/subsystems/DebugDrawSubsystem.h"
 #include "luth/renderer/subsystems/RtSubsystem.h"
+#include "luth/renderer/subsystems/RtRestirSubsystem.h"
+#include "luth/renderer/subsystems/RtRestirGiSubsystem.h"
+#include "luth/renderer/subsystems/PathTraceSubsystem.h"
+#include "luth/renderer/subsystems/ReflectionsSubsystem.h"
 #include "luth/renderer/subsystems/SkinningSubsystem.h"
+#include "luth/renderer/subsystems/IDenoiser.h"
 #include "luth/memory/GPUTaggedPageAllocator.h"
 
 #include <entt/entt.hpp>
@@ -210,6 +215,113 @@ namespace Luth
         // descriptor set carries the pass-local bindings (SceneDepth + slimNormal + mask storage).
         std::shared_ptr<Texture> sunShadowMask;
         std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> rtShadowPassDescSet{};
+
+        // ReSTIR DI (Bitterli 2020). restirReservoir[2] is a ping-pong pair of Garlic device-local
+        // large-tagged buffers (w*h*32 B each) reused across frames — freed only on resize via
+        // FreeTag. Tags stay in NextReservoirTag's reserved high range, disjoint from the per-frame
+        // FreeTag(N-2) sweep. Temporal reuse reads last frame's reservoir (prev) while writing this
+        // frame's (curr); parity = frameAbs & 1u picks which slot is curr — Set 2 b2/b4 rebound
+        // per frame to swap. restirDI is viewport-sized rgba16f STORAGE+SAMPLED (demodulated diffuse
+        // irradiance, consumed by pbr.frag Set 3 b5). The cycled set carries Set 2's depth/normal +
+        // motion samplers + reservoir SSBOs + DI storage image.
+        Memory::GPUSubRegion restirReservoir[2]{};
+        u32 restirReservoirTag[2] = { 0, 0 };
+        // Spatial-reuse output — a SINGLE Garlic device-local buffer (not ping-pong): fully
+        // overwritten then consumed each frame. The spatial pass reads b2 (temporal output) for
+        // self+neighbours and writes here (Set 2 b6); shade reads it. Reserved high tag, freed only
+        // on resize/destroy. The temporal ping-pong (b2) stays intact as next frame's history.
+        Memory::GPUSubRegion restirSpatial{};
+        u32 restirSpatialTag = 0;
+        std::shared_ptr<Texture> restirDI;
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> restirDescSet{};
+
+        // ReSTIR GI (Ouyang 2021) — sibling of the DI reservoirs above, w*h*64 B each (GIReservoir is
+        // a world-space path vertex, not a light index). Same ping-pong + single spatial-output shape;
+        // tags mint from RtRestirGiSubsystem's disjoint 0xFFFF8000 reserved range. restirGiDI is the
+        // viewport-sized rgba16f STORAGE+SAMPLED demodulated indirect-diffuse image (pbr.frag Set 3 b6).
+        Memory::GPUSubRegion restirGiReservoir[2]{};
+        u32 restirGiReservoirTag[2] = { 0, 0 };
+        Memory::GPUSubRegion restirGiSpatial{};
+        u32 restirGiSpatialTag = 0;
+        std::shared_ptr<Texture> restirGiDI;
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> restirGiDescSet{};
+        VkDescriptorSet giReservoirVizDescSet = VK_NULL_HANDLE;  // ShadeMode::RestirGiReservoir debug viz (b0 depth, b1 spatial reservoir)
+
+        // SVGF denoiser output — viewport-sized RGBA16F STORAGE+SAMPLED, same shape as restirDI. The
+        // denoiser reads restirDI (noisy demodulated DI) and writes the denoised result here; pbr.frag
+        // Set 3 b5 samples THIS (not restirDI), so the denoiser owns the slot whenever ReSTIR is on and
+        // the A/B is denoise-vs-raw with no binding swap. History + per-pass sets grow as the SVGF
+        // passes land. see arch/rendering-pipeline.md
+        std::shared_ptr<Texture> svgfDenoised;
+        VkDescriptorSet svgfPassthroughDescSet = VK_NULL_HANDLE;
+
+        // SVGF temporal history — RGBA16F storage images kept in GENERAL, ping-pong by frame parity
+        // (curr = [p], prev = [p^1]). colorHist = integrated color (rgb) + variance (a); moments =
+        // (mu1, mu2, histLen); geom = (linearZ, octN.x, octN.y) for the disocclusion test. Bootstrap-
+        // cleared so frame 0's prev read is well-defined. The two reproject sets are pre-built per
+        // parity (set[p] reads [p^1], writes [p]); AddPasses binds svgfReprojectDescSet[frameAbs & 1].
+        std::shared_ptr<Texture> svgfColorHist[2];
+        std::shared_ptr<Texture> svgfMoments[2];
+        std::shared_ptr<Texture> svgfGeom[2];
+        VkDescriptorSet svgfReprojectDescSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+
+        // À-trous ping-pong (RGBA16F storage, GENERAL). Moments writes svgfAtrous[0] (à-trous level-0
+        // input); the wavelet levels ping-pong [0]/[1] by iteration parity, the final level also writes
+        // svgfDenoised. Moments/à-trous sets are pre-built per parity, bound by index — no UAB rewrite.
+        std::shared_ptr<Texture> svgfAtrous[2];
+        VkDescriptorSet svgfMomentsDescSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        VkDescriptorSet svgfAtrousDescSet[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+
+        // ReSTIR GI SVGF — flat parallel set to the DI fields above (mirroring restirDI/restirGiDI).
+        // A second SvgfDenoiser instance (DenoiserChannel::Gi) drives these; svgfGiDenoised feeds Set 3
+        // b6. Same shapes/clears as DI. see arch/rendering-pipeline.md
+        std::shared_ptr<Texture> svgfGiDenoised;
+        VkDescriptorSet svgfGiPassthroughDescSet = VK_NULL_HANDLE;
+        std::shared_ptr<Texture> svgfGiColorHist[2];
+        std::shared_ptr<Texture> svgfGiMoments[2];
+        std::shared_ptr<Texture> svgfGiGeom[2];
+        VkDescriptorSet svgfGiReprojectDescSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        std::shared_ptr<Texture> svgfGiAtrous[2];
+        VkDescriptorSet svgfGiMomentsDescSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        VkDescriptorSet svgfGiAtrousDescSet[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+
+        // RT-reflection specular SVGF (rt-renderer D.1) — flat parallel to the GI SVGF fields. A third
+        // SvgfDenoiser instance (DenoiserChannel::Reflections) denoises reflRadiance via the hit-distance
+        // virtual-reprojection spec reproject; svgfSpecDenoised feeds pbr.frag Set 3 b7 (the composite, S4).
+        // The geom-history's spare channel carries hitDist for reflected-depth disocclusion (vs the diffuse
+        // geom's unused .a). Same shapes/clears as the GI SVGF.
+        std::shared_ptr<Texture> svgfSpecDenoised;
+        VkDescriptorSet svgfSpecPassthroughDescSet = VK_NULL_HANDLE;
+        std::shared_ptr<Texture> svgfSpecColorHist[2];
+        std::shared_ptr<Texture> svgfSpecMoments[2];
+        std::shared_ptr<Texture> svgfSpecGeom[2];
+        VkDescriptorSet svgfSpecReprojectDescSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        std::shared_ptr<Texture> svgfSpecAtrous[2];
+        VkDescriptorSet svgfSpecMomentsDescSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        VkDescriptorSet svgfSpecAtrousDescSet[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+
+        // Path-traced reference mode (rt-renderer C.5). ptAccum = viewport-sized RGBA32F STORAGE — the
+        // in-place fp32 progressive running mean, kept GENERAL, only ever touched by the PT megakernel
+        // (never sampled, so fp32 precision survives thousands of samples). ptColor = RGBA16F
+        // STORAGE+SAMPLED display copy the post chain (bloom/tonemap) samples; written fresh each frame.
+        // ptSampleCount is the CPU-side accumulated path count (running-mean weight); reset on
+        // camera/scene change. ptDescSet binds b0=ptAccum, b1=ptColor — stable, single (not cycled).
+        std::shared_ptr<Texture> ptAccum;
+        std::shared_ptr<Texture> ptColor;
+        VkDescriptorSet          ptDescSet = VK_NULL_HANDLE;
+        u32                      ptSampleCount = 0;
+        // FNV hash of the reset inputs (camera VP + scene instances + lights + settings + manual salt)
+        // at the last accumulating frame. A mismatch this frame zeroes the accumulation. 0 → frame 0 resets.
+        u64                      ptResetHash = 0;
+
+        // RT specular reflections (rt-renderer D.1). reflRadiance = viewport-sized RGBA16F STORAGE+SAMPLED
+        // — rgb = demodulated specular radiance (Li·F·G1 / Fenv), a = hitDist. The trace writes every
+        // pixel each frame (reflection or env fallback), so no cross-frame read → no bootstrap clear.
+        // reflDescSet binds Set 2 b0 = reflRadiance (GENERAL) + b1-b3 = depth/slimNormal/slimRoughness
+        // samplers — stable per-view (single, not cycled). The specular denoiser's svgfSpec* history
+        // (D.1 S3) lands beside the GI SVGF fields above.
+        std::shared_ptr<Texture> reflRadiance;
+        VkDescriptorSet          reflDescSet = VK_NULL_HANDLE;
     };
 
     // Orchestrates per-frame render-graph assembly and execution. Created by RenderingSystem and
@@ -375,15 +487,36 @@ namespace Luth
         EditorOverlaysSubsystem m_EditorOverlays;
         DebugDrawSubsystem      m_DebugDraw;
         RtSubsystem             m_Rt;
+        RtRestirSubsystem       m_Restir;
+        RtRestirGiSubsystem     m_RestirGi;
+        PathTraceSubsystem      m_PathTrace;
+        ReflectionsSubsystem    m_Reflections;
         SkinningSubsystem       m_Skinning;
+        std::unique_ptr<IDenoiser> m_Denoise;     // DI SVGF; swappable to NRD/RELAX via the settings toggle
+        std::unique_ptr<IDenoiser> m_DenoiseGi;   // GI SVGF — second instance (DenoiserChannel::Gi)
+        std::unique_ptr<IDenoiser> m_DenoiseRefl; // specular SVGF — third instance (DenoiserChannel::Reflections)
 
     public:
         EditorOverlaysSubsystem&       GetEditorOverlays()       { return m_EditorOverlays; }
         const EditorOverlaysSubsystem& GetEditorOverlays() const { return m_EditorOverlays; }
         RtSubsystem&                   GetRt()                   { return m_Rt; }
         const RtSubsystem&             GetRt()             const { return m_Rt; }
+        RtRestirSubsystem&             GetRestir()               { return m_Restir; }
+        const RtRestirSubsystem&       GetRestir()         const { return m_Restir; }
+        RtRestirGiSubsystem&           GetRestirGi()             { return m_RestirGi; }
+        const RtRestirGiSubsystem&     GetRestirGi()       const { return m_RestirGi; }
+        PathTraceSubsystem&            GetPathTrace()            { return m_PathTrace; }
+        const PathTraceSubsystem&      GetPathTrace()      const { return m_PathTrace; }
+        ReflectionsSubsystem&          GetReflections()          { return m_Reflections; }
+        const ReflectionsSubsystem&    GetReflections()    const { return m_Reflections; }
         SkinningSubsystem&             GetSkinning()             { return m_Skinning; }
         const SkinningSubsystem&       GetSkinning()       const { return m_Skinning; }
+        IDenoiser&                     GetDenoise()              { return *m_Denoise; }
+        const IDenoiser&               GetDenoise()        const { return *m_Denoise; }
+        IDenoiser&                     GetDenoiseGi()            { return *m_DenoiseGi; }
+        const IDenoiser&               GetDenoiseGi()      const { return *m_DenoiseGi; }
+        IDenoiser&                     GetDenoiseRefl()          { return *m_DenoiseRefl; }
+        const IDenoiser&               GetDenoiseRefl()    const { return *m_DenoiseRefl; }
 
     private:
         // ---- Graph snapshot + GPU timers + named-texture registry ----

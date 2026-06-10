@@ -947,7 +947,10 @@ namespace Luth
                                                       RG::BufferHandle indirectBufferHandle,
                                                       RG::ResourceHandle sceneDepth,
                                                       RG::ResourceHandle gtaoFinalAO,
-                                                      RG::ResourceHandle rtShadowMask)
+                                                      RG::ResourceHandle rtShadowMask,
+                                                      RG::ResourceHandle diHandle,
+                                                      RG::ResourceHandle giDIHandle,
+                                                      RG::ResourceHandle reflHandle)
     {
         struct GeometryPassData {
             RG::ResourceHandle outputTex;
@@ -956,6 +959,9 @@ namespace Luth
             RG::ResourceHandle shadowCascades[k_ShadowCascadeCount];
             RG::ResourceHandle gtaoFinalAO;
             RG::ResourceHandle rtShadowMask;
+            RG::ResourceHandle diHandle;
+            RG::ResourceHandle giDIHandle;
+            RG::ResourceHandle reflHandle;
             RG::BufferHandle   indirectBuf;
         };
         GeometryOutput output;
@@ -1015,6 +1021,24 @@ namespace Luth
                 // dynamically access binding 4, so the descriptor's layout is irrelevant.
                 if (rtShadowMask.IsValid())
                     data.rtShadowMask = builder.Read(rtShadowMask);
+
+                // ReSTIR DI image — Read triggers GENERAL (RestirShade storage write) →
+                // SHADER_READ_ONLY transition before pbr.frag samples it at Set 3 b5. Invalid
+                // handle when ReSTIR is off / no TLAS; pbr.frag's restirParams.x gate then keeps the
+                // descriptor untouched and runs the point loop instead.
+                if (diHandle.IsValid())
+                    data.diHandle = builder.Read(diHandle);
+
+                // ReSTIR GI image — same GENERAL → SHADER_READ_ONLY transition as the DI handle,
+                // before pbr.frag samples it at Set 3 b6. Invalid when GI is off / no TLAS; the
+                // restirParams.y gate then keeps the descriptor untouched.
+                if (giDIHandle.IsValid())
+                    data.giDIHandle = builder.Read(giDIHandle);
+
+                // Denoised RT reflection radiance (D.1) — keeps the reflection trace + specular denoiser
+                // alive (no pbr.frag sampler until the Set 3 b7 composite, S4). Read-only dependency.
+                if (reflHandle.IsValid())
+                    data.reflHandle = builder.Read(reflHandle);
 
                 data.indirectBuf = builder.ReadIndirectBuffer(indirectBufferHandle);
 
