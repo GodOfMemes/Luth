@@ -74,15 +74,34 @@ project "Runtime"
       "Jolt",
 
       --"vulkan-1",
-      "shaderc_shared"
+      "shaderc_shared",
+      "slang-compiler"
    }
 
    filter "system:windows"
       links { "vulkan-1" }
-      postbuildcommands { "{COPYFILE} " .. LibraryDir["vulkan"] .. "/shaderc_shared.dll %{cfg.targetdir}" }
+      postbuildcommands
+      {
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/shaderc_shared.dll %{cfg.targetdir}",
+         -- Slang in-process compiler (slang-spike, coexists with shaderc). slang-compiler.dll is the
+         -- post-rename real compiler; it LoadLibrary's its siblings on demand, so stage all four.
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/slang-compiler.dll %{cfg.targetdir}",
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/slang-glslang.dll %{cfg.targetdir}",
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/slang-glsl-module.dll %{cfg.targetdir}",
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/slang-rt.dll %{cfg.targetdir}"
+      }
    filter "system:linux"
       links { "vulkan", "dl", "pthread" }
-      postbuildcommands { "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libshaderc_shared.so %{cfg.targetdir}" }
+      postbuildcommands
+      {
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libshaderc_shared.so %{cfg.targetdir}",
+         -- Slang in-process compiler (slang-spike, coexists with shaderc). slang-compiler.so is the
+         -- post-rename real compiler; it LoadLibrary's its siblings on demand, so stage all four.
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libslang-compiler.so %{cfg.targetdir}",
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libslang-glslang.so %{cfg.targetdir}",
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libslang-glsl-module.so %{cfg.targetdir}",
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libslang-rt.so %{cfg.targetdir}"
+      }
    filter {}
 
    filter "configurations:Debug"

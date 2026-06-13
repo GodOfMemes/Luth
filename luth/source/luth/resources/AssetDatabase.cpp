@@ -5,6 +5,7 @@
 #include "luth/core/diagnostics/Log.h"
 #include "luth/resources/AssetManager.h"
 #include <fstream>
+#include <nlohmann/json.hpp>
 
 namespace Luth
 {
@@ -22,6 +23,9 @@ namespace Luth
     std::unordered_set<UUID, UUIDHash> AssetDatabase::s_EngineUUIDs;
 
     std::unordered_map<UUID, u64, UUIDHash> AssetDatabase::s_ArtifactHashes;
+
+    std::unordered_set<UUID, UUIDHash> AssetDatabase::s_SelfWrites;
+    std::mutex AssetDatabase::s_SelfWriteMutex;
 
     // ── Phase 1: Engine-only init (register shaders, fonts) ──
 
@@ -386,6 +390,60 @@ namespace Luth
         return s_Exts.contains(lower);
     }
 
+    // Minimal percent-decode for glTF URIs (handles %20 etc.); leaves malformed escapes intact.
+    static std::string PercentDecode(const std::string& s)
+    {
+        auto hex = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '%' && i + 2 < s.size()) {
+                int hi = hex(s[i + 1]), lo = hex(s[i + 2]);
+                if (hi >= 0 && lo >= 0) { out.push_back(static_cast<char>(hi * 16 + lo)); i += 2; continue; }
+            }
+            out.push_back(s[i]);
+        }
+        return out;
+    }
+
+    // glTF (text .gltf) keeps geometry in a sibling binary buffer named by buffers[].uri; Assimp loads
+    // it directly (not via the texture resolver), so it must sit next to the model or import fails.
+    // Copy each external (non-data:) buffer, preserving its relative subpath under destDir. (.glb
+    // embeds its buffer; .obj/.fbx have no such manifest.)
+    static void CopyGltfBuffers(const fs::path& srcGltf, const fs::path& destDir)
+    {
+        std::ifstream in(srcGltf);
+        if (!in.is_open()) return;
+
+        nlohmann::json gltf;
+        try { in >> gltf; }
+        catch (...) { LH_CORE_WARN("CopyGltfBuffers: cannot parse {0}", srcGltf.filename().string()); return; }
+
+        if (!gltf.contains("buffers")) return;
+        for (const auto& buf : gltf["buffers"]) {
+            if (!buf.contains("uri") || !buf["uri"].is_string()) continue;
+            std::string uri = buf["uri"].get<std::string>();
+            if (uri.empty() || uri.rfind("data:", 0) == 0) continue; // embedded data URI
+
+            fs::path rel = fs::path(PercentDecode(uri));
+            fs::path src = srcGltf.parent_path() / rel;
+            fs::path dst = destDir / rel;
+            std::error_code ec;
+            if (!fs::exists(src, ec)) {
+                LH_CORE_WARN("CopyGltfBuffers: referenced buffer missing: {0}", src.string());
+                continue;
+            }
+            fs::create_directories(dst.parent_path(), ec);
+            fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+            if (ec) LH_CORE_WARN("CopyGltfBuffers: copy failed {0}: {1}", src.string(), ec.message());
+        }
+    }
+
     void AssetDatabase::IngestFile(const fs::path& sourcePath, const fs::path& destDir)
     {
         try {
@@ -407,6 +465,12 @@ namespace Luth
 
             // For model assets, discover and copy adjacent textures
             if (resType == AssetType::Model) {
+                // glTF references its .bin buffer by relative URI; copy it next to the model first.
+                std::string ext = sourcePath.extension().string();
+                for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+                if (ext == ".gltf")
+                    CopyGltfBuffers(sourcePath, destDir);
+
                 fs::path texDestDir = destDir / (sourcePath.stem().string() + "_Textures");
                 fs::path srcDir = sourcePath.parent_path();
 
@@ -497,6 +561,18 @@ namespace Luth
         s_ChangeCallbacks.push_back(std::move(cb));
     }
 
+    void AssetDatabase::SuppressNextReimport(const UUID& uuid)
+    {
+        std::lock_guard<std::mutex> lock(s_SelfWriteMutex);
+        s_SelfWrites.insert(uuid);
+    }
+
+    bool AssetDatabase::ConsumeSelfWrite(const UUID& uuid)
+    {
+        std::lock_guard<std::mutex> lock(s_SelfWriteMutex);
+        return s_SelfWrites.erase(uuid) > 0;
+    }
+
     void AssetDatabase::ProcessPendingChanges()
     {
         std::vector<std::pair<fs::path, FileWatcher::FileStatus>> batch;
@@ -544,6 +620,12 @@ namespace Luth
 
                     fs::path metaPath = path; metaPath += ".meta";
                     u64 newHash = CalculateAssetHash(path, metaPath);
+
+                    // Editor-originated write (autosave): the in-memory asset is the source of truth; a
+                    // reimport would evict the live instance the inspector edits. Consume BEFORE the
+                    // hash-dedup early-out so a deduped event can't leak the token, and refresh the
+                    // recorded hash so a later genuine external edit still reimports.
+                    if (ConsumeSelfWrite(uuid)) { s_ArtifactHashes[uuid] = newHash; continue; }
 
                     if (s_ArtifactHashes[uuid] == newHash) continue;
                     s_ArtifactHashes[uuid] = newHash;

@@ -37,10 +37,13 @@ namespace Luth::RG
         TransferSrc,                // Copy Source
         TransferDst,                // Copy Dest / Clear
         Present,                    // Swapchain Present
-        ComputeRead,                // Compute shader read (storage image)
-        ComputeWrite,               // Compute shader write (storage image)
+        ComputeRead,                // Compute/RT shader read, SAMPLED — transitions to SHADER_READ_ONLY
+        ComputeWrite,               // Compute shader write (storage image) — GENERAL
+        ComputeReadStorage,         // Compute/RT read of a STORAGE image (imageLoad) — stays GENERAL
         StorageBufferRead,          // Compute shader read (SSBO)
         StorageBufferWrite,         // Compute shader write (SSBO)
+        FragmentStorageRead,        // Fragment-shader storage read (image stays GENERAL) — PPLL resolve
+        FragmentStorageWrite,       // Fragment-shader storage write, RMW access for atomics — PPLL store
         IndirectRead,               // Indirect draw/dispatch command read
         AccelerationStructureBuild, // vkCmdBuildAccelerationStructuresKHR write
         AccelerationStructureRead,  // Ray-query / RT-pipeline / fragment-shader read of AS
@@ -88,6 +91,9 @@ namespace Luth::RG
         VkBufferUsageFlags usage = 0;
     };
 
+    // Why a barrier was emitted — set by SolveBarriers, surfaced by the graph dump + barrier trace.
+    enum class BarrierReason : u8 { Raw, Waw, Final };
+
     struct Barrier
     {
         ResourceHandle resource;
@@ -99,6 +105,7 @@ namespace Luth::RG
         // Without this, a barrier emitted on the compute primary with a graphics-only src stage like
         // VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT would violate VUID-vkCmdPipelineBarrier2-srcStageMask-*.
         bool crossQueueSrc = false;
+        BarrierReason reason = BarrierReason::Raw;
     };
 
     struct BufferBarrier
@@ -107,5 +114,6 @@ namespace Luth::RG
         ResourceState before;
         ResourceState after;
         bool crossQueueSrc = false;
+        BarrierReason reason = BarrierReason::Raw;
     };
 }

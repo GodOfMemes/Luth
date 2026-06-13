@@ -1,5 +1,6 @@
 #include "luthpch.h"
 #include "ShaderCompiler.h"
+#include "SlangCompiler.h"
 #include "luth/core/diagnostics/Log.h"
 #include "luth/resources/FileSystem.h"
 #include <shaderc/shaderc.hpp>
@@ -111,6 +112,11 @@ namespace Luth
 
     std::vector<u32> ShaderCompiler::Compile(const fs::path& sourcePath, bool optimize)
     {
+        // .slang dispatches to the in-process Slang backend (coexists with libshaderc, no removals); the
+        // entry's [shader("...")] attribute supplies the stage. see SlangCompiler / spike #156
+        if (sourcePath.extension() == ".slang")
+            return SlangCompiler::Compile(sourcePath, "main");
+
         ShaderStage stage = InferStage(sourcePath);
         if (stage == ShaderStage::Unknown)
         {
@@ -153,5 +159,17 @@ namespace Luth
         }
 
         return { module.cbegin(), module.cend() };
+    }
+
+    ShaderCompiler::StagedSpirv ShaderCompiler::CompileStaged(const fs::path& sourcePath, bool optimize)
+    {
+        // .slang stage lives in the source attribute, not the extension — recover it via reflection. GLSL
+        // keeps the cheap extension inference. Either way the importer gets {spirv, stage} from one call.
+        if (sourcePath.extension() == ".slang")
+        {
+            SlangCompiler::CompileOutput r = SlangCompiler::CompileReflectStage(sourcePath, "main");
+            return { std::move(r.spirv), r.stage };
+        }
+        return { Compile(sourcePath, optimize), InferStage(sourcePath) };
     }
 }

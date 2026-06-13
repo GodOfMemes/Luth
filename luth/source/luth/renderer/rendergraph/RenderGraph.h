@@ -10,6 +10,7 @@
 #include <vector>
 #include <functional>
 #include <string>
+#include <utility>
 
 // Forward declare VMA struct
 struct VmaAllocation_T;
@@ -32,8 +33,13 @@ namespace Luth::RG
         // Image resources
         ResourceHandle Read(ResourceHandle resource);
         ResourceHandle ReadTransfer(ResourceHandle resource);
-        ResourceHandle ReadStorageImage(ResourceHandle resource);   // Compute read (sampled)
-        ResourceHandle WriteStorageImage(ResourceHandle resource);  // Compute write (storage)
+        ResourceHandle ReadStorageImage(ResourceHandle resource);        // Compute read, SAMPLED → SHADER_READ_ONLY
+        ResourceHandle ReadStorageImageGeneral(ResourceHandle resource); // Compute read, STORAGE imageLoad → stays GENERAL
+        ResourceHandle WriteStorageImage(ResourceHandle resource);       // Compute write (storage) → GENERAL
+        // Fragment-stage storage variants — the Compute* states above emit COMPUTE-stage barriers,
+        // which under-synchronize a fragment-shader producer/consumer (PPLL store/resolve).
+        ResourceHandle ReadStorageImageFragment(ResourceHandle resource);  // Fragment imageLoad → stays GENERAL
+        ResourceHandle WriteStorageImageFragment(ResourceHandle resource); // Fragment storage write (atomics) → GENERAL
 
         ResourceHandle Write(ResourceHandle resource,
                              VkAttachmentLoadOp loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
@@ -51,6 +57,9 @@ namespace Luth::RG
         // Buffer resources
         BufferHandle ReadBuffer(BufferHandle buffer);          // StorageBufferRead
         BufferHandle WriteBuffer(BufferHandle buffer);         // StorageBufferWrite
+        BufferHandle ReadBufferFragment(BufferHandle buffer);  // FragmentStorageRead
+        BufferHandle WriteBufferFragment(BufferHandle buffer); // FragmentStorageWrite
+        BufferHandle WriteBufferTransfer(BufferHandle buffer); // TransferDst (vkCmdFillBuffer / copy)
         BufferHandle ReadIndirectBuffer(BufferHandle buffer);  // IndirectRead
 
         // Mark this pass as having engine-side side effects (state mutations outside the RG).
@@ -277,6 +286,13 @@ namespace Luth::RG
         std::vector<ResourceNode>& GetResources() { return m_Resources; }
         std::vector<BufferNode>& GetBuffers() { return m_Buffers; }
 
+        // Serialize the compiled graph for offline inspection (.dot GraphViz / .json schema). Call after Compile().
+        std::string DumpGraphDot()  const;
+        std::string DumpGraphJson() const;
+
+        // State → (stage, access) for barrier emission; public for headless emission tests. see arch/rendering-pipeline.md
+        static std::pair<VkPipelineStageFlags2, VkAccessFlags2> GetStateInfo(ResourceState state);
+
         // Archive sink — invoked after each non-culled pass during Execute. Optional.
         // The sink is responsible for restoring source RT layouts (see IArchiveSink.h).
         void SetArchiveSink(IArchiveSink* sink) { m_ArchiveSink = sink; }
@@ -302,5 +318,9 @@ namespace Luth::RG
         void CullDeadPasses();
         void SolveBarriers();
         void ComputeLifetimes();
+
+        // Nearest prior pass that wrote `handle` before `beforePass` (UINT32_MAX if none) — graph-dump/trace edges.
+        u32 FindLastWriter(ResourceHandle handle, u32 beforePass) const;
+        u32 FindLastBufferWriter(BufferHandle handle, u32 beforePass) const;
     };
 }

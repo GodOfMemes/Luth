@@ -51,6 +51,10 @@ namespace Luth
 
         bool OnShaderReloaded(const std::string& name, const std::vector<u32>& spv);
 
+        // RT fog shadows toggle gate (VolumetricSettings::rtShadows). Read by RenderPipeline's needTlas
+        // gate + the scatter pass's AS-build→read barrier. Out-of-line: needs the RenderingSystem def.
+        bool IsRtShadowsEnabled() const;
+
         // Allocates a FogVolume SSBO region from GPUTaggedPageAllocator and copies the gathered
         // header + flexible array. Returns the region; caches m_LastFogVolumeRegion for the
         // injection pass binding. Returns an empty region when no JobContext (off the fiber path)
@@ -161,8 +165,11 @@ namespace Luth
         std::unique_ptr<VKComputePipeline> m_InjectDensityPipeline;
         std::vector<u32>                   m_InjectDensitySpv;
 
-        // Inject scatter.
+        // Inject scatter. The scatter pipeline carries the cutout 5-set layout [global, scatter, EMPTY,
+        // Material, bindless]: geom_table.glsl hardcodes Set 3/4, but scatter has no pass-local Set 2, so
+        // an empty layout fills index 2 (never bound — the shader doesn't reference it).
         VkDescriptorSetLayout              m_InjectScatterDescLayout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout              m_EmptySet2Layout         = VK_NULL_HANDLE;
         std::unique_ptr<VKComputePipeline> m_InjectScatterPipeline;
         std::vector<u32>                   m_InjectScatterSpv;
 

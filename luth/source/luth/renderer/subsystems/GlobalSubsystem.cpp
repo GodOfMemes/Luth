@@ -23,10 +23,10 @@ namespace Luth
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[0].descriptorCount = 1;
-        // COMPUTE added so VolumetricSubsystem's inject pass can sample camera/CSM uniforms.
-        // RAYGEN added so rt_sun_shadows.rgen can read ubo.viewProjection / ubo.rtShadowParams.
+        // COMPUTE added so VolumetricSubsystem's inject pass + rt_sun_shadows.comp can sample
+        // camera/CSM uniforms (viewProjection / rtShadowParams) via rayQuery-in-compute.
         bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT
-                               | VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+                               | VK_SHADER_STAGE_COMPUTE_BIT;
 
         for (u32 i = 1; i <= 4; ++i)
         {
@@ -110,14 +110,19 @@ namespace Luth
         // compute. All rendered passes (DepthPrepass, SlimGBuffer, Geometry, Shadow, Skybox) use the
         // jittered projection; motion vectors naturally absorb the jitter delta (standard Karis recipe).
         // Disabled when TAA is off so users don't see pure shimmer with no resolve pass to integrate it.
+        // Also disabled in PathTrace mode: the reference accumulates over a STATIC view-projection (the
+        // megakernel does its own per-sample jitter), so a moving Halton jitter would restart the
+        // accumulation every frame (it feeds the PT reset hash via m_CachedViewProj).
+        const bool ptMode = m_Pipeline->GetSystem().GetRenderMode() == RenderMode::PathTrace;
         Vec2 thisFrameJitter{ 0.0f, 0.0f };
-        if (vr && pps.taaEnabled && vr->width > 0 && vr->height > 0)
+        if (vr && pps.taaEnabled && !ptMode && vr->width > 0 && vr->height > 0)
         {
             const u64 frameAbs = Renderer::GetFrameData()->GetRenderFrameIndex();
             thisFrameJitter    = TAA::SampleHalton(frameAbs);
             ubo.projection     = TAA::ApplyJitter(ubo.projection, thisFrameJitter, vr->width, vr->height);
         }
-        ubo.viewProjection = ubo.projection * ubo.view;
+        ubo.viewProjection    = ubo.projection * ubo.view;
+        ubo.invViewProjection = Math::Inverse(ubo.viewProjection);
 
         if (vr) {
             ubo.prevViewProjection = vr->prevViewProj;
@@ -175,7 +180,8 @@ namespace Luth
         ubo.volNoiseWind            = Vec4(vs.noiseWind, 0.0f);
         ubo.volScatterParams        = Vec4(vs.scatteringIntensity,
                                            vs.blueNoiseDither ? 1.0f : 0.0f,
-                                           0.0f, 0.0f);
+                                           vs.rtShadows ? 1.0f : 0.0f,   // .z = RT fog shadows (D.2)
+                                           0.0f);
 
         // Image-quality toggles. Tail of GlobalUniforms — pbr.frag's common/globals.glsl mirrors
         // the std140 layout exactly so offsets stay in lockstep.
@@ -189,6 +195,35 @@ namespace Luth
                                   shadowParams.rtOriginEpsilon,
                                   shadowParams.rtNormalEpsilon,
                                   0.0f);
+
+        // ReSTIR DI consumption flag — set only when the subsystem is enabled AND this view's DI
+        // image exists AND a TLAS is available (the conditions under which AddPasses actually writes
+        // the DI). Otherwise pbr.frag must run its own point-light loop, so leave x = 0.
+        const bool restirActive = m_Pipeline->GetRestir().IsEnabled()
+                               && vr && vr->restirDI
+                               && m_Pipeline->GetRt().GetTlas() != VK_NULL_HANDLE;
+        // .y mirrors .x for the GI path — pbr.frag adds the demodulated indirect-diffuse image when set.
+        const bool restirGiActive = m_Pipeline->GetRestirGi().IsEnabled()
+                                 && vr && vr->restirGiDI
+                                 && m_Pipeline->GetRt().GetTlas() != VK_NULL_HANDLE;
+        // .z = ReSTIR-DI specular gate × intensity (#154); 0 when DI inactive or the specular toggle is off.
+        const RestirSettings& restirS = m_Pipeline->GetSystem().GetRestirSettings();
+        const float specZ = (restirActive && restirS.specular) ? restirS.specularIntensity : 0.0f;
+        ubo.restirParams = Vec4(restirActive ? 1.0f : 0.0f, restirGiActive ? 1.0f : 0.0f, specZ, 0.0f);
+
+        // Path-traced reference mode (informational — PT bypasses pbr.frag; the megakernel reads its own
+        // push constants). x gates nothing in pbr.frag; carried for debug viz + frame-debugger UBO dumps.
+        const bool ptActive = m_Pipeline->GetSystem().GetRenderMode() == RenderMode::PathTrace;
+        const PathTraceSettings& ptS = m_Pipeline->GetSystem().GetPathTraceSettings();
+        const u32 ptSamples = (ptActive && vr) ? vr->ptSampleCount : 0u;
+        ubo.pathTraceParams = Vec4(ptActive ? 1.0f : 0.0f, static_cast<f32>(ptS.samplesPerFrame),
+                                   static_cast<f32>(ptS.maxBounces), static_cast<f32>(ptSamples));
+
+        // RT reflections (D.1) — gate the pbr.frag composite on enabled AND a valid TLAS (the reflection
+        // pass + denoiser no-op before the first build, leaving svgfSpecDenoised stale).
+        const ReflectionsSettings& reflS = m_Pipeline->GetSystem().GetReflectionsSettings();
+        const bool reflActive = reflS.enabled && m_Pipeline->GetRt().GetTlas() != VK_NULL_HANDLE;
+        ubo.reflParams = Vec4(reflActive ? 1.0f : 0.0f, reflS.roughnessFadeStart, reflS.roughnessFadeEnd, 0.0f);
 
         // m_CachedViewProj is read this frame by cull-compute (frustum) and the frame debugger.
         // Per-view; gets overwritten on each view's UpdateUBO and consumed by the same view's Execute.

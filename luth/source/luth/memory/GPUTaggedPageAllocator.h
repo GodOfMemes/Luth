@@ -31,6 +31,7 @@ namespace Luth::Memory
         u64  used               = 0;
         u32  tag                = 0;
         bool isLargeOneShot     = false;
+        bool isDeviceLocal      = false;  // Garlic large-one-shot: DEVICE_LOCAL, non-mapped (basePtr == nullptr)
 
         // Cached for fast Allocate hot path
         VkBuffer buffer     = VK_NULL_HANDLE;
@@ -71,6 +72,11 @@ namespace Luth::Memory
         // For requests that exceed PAGE_SIZE: dedicated VkBuffer per request, tag-released.
         GPUSubRegion AllocateLargeTagged(u32 tag, u64 size, u64 alignment = 16);
 
+        // Garlic sibling of AllocateLargeTagged: DEVICE_LOCAL, non-mapped, for GPU-only read+write
+        // buffers (ReSTIR reservoirs, SVGF history) that would thrash PCIe in the host-visible heap.
+        // Same tag/FreeTag/recycle lifetime; returned region's mappedPtr is null. see arch/memory.md
+        GPUSubRegion AllocateLargeTaggedDeviceLocal(u32 tag, u64 size, u64 alignment = 16);
+
         // Wraps vmaFlushAllocation on the backing; no-op on HOST_COHERENT memory.
         void FlushRegion(const GPUSubRegion& region);
 
@@ -84,6 +90,7 @@ namespace Luth::Memory
             u32 ActivePages      = 0;
             u32 FreePages        = 0;
             u32 LargeOneShots    = 0;
+            u32 FreeLargePages   = 0;
             u64 BytesInFlight    = 0;
         };
         Stats GetStats() const;
@@ -105,6 +112,8 @@ namespace Luth::Memory
         std::vector<BackingBuffer> m_BackingBuffers;
         std::vector<GPUPage*>      m_FreePages;
         std::vector<GPUPage*>      m_UsedPages;   // includes large-one-shot pages
+        std::vector<GPUPage*>      m_FreeLargePages;  // recycled large-one-shots: VkBuffer kept alive, `used` = capacity, tag cleared
+        std::vector<GPUPage*>      m_FreeLargeDeviceLocalPages;  // device-local recycle pool, kept disjoint so a host-visible buffer never satisfies a device-local request
         Luth::SpinLock             m_Lock;        // V1: hot path SpinLock, NOT std::mutex
         u64                        m_MinAlignment = 16;
     };

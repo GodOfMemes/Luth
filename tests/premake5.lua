@@ -48,10 +48,12 @@ project "LuthTests"
    links
    {
       "Luth",
+      "glfw",
       "Jolt",
       "Tracy",
       --"vulkan-1",
       "shaderc_shared",
+      "slang-compiler"
       --"ws2_32",
       --"dbghelp"
    }

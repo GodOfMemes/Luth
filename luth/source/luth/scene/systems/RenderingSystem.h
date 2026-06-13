@@ -15,6 +15,13 @@
 #include "luth/renderer/lighting/LightTypes.h"
 #include "luth/renderer/settings/PostProcessSettings.h"
 #include "luth/renderer/settings/VolumetricSettings.h"
+#include "luth/renderer/settings/RestirSettings.h"
+#include "luth/renderer/settings/RestirGiSettings.h"
+#include "luth/renderer/settings/SlangParitySettings.h"
+#include "luth/renderer/settings/TransparencySettings.h"
+#include "luth/renderer/settings/SvgfSettings.h"
+#include "luth/renderer/settings/PathTraceSettings.h"
+#include "luth/renderer/settings/ReflectionsSettings.h"
 
 #include <entt/entt.hpp>
 #include <memory>
@@ -80,7 +87,26 @@ namespace Luth
         // x = shadowingMode (0=RasterCSM, 1=RtShadows), y = rtOriginEpsilon, z = rtNormalEpsilon, w pad.
         // pbr.frag::ComputeShadow dispatches on .x; RT path reads .y/.z for ray-origin biasing (Wächter-Binder).
         Vec4 rtShadowParams;
+        // x = ReSTIR DI enabled (1 when the subsystem is on AND a valid DI image exists). When set,
+        // pbr.frag samples the demodulated DI image (Set 3 b5) instead of running the point-light loop.
+        Vec4 restirParams;
+        // Path-traced reference mode (rt-renderer C.5). x = enabled (RenderMode::PathTrace), y =
+        // samplesPerFrame, z = maxBounces, w = accumulated sample count. PT bypasses pbr.frag entirely
+        // (it overwrites the post chain's HDR input), so this is informational/debug, not a pbr.frag gate.
+        Vec4 pathTraceParams;
+        // RT reflections (rt-renderer D.1). x = enabled (1 → pbr.frag composites the denoised reflection
+        // into the split-sum specular IBL), y = roughnessFadeStart, z = roughnessFadeEnd (full RT below
+        // Start, smoothstep to prefiltered-env IBL, pure IBL above End), w pad.
+        Vec4 reflParams;
+        // depth → world for the RT-reflection denoiser's virtual reprojection. APPENDED at the end — never
+        // insert mid-struct: shaders with an inline GlobalUniforms prefix (skybox.frag etc.) would desync.
+        Mat4 invViewProjection;
     };
+
+    // Top-level render path selector. Raster = the clustered Forward+ / ReSTIR pipeline; PathTrace = the
+    // brute-force ground-truth reference (rt-renderer C.5). An A/B compare toggle like ShadowingMode /
+    // TonemapOperator — distinct from ShadeMode (post-tonemap debug-viz blits, not a path replacement).
+    enum class RenderMode : u8 { Raster = 0, PathTrace = 1 };
 
     enum class ShadeMode : u8 {
         Lit = 0, Unlit, Wireframe, Normals, EntityID,
@@ -92,7 +118,11 @@ namespace Luth
         ClustersDensity,
         // Volumetric fog atlas viz — samples SceneDepth to derive the Wronski slice, then reads
         // the per-view fog atlas. Two modes: density heat-map and integrated in-scatter radiance.
-        VolumetricDensity, VolumetricInScatter
+        VolumetricDensity, VolumetricInScatter,
+        // ReSTIR GI reservoir viz — heat-maps the spatial reservoir's M (confidence) + age (staleness).
+        RestirGiReservoir,
+        // Emissive radiance only — in-shader override in pbr.frag; isolates emission for raster==RT A/B.
+        Emission
     };
 
     struct GeometryOutput {
@@ -153,6 +183,50 @@ namespace Luth
 
         VolumetricSettings& GetVolumetricSettings() { return m_VolumetricSettings; }
         const VolumetricSettings& GetVolumetricSettings() const { return m_VolumetricSettings; }
+
+        TransparencySettings& GetTransparencySettings() { return m_TransparencySettings; }
+        const TransparencySettings& GetTransparencySettings() const { return m_TransparencySettings; }
+
+        RestirSettings& GetRestirSettings() { return m_RestirSettings; }
+        const RestirSettings& GetRestirSettings() const { return m_RestirSettings; }
+
+        RestirGiSettings& GetRestirGiSettings() { return m_RestirGiSettings; }
+        const RestirGiSettings& GetRestirGiSettings() const { return m_RestirGiSettings; }
+
+        SlangParitySettings& GetSlangParitySettings() { return m_SlangParitySettings; }
+        const SlangParitySettings& GetSlangParitySettings() const { return m_SlangParitySettings; }
+
+        SvgfSettings& GetSvgfSettings() { return m_SvgfSettings; }
+        const SvgfSettings& GetSvgfSettings() const { return m_SvgfSettings; }
+
+        // Separate SVGF tuning for the ReSTIR GI denoiser instance — GI is a noisier, lower-frequency
+        // signal already temporally accumulated by its reservoir, so it leans on wider à-trous + a
+        // shorter SVGF history than DI. Surfaced as the editor's "SVGF (GI)" section.
+        SvgfSettings& GetSvgfGiSettings() { return m_SvgfGiSettings; }
+        const SvgfSettings& GetSvgfGiSettings() const { return m_SvgfGiSettings; }
+
+        // Specular (RT-reflection) denoiser tuning — a sharper, view-dependent signal than diffuse GI, so
+        // fewer à-trous levels (less smear on mirrors) + the hit-distance virtual reprojection carries the
+        // temporal stability. Surfaced as the editor's "SVGF (Specular)" section.
+        SvgfSettings& GetSvgfSpecSettings() { return m_SvgfSpecSettings; }
+        const SvgfSettings& GetSvgfSpecSettings() const { return m_SvgfSpecSettings; }
+
+        // ReSTIR-DI specular denoiser tuning (#154) — same shape as the reflection spec denoiser.
+        SvgfSettings& GetSvgfDiSpecSettings() { return m_SvgfDiSpecSettings; }
+        const SvgfSettings& GetSvgfDiSpecSettings() const { return m_SvgfDiSpecSettings; }
+
+        PathTraceSettings& GetPathTraceSettings() { return m_PathTraceSettings; }
+        const PathTraceSettings& GetPathTraceSettings() const { return m_PathTraceSettings; }
+
+        // RT specular reflections (rt-renderer D.1). ReflectionsSubsystem::IsEnabled reads .enabled;
+        // GlobalSubsystem packs the fade band into reflParams (pbr.frag composite gate). Editor "Reflections".
+        ReflectionsSettings& GetReflectionsSettings() { return m_ReflectionsSettings; }
+        const ReflectionsSettings& GetReflectionsSettings() const { return m_ReflectionsSettings; }
+
+        // Top-level render path (Raster / PathTrace). PathTraceSubsystem::IsEnabled() reads this; the
+        // editor RenderPanel toggles it. Switching modes resets the PT accumulation on the next frame.
+        RenderMode GetRenderMode() const { return m_RenderMode; }
+        void SetRenderMode(RenderMode mode) { m_RenderMode = mode; }
 
         u64 GetFrameAllocatorUsage() const { return m_FrameAllocator->GetUsedMemory(); }
         u64 GetFrameAllocatorTotal() const { return m_FrameAllocator->GetTotalSize(); }
@@ -259,9 +333,22 @@ namespace Luth
         std::unique_ptr<RenderPipeline> m_Pipeline;
 
         // Editor-facing state.
-        PostProcessSettings m_PostProcessSettings;
-        VolumetricSettings  m_VolumetricSettings;
-        ShadeMode           m_ShadeMode    = ShadeMode::Lit;
+        PostProcessSettings  m_PostProcessSettings;
+        VolumetricSettings   m_VolumetricSettings;
+        TransparencySettings m_TransparencySettings;
+        RestirSettings       m_RestirSettings;
+        RestirGiSettings     m_RestirGiSettings;
+        SlangParitySettings   m_SlangParitySettings;
+        SvgfSettings         m_SvgfSettings;
+        // GI denoiser defaults: lower history cap + shorter temporal alpha + one more à-trous level.
+        SvgfSettings         m_SvgfGiSettings{ .alphaColor = 0.3f, .alphaMoments = 0.3f, .historyCap = 16u, .atrousIterations = 6u };
+        // Specular denoiser: fewer à-trous levels (preserve mirror sharpness), moderate temporal alpha.
+        SvgfSettings         m_SvgfSpecSettings{ .alphaColor = 0.15f, .alphaMoments = 0.15f, .historyCap = 24u, .atrousIterations = 3u };
+        SvgfSettings         m_SvgfDiSpecSettings{ .alphaColor = 0.15f, .alphaMoments = 0.15f, .historyCap = 24u, .atrousIterations = 3u };  // #154 ReSTIR-DI specular
+        PathTraceSettings    m_PathTraceSettings;
+        ReflectionsSettings  m_ReflectionsSettings;
+        RenderMode           m_RenderMode   = RenderMode::Raster;
+        ShadeMode            m_ShadeMode    = ShadeMode::Lit;
         bool                m_GridVisible  = true;
 
         // Frame debugger runtime state (capture state machine + archives).

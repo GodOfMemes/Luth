@@ -93,6 +93,28 @@
 | v3.0.5 | `volumetric-fog-polish` (initial) | Three deferred sub-tasks (Hillaire multi-scatter, temporal accumulation, ShadeMode viz) plus audit fixes. Temporal moved to dedicated `VolumetricResolve` compute pass after integrate (inject-time blend produced energy non-conservation). HG phase, point-light 1/d², sun-fog absorption, IBL irradiance multi-scatter, half-step transmittance, configurable Quality preset, shader `#include` support, k_ClusterSlicesZ 24→48 | 2026-05-24 |
 | v3.0.6 | `volumetric-fog-polish` (follow-up) | Inject split into density + scatter passes joined by RG barrier (enables density-atlas sampling along sun ray — v3.0.5's single-pass `SunFogTransmittance` was dead-code). Canonical σ_t contract drops spurious `× density` in scatter (was double-applying). New `scatteringIntensity` knob, 3D Worley-FBM density noise, recalibrated defaults | 2026-05-25 |
 | v3.0.7 | `image-quality` | Closes Phase A. Tokuyoshi19 specular AA + AgX + AgX Punchy tonemaps. Karis14 TAA YCoCg-clip K3 — Halton(2,3) prefix-8 jitter, per-view RGBA16F history ping-pong, ~170 LOC resolve (closest-depth velocity, Blackman-Harris reconstruction, chroma narrow, luma feedback). Roberts R2 blue-noise volumetric dither; pbr.frag → `common/globals.glsl` | 2026-05-25 |
+| v3.0.8 | `rt-extensions` | Phase B opener: 4 KHR RT extensions enabled + feature validation + RT-mandatory device check; `VKRayTracingPipeline` + `RtShaderBindingTable` factories; validation-gated no-op `traceRays` smoke test | 2026-05-26 |
+| v3.0.9 | `blas-tlas` | Per-mesh BLAS at import (static + skinned, `skinning.comp` deformed-VB + `MODE_UPDATE` refit); per-frame TLAS rebuild on AsyncCompute with FNV-1a hash dirty-skip; Set 0 → 7 bindings (TLAS at b6) | 2026-05-26 |
+| v3.0.10 | `rt-shadows` | First RT-pipeline consumer: ray-traced sun shadows (1-spp, R8 mask) as default, raster CSM kept as `ShadowingMode` compare toggle; `RtSunShadowsPass` on AsyncCompute; `pbr.frag` CSM/RT dispatch. Closes Phase B | 2026-05-31 |
+| v3.0.10 | `gpu-debug-toolkit` | GPU crash-debugging subsystem: dynamic-load Nsight Aftermath, `LUTH_VALIDATION` runtime tiers (GPU-AV opt-in), per-pass NV checkpoints + device-lost dump; new `arch/gpu-crash-debugging.md` | 2026-05-31 |
+| v3.0.11 | `vulkan-sync-hardening` | Clean sync-val baseline before Phase C: GPU object names + RG pass labels, `LUTH_RG_DUMP`/`LUTH_RG_TRACE` + headless solver tests; loadOp-LOAD, swapchain-acquire, cross-queue-WAW barrier fixes | 2026-06-06 |
+| v3.0.11 | `gpu-device-lost` | Root-caused the recurring skinned `VK_ERROR_DEVICE_LOST`: 4 MiB `BoneMatrixBuffer` took the tagged-heap large-one-shot destroy path; ND-model fix recycles large tagged allocs (never `vkDestroyBuffer`) | 2026-06-06 |
+| v3.0.12 | `restir-di` | Bitterli 2020 ReSTIR DI for point lights: device-local (Garlic) reservoir buffers, rayQuery-in-compute initial RIS + temporal + spatial reuse, demodulated diffuse irradiance remodulated in `pbr.frag`, editor tuning; opens Phase C | 2026-06-07 |
+| v3.0.13 | `svgf-denoiser` | Schied 2017 SVGF over the demodulated ReSTIR DI: reproject (temporal EMA + moments) → variance (7×7 spatial fallback) → edge-aware à-trous, behind an `IDenoiser` abstraction; per-view image history + a GENERAL-preserving RG storage read; feedbackTap=−1, A-SVGF deferred | 2026-06-07 |
+| v3.0.14 | `restir-gi` | Ouyang 2021 ReSTIR GI: per-pixel 1-bounce path reservoirs + reconnection Jacobian (temporal/spatial reuse, RTXDI BASIC); real bindless secondary-hit material via a per-frame geometry table (`instanceCustomIndex` contract change + buffer_reference deref); second channel-parameterized SVGF instance denoises the bounce; editor tuning | 2026-06-08 |
+| v3.0.15 | `gi-polish` | Post-restir-gi follow-ups: TLAS builds for any RT consumer (DI/GI no longer dark under CSM), sun light added to the GI bounce, GI reservoir M·age debug view, and a zero-weight-reservoir fix (unlit hits keep a valid sample point — killed a world-plane confidence split + latent shadowed-region reuse bias) | 2026-06-09 |
+| v3.0.16 | `path-trace-reference` | Ground-truth path-traced reference mode: a rayQuery-in-compute megakernel reusing the TLAS + bindless materials, multi-bounce NEE + full Cook-Torrance BRDF + GGX VNDF lobe-MIS, fp32 progressive accumulation reset-on-change, `RenderMode` toggle + editor convergence UI; validates ReSTIR DI/GI convergence | 2026-06-09 |
+| v3.0.17 | `rt-reflections` | Stochastic RT specular reflections: GGX-VNDF rays from the slim G-buffer, NEE hit shading via the geometry table, demodulated split-sum composite in `pbr.frag` below a roughness cutoff; dedicated specular denoiser (SvgfDenoiser Reflections channel, hit-distance virtual reprojection); shared `common/brdf.glsl`. Supersedes SSR; opens Phase D | 2026-06-09 |
+| v3.0.18 | `volumetric-rt-shadows` | Per-froxel RT shadow rays in the fog inject-scatter pass: point lights + arbitrary occluders now cast fog shadows (sun swaps CSM→RT ray), 1-spp softened by the existing temporal resolve (no denoiser), default-off toggle; TLAS-build hoisted before the volumetric chain for registration-order correctness; folds two post-D.1 ReSTIR-DI audit fixes | 2026-06-09 |
+| v3.1.0 | `emissive-parity` | Opens the material-system arc: emissive factor + HDR strength, identical raster (`pbr.frag`) + RT (`geom_table.glsl`) emission closing the raster≠RT bug, editor controls + import bridge + inspector preview + `ShadeMode::Emission`; folds material-authoring fixes — metal/rough/color reach the GPU via direct fields, textureless emissive editable, no autosave reimport bounce | 2026-06-09 |
+| v3.1.1 | `material-eval-seam` | Retires `pbr.frag`'s hand-duplicated Cook-Torrance onto the shared `common/brdf.glsl` seam — raster==RT BRDF parity now structural (single source); neutral-renamed the `Pt*` functions; fp32-identical output | 2026-06-10 |
+| v3.1.2 | `cutout-rt` | Alpha-cutout materials hole correctly in every RT path: per-instance TLAS opaque flag (cutout→FORCE_NO_OPAQUE) + a shared `geom_table.glsl` candidate-loop alpha-test across PT/GI/reflections/ReSTIR-DI/volumetric fog; rewrites the lone RT-pipeline sun-shadow pass to rayQuery-compute, deleting the SBT/rgen/rmiss | 2026-06-11 |
+| v3.1.3 | `transparency-tier` | Transparent tier after the fog composite (fixes #32 skybox compositing): PPLL OIT default (per-view heads image + Garlic node pool, sort-K resolve) + per-view sorted A/B; corrected transparent shading — rayQuery sun shadow, cluster lights, fragment-depth froxel fog; TLAS cull masks make glass shadow-ray-invisible yet GI/reflection/PT-visible | 2026-06-11 |
+| v3.1.4 | `rt-normal-maps` | RT hits sample the normal map (TBN at the rayQuery hit, inverse-transpose normal matrix matching `pbr.vert`) + the occlusion map (`HitSurface.ao` → rt-reflections' IBL ambient; PT omits it — geometric occlusion); GI keeps its geometric secondary normal; dead alpha/specular/thickness indices marked reserved | 2026-06-11 |
+| v3.1.5 | `restir-di-specular` | ReSTIR DI gains specular: combined diffuse+spec RIS target (initial/temporal/spatial), demodulated F0-free specular from the shade pass, a dedicated 4th SVGF channel (surface-motion reproject), and pbr.frag F0-remodulation under `restirParams.z`; fixes metals/specular getting ~nothing from point lights | 2026-06-11 |
+| v3.1.6 | `model-import-fidelity` | Importer fidelity: faithful DCC node graph → entity tree (Model V4, un-baked static meshes), camera + light import, render-mode/cutout/cull/occlusion/UV1 from Assimp, engine-side `Scene::InstantiateModel`; fixes a node-rotation decompose-conjugate inversion; sRGB attempt reverted (editor not sRGB-aware) | 2026-06-12 |
+| v3.2.0 | `slang-spike` | Opens the `slang-material` series — Phase-0 gate GO: in-process `SlangCompiler` (Slang 2026.1) coexisting with libshaderc, one rayQuery+BDA+nonuniform-bindless shader ported, in-engine A/B bit-identical, link-spec valid across 2 stages; slang#10525/#9578 clear; default-off harness merged as the regression guard | 2026-06-13 |
+| v3.2.1 | `slang-toolchain` | `.slang` through the asset pipeline (stage via Slang reflection) + ShaderWatcher hot-reload, coexisting with GLSL; spike promoted to a SlangParityGuard whose gate is a deterministic SPIR-V NonUniform/caps scan, with the pixel A/B kept default-off as a diagnostic; multi-entry link probe retired | 2026-06-13 |
 
 ---
 
@@ -100,7 +122,9 @@
 
 Effort scale (scope/difficulty, not calendar time): **S** = small, contained · **M** = some design decisions · **L** = significant refactor or new system · **XL** = full new subsystem.
 
-### Active series — `rt-renderer` (Mode A, v3.0.0)
+### Closed series — `rt-renderer` (Mode A, v3.0.0 → v3.0.18) ✅
+
+**CLOSED** — milestone Release "RT Renderer" published; every effort is in the completed table above.
 
 RT-first renderer modernization arc. Clustered Forward+ with bindless throughout, hardware ray tracing for shadows / GI / reflections, full Wronski volumetrics, ReSTIR + SVGF denoising, path-traced reference mode. Target showcase: Bhaal Temple, fully RT-lit. RT-mandatory (raises minimum HW to RT-capable GPU — counted toward the MAJOR bump).
 
@@ -118,35 +142,36 @@ Umbrella issue: [#127](https://github.com/Hekbas/Luth/issues/127) (sub-effort is
 | A.4 `volumetric-fog` ✅ | [#130](https://github.com/Hekbas/Luth/issues/130) | L | Wronski frustum voxel; light injection + integrate + composite — shipped v3.0.3 (+ `volumetric-fog-polish` v3.0.5/v3.0.6 [#132](https://github.com/Hekbas/Luth/issues/132) added temporal resolve, split inject + canonical math contract, scatter intensity knob, noise modulation) |
 | A.5 `image-quality` ✅ | [#135](https://github.com/Hekbas/Luth/issues/135) | M | TAA Karis14 YCoCg-clip recipe + specular AA Tokuyoshi19 + AgX/AgX Punchy tonemaps + blue-noise volumetric dither — shipped v3.0.7. Closes Phase A. |
 
-**Phase B — Hardware RT foundation**
+**Phase B — Hardware RT foundation ✅**
 
 | Effort | Issue | Size | Notes |
 |---|---|---|---|
-| B.1 `rt-extensions` | NEW | M | `VK_KHR_acceleration_structure` + `ray_tracing_pipeline` integration |
-| B.2 `blas-tlas` | NEW | L | Per-mesh BLAS + per-frame TLAS rebuild for dynamic objects |
-| B.3 `rt-shadows` | NEW | L | Replace raster CSM with RT shadow rays (CSM path retired) |
+| B.1 `rt-extensions` ✅ | [#137](https://github.com/Hekbas/Luth/issues/137) | M | 4 KHR RT extensions + feature validation + RT pipeline/SBT factories + RT-mandatory device check — shipped v3.0.8 |
+| B.2 `blas-tlas` ✅ | [#138](https://github.com/Hekbas/Luth/issues/138) | L | Per-mesh BLAS (static + skinned) + per-frame TLAS rebuild on AsyncCompute + hash dirty-skip — shipped v3.0.9 |
+| B.3 `rt-shadows` ✅ | [#140](https://github.com/Hekbas/Luth/issues/140) | L | RT sun shadows default; raster CSM **retained** as `ShadowingMode` compare toggle (not retired — A/B precedent) — shipped v3.0.10. Closes Phase B. |
+
+> Arc-adjacent efforts shipped alongside Phase B (tag-only): `gpu-debug-toolkit` (v3.0.10) — GPU crash-debugging subsystem; `vulkan-sync-hardening` + `gpu-device-lost` (v3.0.11) — clean sync-val baseline + the skinned device-lost root-cause, ahead of Phase C's barrier-heavy work.
 
 **Phase C — RT global illumination**
 
 | Effort | Issue | Size | Notes |
 |---|---|---|---|
-| C.1 `restir-di` | NEW | XL | Bitterli 2020 — direct lighting reservoir resampling |
-| C.2 `svgf-denoiser` | NEW | XL | Schied 2017 + A-SVGF; denoiser abstraction layer for future NRD swap |
-| C.3 `restir-gi` | NEW | XL | Ouyang 2021 — indirect bounce reservoirs |
+| C.1 `restir-di` ✅ | [#146](https://github.com/Hekbas/Luth/issues/146) | XL | Bitterli 2020 — device-local reservoirs + rayQuery RIS + temporal/spatial reuse + demodulated DI — shipped v3.0.12 |
+| C.2 `svgf-denoiser` ✅ | [#147](https://github.com/Hekbas/Luth/issues/147) | XL | Schied 2017 SVGF + `IDenoiser` abstraction (NRD/RELAX swap reserved); feedbackTap=−1, A-SVGF + feedbackTap=1 deferred to a gated follow-up — shipped v3.0.13 |
+| C.3 `restir-gi` ✅ | [#127](https://github.com/Hekbas/Luth/issues/127) | XL | Ouyang 2021 — path reservoirs + reconnection Jacobian + real secondary material (geometry table) + 2nd SVGF instance — shipped v3.0.14 |
 
 **Phase C.5 — Path-traced reference mode**
 
 | Effort | Issue | Size | Notes |
 |---|---|---|---|
-| C.5 `path-trace-reference` | NEW | M | Ground-truth PT mode reusing C.* infrastructure; validates RT GI convergence |
+| C.5 `path-trace-reference` ✅ | [#148](https://github.com/Hekbas/Luth/issues/148) | M | rayQuery megakernel + multi-bounce NEE + full Cook-Torrance BRDF + GGX VNDF lobe-MIS + fp32 progressive accumulation; `RenderMode` toggle — shipped v3.0.16 |
 
 **Phase D — RT reflections + atmospheric polish**
 
 | Effort | Issue | Size | Notes |
 |---|---|---|---|
-| D.1 `rt-reflections` | NEW | L | Stochastic ray reflections + denoise (supersedes planned SSR) |
-| D.2 `volumetric-rt-shadows` | NEW | M | Shadow rays from voxel volume cells |
-| D.3 `gpu-particles` | [#57](https://github.com/Hekbas/Luth/issues/57) | L | Compute sim; showcase-sized scope (fire / ember / smoke / motes in god ray) |
+| D.1 `rt-reflections` ✅ | [#149](https://github.com/Hekbas/Luth/issues/149) | L | GGX-VNDF reflections from the slim G-buffer + specular denoiser (hit-distance virtual reprojection) + pbr split-sum composite — shipped v3.0.17 |
+| D.2 `volumetric-rt-shadows` ✅ | [#150](https://github.com/Hekbas/Luth/issues/150) | M | Per-froxel RT shadow rays in the inject-scatter pass — **point-light + arbitrary-occluder** fog shadows; sun swaps CSM→RT ray; 1-spp softened by the temporal resolve (no denoiser); default-off toggle — shipped v3.0.18 |
 
 **Out of arc (deferred to follow-up series)**
 
@@ -154,12 +179,48 @@ Umbrella issue: [#127](https://github.com/Hekbas/Luth/issues/127) (sub-effort is
 - `gpu-driven` — mesh shaders + meshlet baker + HiZ occlusion (Framework 5 alignment)
 - `virtual-geometry` — Nanite-class virtualized geometry; long-tail
 
+### Active series — `material-system` (Mode A, v3.1.0)
+
+Extends the uber-shader and factors a shared evaluate-at-surface-point seam that both `pbr.frag` and the RT hit (`geom_table.glsl`) call, retiring the hand-duplicated BRDF. Node-graph deferred to a later authoring layer over the seam. Mode A — series-open MINOR bump to `3.1.0` (`emissive-parity`); intermediate efforts PATCH-bump, tag-only; milestone Release at series end.
+
+Umbrella issue: [#151](https://github.com/Hekbas/Luth/issues/151) (sub-effort issues created on demand; commits use `Part of #151`).
+
+| Effort | Issue | Size | Notes |
+|---|---|---|---|
+| M.1 `emissive-parity` ✅ | [#152](https://github.com/Hekbas/Luth/issues/152) | S–M | Emissive factor + HDR strength; raster==RT emission; editor/import/preview + `ShadeMode::Emission` — shipped v3.1.0 |
+| M.2 `material-eval-seam` ✅ | — | S | `pbr.frag` migrated onto the existing `common/brdf.glsl` seam (`rt-reflections` built it); `Pt*` renamed; raster==RT BRDF parity structural — shipped v3.1.1 |
+| M.3 `cutout-rt` ✅ | — | M | Per-instance TLAS opaque flag + shared candidate-loop alpha-test (rayQuery-centric, not anyhit BLAS); cutout correct in RT shadows / GI / reflections / DI / fog; lone RT-pipeline sun-shadow pass rewritten to rayQuery-compute — shipped v3.1.2 |
+| M.4 `transparency-tier` ✅ | [#32](https://github.com/Hekbas/Luth/issues/32) | M→L | Dedicated pass after the fog composite: PPLL OIT default + per-view sorted A/B, rayQuery sun shadow + fragment-depth fog, cull-masked RT visibility (shadow-ray-excluded, GI/reflection-visible; scope override: true OIT from the start, superseding "WBOIT only if layered") — shipped v3.1.3 |
+| M.5 `rt-normal-maps` ✅ | [#153](https://github.com/Hekbas/Luth/issues/153) | S | RT-hit normal-map TBN + occlusion parity (inverse-transpose normal matrix); applied in PT + rt-reflections, GI keeps its geometric secondary normal; folds the dead-index audit comment — shipped v3.1.4 |
+| M.6 `restir-di-specular` ✅ | [#154](https://github.com/Hekbas/Luth/issues/154) | M→L | ReSTIR DI specular: combined diffuse+spec RIS target + demodulated F0-free shade output + dedicated 4th SVGF channel (surface-motion reproject) + pbr.frag F0-remod (not envBRDF — point-spec lobe applied at shade); research-backed (NRD/RTXDI/Bevy Solari) — shipped v3.1.5 |
+
+Deferred: `emissive-as-area-lights` (L). The Slang `IMaterial` spike → **GO (v3.2.0)**, opening the `slang-material` series below — the deferred node-graph authoring lands there.
+
+> `gpu-particles` ([#57](https://github.com/Hekbas/Luth/issues/57), L) — compute sim, showcase-sized (fire / ember / smoke / motes in god ray). **Parallelizable — not a material-system dependency**; drop into any renderer slot.
+
+### Active series — `slang-material` (Mode A, v3.2.0)
+
+GLSL→Slang migration + a bounded `IMaterial` surface (link-time specialization) shared across raster / RT / path-trace, plus a node-graph authoring layer emitting into that surface — continues `material-system`'s deferred node-graph. Mode A — series-open MINOR bump to `3.2.0` (the `slang-spike` gate); intermediate efforts PATCH-bump, tag-only; milestone Release at series end. Detailed design: local `docs/development/epics/slang-material.md`.
+
+Umbrella issue: [#157](https://github.com/Hekbas/Luth/issues/157) (sub-effort issues on demand; commits use `Part of #157`).
+
+| Phase | Effort | Size | Notes |
+|---|---|---|---|
+| 0 ✅ | `slang-spike` | M | Phase-0 gate GO — in-process compiler + rayQuery/BDA/bindless A/B + link-spec, all green — shipped v3.2.0 |
+| 1 ✅ | `slang-toolchain` | M | `.slang` asset-pipeline dispatch (stage via reflection) + ShaderWatcher hot-reload + SlangParityGuard (deterministic SPIR-V NonUniform/caps gate; pixel A/B = diagnostic) — shipped v3.2.1 |
+| 2 | `slang-imaterial` | L | `MaterialInputs` + one generic Slang eval; convert `pbr.frag` + RT hit; retire the struct triplet; two-tier eval — the keystone |
+| 3 | packed-texture routing | S–M | Import-side ORM / spec-gloss / separate / inverted → `MaterialInputs` (the original pain) |
+| 4 | composable effect layer | L | Link-specialized effect stack |
+| 5 | node editor → bounded surface | XL | Blender-like UX emitting into `IMaterial` |
+
+> Next: Phase 2 (`slang-imaterial`). `gpu-particles` (#57) stays parallelizable — slot it independently.
+
 ### Gameplay enablement
 
 | Pri | Epic | Issue | Target | Effort | Deps |
 |---|---|---|---|---|---|
-| 4 | `scripting` (C# or Lua) | NEW | v3.1.0 | XL | `rt-renderer` |
-| 5 | `prefab-system` | NEW | v3.1.x | M | `scripting` |
+| 4 | `scripting` (C# or Lua) | NEW | v3.2.0 | XL | `rt-renderer` ✅ |
+| 5 | `prefab-system` | NEW | v3.2.x | M | `scripting` |
 
 Scripting unblocks the `PlayerControllerSystem` stub deletion and is the prerequisite for most gameplay-side future ideas.
 
