@@ -1,4 +1,5 @@
 #include "luthpch.h"
+#include <chrono>
 #include "VulkanComputePipeline.h"
 #include "VulkanContext.h"
 #include "PipelineCache.h"
@@ -10,6 +11,8 @@ namespace Luth
                                          const std::vector<VkDescriptorSetLayout>& layouts,
                                          const std::vector<VkPushConstantRange>& pushConstantRanges)
     {
+        LH_PROFILE_FUNCTION();
+
         m_Device = VulkanContext::Get().GetDevice();
 
         // Shader module
@@ -21,7 +24,7 @@ namespace Luth
         VkShaderModule shaderModule = VK_NULL_HANDLE;
         if (vkCreateShaderModule(m_Device, &moduleInfo, nullptr, &shaderModule) != VK_SUCCESS)
         {
-            LH_CORE_ERROR("VKComputePipeline: Failed to create shader module!");
+            LH_LOG(Renderer, error, "VKComputePipeline: Failed to create shader module!");
             return;
         }
 
@@ -35,7 +38,7 @@ namespace Luth
 
         if (vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_PipelineLayout) != VK_SUCCESS)
         {
-            LH_CORE_CRITICAL("VKComputePipeline: Failed to create pipeline layout!");
+            LH_LOG(Renderer, critical, "VKComputePipeline: Failed to create pipeline layout!");
             vkDestroyShaderModule(m_Device, shaderModule, nullptr);
             return;
         }
@@ -49,9 +52,12 @@ namespace Luth
         pipelineInfo.stage.module = shaderModule;
         pipelineInfo.stage.pName  = "main";
 
-        if (vkCreateComputePipelines(m_Device, PipelineCache::Get(), 1, &pipelineInfo, nullptr, &m_Pipeline) != VK_SUCCESS)
+        const auto pcStart = std::chrono::high_resolution_clock::now();
+        VkResult pipeRes = vkCreateComputePipelines(m_Device, PipelineCache::Get(), 1, &pipelineInfo, nullptr, &m_Pipeline);
+        PipelineCache::RecordCompile(std::chrono::duration<f64, std::milli>(std::chrono::high_resolution_clock::now() - pcStart).count());
+        if (pipeRes != VK_SUCCESS)
         {
-            LH_CORE_CRITICAL("VKComputePipeline: Failed to create compute pipeline!");
+            LH_LOG(Renderer, critical, "VKComputePipeline: Failed to create compute pipeline!");
         }
 
         vkDestroyShaderModule(m_Device, shaderModule, nullptr);

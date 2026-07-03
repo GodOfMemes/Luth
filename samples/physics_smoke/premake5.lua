@@ -49,7 +49,6 @@ project "JobSysProof"
       "Jolt",
       "Tracy",
       --"vulkan-1",
-      "shaderc_shared",
       --"ws2_32",
       --"dbghelp"
    }

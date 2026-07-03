@@ -22,6 +22,7 @@
 #include "luth/renderer/settings/SvgfSettings.h"
 #include "luth/renderer/settings/PathTraceSettings.h"
 #include "luth/renderer/settings/ReflectionsSettings.h"
+#include "luth/renderer/settings/WindSettings.h"
 
 #include <entt/entt.hpp>
 #include <memory>
@@ -81,7 +82,7 @@ namespace Luth
         // x = taaEnabled (1/0), y = temporalAlpha (history feedback, 0.05..0.2), zw = currentJitter (pixels).
         Vec4 taaParams;
         // xy = prevJitter (pixels, last frame's currentJitter); zw pad. Paired with taaParams.zw so
-        // slim_gbuffer.frag can dejitter motion source-side (Tardif form): the producer writes pure
+        // slim_gbuffer.slang can dejitter motion source-side (Tardif form): the producer writes pure
         // scene motion, supersedes the resolve-side push-constant jitterDelta. See source-side-taa-dejitter.
         Vec4 prevJitter;
         // x = shadowingMode (0=RasterCSM, 1=RtShadows), y = rtOriginEpsilon, z = rtNormalEpsilon, w pad.
@@ -121,9 +122,33 @@ namespace Luth
         VolumetricDensity, VolumetricInScatter,
         // ReSTIR GI reservoir viz — heat-maps the spatial reservoir's M (confidence) + age (staleness).
         RestirGiReservoir,
-        // Emissive radiance only — in-shader override in pbr.frag; isolates emission for raster==RT A/B.
-        Emission
+        // Emissive radiance only — in-shader override in pbr_shade.slang; isolates emission for raster==RT A/B.
+        Emission,
+        // In-shader per-draw channel overrides (obj.shadeMode → pbr_shade.slang); cheap, raster==RT-safe.
+        // ShadowCascades reuses the CSM/RT cascade-tint path. APPENDED — never renumber existing values
+        // (the object buffer, slim-viz offset math, and the live shader branches all key off them).
+        Metallic, Occlusion, ShadowCascades,
+        // Raw screen-space signals — in-shader overrides sampling the same bound textures the lit pass
+        // reads (each gated on its feature; greyed in the picker when off). AO reuses gtao.visualize.
+        AmbientOcclusion, GiRaw, DiRaw, RtReflectionRaw,
+        // Shaded fill + a flat wireframe overlay (a second line-polygon pass in GeometrySubsystem). The fill
+        // renders lit (no shader override), so it is NOT a data-debug mode: the composite tonemaps it.
+        WireframeShaded
     };
+
+    // RenderPipeline decodes Slim viz as an offset from SlimNormal — keep these four contiguous.
+    static_assert(static_cast<u8>(ShadeMode::SlimMaterialID) - static_cast<u8>(ShadeMode::SlimNormal) == 3,
+                  "Slim* ShadeModes must stay contiguous (RenderPipeline slim-viz offset math).");
+
+    // Debug modes whose fragment output is display-ready DATA (encoded normals, IDs, [0,1] channels)
+    // rather than radiance: the composite sRGB-encodes them WITHOUT tonemap/grade (signalled by a
+    // negative tonemapOp to postprocess.slang). Radiance debug modes (Emission, GiRaw/DiRaw/ReflRaw,
+    // ShadowCascades) keep tonemap; bloom is gated off for every non-Lit mode in RenderPipeline.
+    inline bool IsDataDebugMode(ShadeMode m)
+    {
+        return m == ShadeMode::Unlit    || m == ShadeMode::Normals   || m == ShadeMode::EntityID
+            || m == ShadeMode::Metallic || m == ShadeMode::Occlusion || m == ShadeMode::AmbientOcclusion;
+    }
 
     struct GeometryOutput {
         RG::ResourceHandle color;
@@ -189,6 +214,9 @@ namespace Luth
 
         RestirSettings& GetRestirSettings() { return m_RestirSettings; }
         const RestirSettings& GetRestirSettings() const { return m_RestirSettings; }
+
+        WindSettings& GetWindSettings() { return m_WindSettings; }
+        const WindSettings& GetWindSettings() const { return m_WindSettings; }
 
         RestirGiSettings& GetRestirGiSettings() { return m_RestirGiSettings; }
         const RestirGiSettings& GetRestirGiSettings() const { return m_RestirGiSettings; }
@@ -347,6 +375,7 @@ namespace Luth
         SvgfSettings         m_SvgfDiSpecSettings{ .alphaColor = 0.15f, .alphaMoments = 0.15f, .historyCap = 24u, .atrousIterations = 3u };  // #154 ReSTIR-DI specular
         PathTraceSettings    m_PathTraceSettings;
         ReflectionsSettings  m_ReflectionsSettings;
+        WindSettings         m_WindSettings;
         RenderMode           m_RenderMode   = RenderMode::Raster;
         ShadeMode            m_ShadeMode    = ShadeMode::Lit;
         bool                m_GridVisible  = true;

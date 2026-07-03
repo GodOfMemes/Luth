@@ -6,8 +6,6 @@
 #include "luth/renderer/FrameTargets.h"
 #include "luth/renderer/Renderer.h"
 #include "luth/renderer/backend/vulkan/VulkanContext.h"
-#include "luth/renderer/backend/vulkan/VulkanRayTracingPipeline.h"
-#include "luth/renderer/backend/vulkan/RtShaderBindingTable.h"
 #include "luth/renderer/backend/vulkan/VulkanComputePipeline.h"
 #include "luth/renderer/backend/vulkan/VulkanAllocator.h"
 #include "luth/renderer/backend/vulkan/VulkanTexture.h"
@@ -129,6 +127,7 @@ namespace Luth
 
     void RtSubsystem::Init(RenderPipeline& pipeline)
     {
+        LH_PROFILE_FUNCTION();
         m_Pipeline = &pipeline;
 
         // Persistent empty TLAS — backs GetTlas() before the first per-frame TlasBuildPass runs.
@@ -136,11 +135,11 @@ namespace Luth
         // accidentally destroys it when a per-frame TLAS first replaces the m_LastResult slot.
         if (BuildEmptyTlas(m_PersistentEmptyTlas, m_PersistentEmptyTlasBuf, m_PersistentEmptyTlasAlloc))
         {
-            LH_CORE_INFO("RtSubsystem: persistent empty TLAS built (frame-0 binding-6 safety)");
+            LH_LOG(Renderer, info, "RtSubsystem: persistent empty TLAS built (frame-0 binding-6 safety)");
         }
         else
         {
-            LH_CORE_CRITICAL("RtSubsystem: persistent empty TLAS build failed — Set 0 binding 6 will be null on frame 0");
+            LH_LOG(Renderer, critical, "RtSubsystem: persistent empty TLAS build failed — Set 0 binding 6 will be null on frame 0");
         }
 
         // Pass-local sampler — linear clamp-to-edge for both SceneDepth + SlimNormal reads.
@@ -176,68 +175,23 @@ namespace Luth
         vkCreateDescriptorSetLayout(VulkanContext::Get().GetDevice(), &shadowLayoutInfo, nullptr, &m_ShadowPassSetLayout);
 
         // Load the sun-shadow compute SPV. ShaderLibrary::LoadEngine routes through the standard asset
-        // path (with hot-reload watching) so RtSubsystem::OnShaderReloaded receives rt_sun_shadows.comp
+        // path (with hot-reload watching) so RtSubsystem::OnShaderReloaded receives rt_sun_shadows.slang
         // when it changes on disk.
-        if (auto sh = ShaderLibrary::LoadEngine("shaders/rt_sun_shadows.comp"))
+        if (auto sh = ShaderLibrary::LoadEngine("shaders/rt_sun_shadows.slang"))
             m_ShadowSpv = sh->GetSpirV();
         if (m_ShadowSpv.empty())
         {
-            LH_CORE_ERROR("RtSubsystem: failed to load rt_sun_shadows.comp SPIR-V");
+            LH_LOG(Renderer, error, "RtSubsystem: failed to load rt_sun_shadows.slang SPIR-V");
         }
         else
         {
             BuildShadowPipeline();
         }
-
-#if LUTH_ENABLE_VALIDATION
-        auto raygenSpv = ShaderCompiler::Compile(FileSystem::EngineAssetsPath("shaders/rt_smoke.rgen"));
-        if (raygenSpv.empty())
-        {
-            LH_CORE_CRITICAL("RtSubsystem: smoke shader compile failed — check ShaderCompiler RT mappings");
-            return;
-        }
-
-        RayTracingStages stages;
-        stages.stages.push_back({ VK_SHADER_STAGE_RAYGEN_BIT_KHR, raygenSpv, "main" });
-        RayTracingShaderGroup grp{};
-        grp.type          = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-        grp.generalShader = 0;
-        stages.groups.push_back(grp);
-
-        VKRayTracingPipeline pipe(stages, {}, {}, 1);
-        if (pipe.GetPipeline() == VK_NULL_HANDLE)
-        {
-            LH_CORE_CRITICAL("RtSubsystem: smoke pipeline create failed");
-            return;
-        }
-
-        RtSbtCounts counts; counts.raygenCount = 1;
-        RtShaderBindingTable sbt(pipe, counts);
-        if (sbt.GetBuffer() == VK_NULL_HANDLE)
-        {
-            LH_CORE_CRITICAL("RtSubsystem: smoke SBT build failed");
-            return;
-        }
-
-        auto& ctx = VulkanContext::Get();
-        const VkStridedDeviceAddressRegionKHR empty{};
-        ctx.ImmediateSubmit([&](VkCommandBuffer cmd) {
-            pipe.Bind(cmd);
-            ctx.GetRtFn().vkCmdTraceRaysKHR(
-                cmd,
-                &sbt.GetRaygenRegion(),
-                &empty, &empty, &empty,
-                1, 1, 1);
-        });
-
-        LH_CORE_INFO("RtSubsystem: smoke-test traceRays OK");
-#else
-        LH_CORE_INFO("RtSubsystem: idle (Release build — smoke test disabled)");
-#endif
     }
 
     void RtSubsystem::Shutdown()
     {
+        LH_PROFILE_FUNCTION();
         // Persistent empty TLAS — push to deletion queue so it retires after the last in-flight
         // frame stops referencing it via Set 0 binding 6 (PushDeletion drains N+2 frames out).
         if (m_PersistentEmptyTlas != VK_NULL_HANDLE)
@@ -297,12 +251,13 @@ namespace Luth
 
     void RtSubsystem::BuildShadowPipeline()
     {
+        LH_PROFILE_FUNCTION();
         if (m_ShadowSpv.empty()) return;
         if (!m_Pipeline) return;
 
         // Set 0 = Global (TLAS b6 + UBO b0), Set 1 = Light SSBO (PBR's Set 3 remapped to Set 1; the
         // shader's `set = 1` matches), Set 2 = pass-local (depth + normal + mask), Set 3 = Material SSBO +
-        // Set 4 = bindless textures for geom_table.glsl's cutout alpha-test. The geom-table BDA rides a
+        // Set 4 = bindless textures for material_bindings_rt.slang's cutout alpha-test. The geom-table BDA rides a
         // push constant; all other RT-shadow params still come from GlobalUniforms.rtShadowParams.
         std::vector<VkDescriptorSetLayout> layouts = {
             m_Pipeline->GetGlobal().GetSetLayout(),
@@ -319,7 +274,8 @@ namespace Luth
 
     bool RtSubsystem::OnShaderReloaded(const std::string& name, const std::vector<u32>& spv)
     {
-        if (name != "rt_sun_shadows.comp") return false;
+        LH_PROFILE_FUNCTION();
+        if (name != "rt_sun_shadows.slang") return false;
         m_ShadowSpv = spv;
 
         // Defer-destroy the old pipeline — in-flight cmd buffers may still reference it.
@@ -329,12 +285,13 @@ namespace Luth
             VulkanContext::Get().PushDeletion([oldPipe]() { delete oldPipe; });
         }
         BuildShadowPipeline();
-        LH_CORE_INFO("RtSubsystem: sun-shadow pipeline rebuilt after shader reload ({})", name);
+        LH_LOG(Renderer, info, "RtSubsystem: sun-shadow pipeline rebuilt after shader reload ({})", name);
         return true;
     }
 
     void RtSubsystem::WriteShadowPassView(ViewResources& vr, FrameTargets& targets)
     {
+        LH_PROFILE_FUNCTION();
         if (m_ShadowPassSetLayout == VK_NULL_HANDLE) return;
         if (!targets.GetSceneDepth() || !targets.GetSlimNormal() || !vr.sunShadowMask) return;
 
@@ -394,6 +351,7 @@ namespace Luth
                                                         RG::ResourceHandle sceneDepth,
                                                         RG::ResourceHandle slimNormal)
     {
+        LH_PROFILE_FUNCTION();
         // Pre-flight: pipeline must exist (shaders loaded). Mask must exist (view allocated).
         ViewResources* preflightVr = m_Pipeline ? m_Pipeline->GetCurrentViewResources() : nullptr;
         if (!m_SunShadowsPipeline || !preflightVr || !preflightVr->sunShadowMask)
@@ -485,6 +443,7 @@ namespace Luth
 
     void RtSubsystem::AddTlasBuildPass(RG::RenderGraph& rg)
     {
+        LH_PROFILE_FUNCTION();
         struct TlasBuildData {};
         rg.AddComputePass<TlasBuildData>(
             "TlasBuild",
@@ -510,23 +469,12 @@ namespace Luth
                 if (!rs) return;
                 const RenderSnapshot& snapshot = rs->GetActiveSnapshot();
 
-                // 1. Per-skinned-mesh compute-skin into deformed-VBs.
-                m_Pipeline->GetSkinning().DispatchAllSkinned(cmd, snapshot);
+                // Skinning now runs in SkinningSubsystem::AddDeformPass at frame start (graphics queue);
+                // the deformed buffers are ready for both raster and this refit. The gA→compute timeline
+                // semaphore makes the deform writes visible to this async-compute refit — no inline
+                // compute-write barrier here. see arch/multi-queue.md
 
-                // 2. Compute-write → AS-build-read global barrier per NVIDIA RTX guidance (one
-                // global UAV barrier before AS work, not per-resource). Covers every skinned
-                // mesh's deformed-VB at once.
-                VkMemoryBarrier2 mem{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-                mem.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                mem.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
-                mem.dstStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
-                mem.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;  // build reads vertex input as SHADER_READ, not AS_READ
-                VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-                dep.memoryBarrierCount = 1;
-                dep.pMemoryBarriers    = &mem;
-                vkCmdPipelineBarrier2(cmd, &dep);
-
-                // 3. Batched skinned-BLAS refits — one vkCmdBuildAccelerationStructuresKHR call
+                // Batched skinned-BLAS refits — one vkCmdBuildAccelerationStructuresKHR call
                 // with N infos sharing one tagged scratch (per-mesh sub-regions, no overlap).
                 TlasBuilder::RefitSkinnedBLASes(cmd, snapshot.meshes, static_cast<u32>(frameAbs));
 

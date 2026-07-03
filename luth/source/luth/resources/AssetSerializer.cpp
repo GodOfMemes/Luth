@@ -12,6 +12,7 @@ namespace Luth
 {
     bool AssetSerializer::SerializeTexture(const fs::path& path, const TextureAssetData& data)
     {
+        LH_PROFILE_FUNCTION();
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) return false;
 
@@ -36,6 +37,7 @@ namespace Luth
 
     bool AssetSerializer::DeserializeTexture(const fs::path& path, TextureAssetData& outData)
     {
+        LH_PROFILE_FUNCTION();
         std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) return false;
 
@@ -234,11 +236,12 @@ namespace Luth
 
     bool AssetSerializer::SerializeModel(const fs::path& path, const ModelAssetData& data)
     {
+        LH_PROFILE_FUNCTION();
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) return false;
 
         AssetHeader header;
-        header.Version = 4; // V4: scene-graph nodes + cameras + lights (was V3 clips-by-UUID)
+        header.Version = 5; // V5: per-mesh IsDeformable (was V4 scene-graph nodes + cameras + lights)
         header.Type = AssetType::Model;
         out.write((const char*)&header, sizeof(AssetHeader));
 
@@ -263,6 +266,7 @@ namespace Luth
 
             MeshHeader meshHeader;
             meshHeader.IsSkinned = mesh.IsSkinned ? 1 : 0;
+            meshHeader.IsDeformable = mesh.IsDeformable ? 1 : 0;
             meshHeader.IndexCount = (u32)mesh.Indices.size();
             meshHeader.MaterialIndex = mesh.MaterialIndex;
 
@@ -298,6 +302,7 @@ namespace Luth
 
     bool AssetSerializer::DeserializeModel(const fs::path& path, ModelAssetData& outData)
     {
+        LH_PROFILE_FUNCTION();
         std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) return false;
 
@@ -305,9 +310,9 @@ namespace Luth
         in.read((char*)&header, sizeof(AssetHeader));
         if (header.Type != AssetType::Model) return false;
 
-        // V4 schema: scene-graph nodes + cameras + lights. Older artifacts are rejected so they get
-        // re-imported under the new schema on first load (mirrors the Shader V1->V2 reject pattern).
-        if (header.Version != 4) return false;
+        // V5 schema: per-mesh IsDeformable. Older artifacts are rejected so they get re-imported under
+        // the new schema on first load (mirrors the Shader V1->V2 reject pattern).
+        if (header.Version != 5) return false;
 
         ModelHeader modelHeader;
         in.read((char*)&modelHeader, sizeof(ModelHeader));
@@ -329,6 +334,7 @@ namespace Luth
             in.read((char*)&meshHeader, sizeof(MeshHeader));
             mesh.MaterialIndex = meshHeader.MaterialIndex;
             mesh.IsSkinned = (meshHeader.IsSkinned != 0);
+            mesh.IsDeformable = (meshHeader.IsDeformable != 0);
 
             if (mesh.IsSkinned) {
                 mesh.SkinnedVertices.resize(meshHeader.VertexCount);
@@ -366,6 +372,7 @@ namespace Luth
 
     bool AssetSerializer::SerializeMaterial(const fs::path& path, const MaterialAssetData& data)
     {
+        LH_PROFILE_FUNCTION();
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) return false;
 
@@ -383,6 +390,7 @@ namespace Luth
 
     bool AssetSerializer::DeserializeMaterial(const fs::path& path, MaterialAssetData& outData)
     {
+        LH_PROFILE_FUNCTION();
         std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) return false;
 
@@ -401,6 +409,7 @@ namespace Luth
 
     bool AssetSerializer::SerializePhysicsMaterial(const fs::path& path, const PhysicsMaterialAssetData& data)
     {
+        LH_PROFILE_FUNCTION();
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) return false;
 
@@ -418,6 +427,7 @@ namespace Luth
 
     bool AssetSerializer::DeserializePhysicsMaterial(const fs::path& path, PhysicsMaterialAssetData& outData)
     {
+        LH_PROFILE_FUNCTION();
         std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) return false;
 
@@ -436,6 +446,7 @@ namespace Luth
 
     bool AssetSerializer::SerializeShader(const fs::path& path, const ShaderAssetData& data)
     {
+        LH_PROFILE_FUNCTION();
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) return false;
 
@@ -456,6 +467,7 @@ namespace Luth
 
     bool AssetSerializer::DeserializeShader(const fs::path& path, ShaderAssetData& outData)
     {
+        LH_PROFILE_FUNCTION();
         std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) return false;
 
@@ -479,6 +491,7 @@ namespace Luth
 
     bool AssetSerializer::SerializeAnimation(const fs::path& path, const AnimationAssetData& data)
     {
+        LH_PROFILE_FUNCTION();
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) return false;
 
@@ -493,6 +506,7 @@ namespace Luth
 
     bool AssetSerializer::DeserializeAnimation(const fs::path& path, AnimationAssetData& outData)
     {
+        LH_PROFILE_FUNCTION();
         std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) return false;
 

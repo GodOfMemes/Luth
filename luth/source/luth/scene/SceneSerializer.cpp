@@ -122,6 +122,7 @@ namespace Luth
         j["uuid"]   = entity.GetComponent<ID>().Value.ToString();
         j["tag"]    = entity.GetComponent<Tag>().Value;
         j["active"] = entity.IsActive();
+        if (entity.HasComponent<Bone>()) j["bone"] = true;   // skeleton-joint marker
 
         // Parent UUID (empty string if root)
         if (entity.HasParent()) {
@@ -244,6 +245,17 @@ namespace Luth
             j["pointLight"] = pj;
         }
 
+        if (entity.HasComponent<SpotLight>()) {
+            auto& sl = entity.GetComponent<SpotLight>();
+            json sj;
+            sj["color"]     = SerializeVec3(sl.Color);
+            sj["intensity"] = sl.Intensity;
+            sj["range"]     = sl.Range;
+            sj["innerCone"] = sl.InnerConeAngleDeg;
+            sj["outerCone"] = sl.OuterConeAngleDeg;
+            j["spotLight"]  = sj;
+        }
+
         if (entity.HasComponent<FogVolume>()) {
             const auto& fv = entity.GetComponent<FogVolume>();
             json fj;
@@ -265,6 +277,20 @@ namespace Luth
             fj["falloffEnd"]     = fv.falloffEnd;
             fj["affectsAmbient"] = fv.affectsAmbient;
             j["fogVolume"]       = fj;
+        }
+
+        if (entity.HasComponent<Wind>()) {
+            const auto& w = entity.GetComponent<Wind>();
+            json wj;
+            wj["enabled"]              = w.enabled;
+            wj["strengthMultiplier"]   = w.strengthMultiplier;
+            wj["phaseOffset"]          = w.phaseOffset;
+            wj["gustMultiplier"]       = w.gustMultiplier;
+            wj["detailMultiplier"]     = w.detailMultiplier;
+            wj["useDirectionOverride"] = w.useDirectionOverride;
+            wj["directionOverride"]    = SerializeVec3(w.directionOverride);
+            wj["overrideIsWorldSpace"] = w.overrideIsWorldSpace;
+            j["wind"]                  = wj;
         }
 
         if (entity.HasComponent<Collider>()) {
@@ -379,14 +405,14 @@ namespace Luth
     {
         std::ofstream file(path);
         if (!file.is_open()) {
-            LH_CORE_ERROR("SceneSerializer::Save — failed to open '{}'", path.string());
+            LH_LOG(Scene, error, "SceneSerializer::Save — failed to open '{}'", path.string());
             return false;
         }
 
         file << SaveToString(scene);
         file.close();
 
-        LH_CORE_INFO("Scene saved to '{}'", path.string());
+        LH_LOG(Scene, info, "Scene saved to '{}'", path.string());
         return true;
     }
 
@@ -396,7 +422,7 @@ namespace Luth
     {
         std::ifstream file(path);
         if (!file.is_open()) {
-            LH_CORE_ERROR("SceneSerializer::Load — failed to open '{}'", path.string());
+            LH_LOG(Scene, error, "SceneSerializer::Load — failed to open '{}'", path.string());
             return false;
         }
 
@@ -405,11 +431,11 @@ namespace Luth
         file.close();
 
         if (!LoadFromString(scene, contents, /*preserveAssets=*/false)) {
-            LH_CORE_ERROR("SceneSerializer::Load — failed to load '{}'", path.string());
+            LH_LOG(Scene, error, "SceneSerializer::Load — failed to load '{}'", path.string());
             return false;
         }
 
-        LH_CORE_INFO("Scene loaded from '{}'", path.string());
+        LH_LOG(Scene, info, "Scene loaded from '{}'", path.string());
         return true;
     }
 
@@ -420,12 +446,12 @@ namespace Luth
             root = json::parse(jsonStr);
         }
         catch (const json::parse_error& e) {
-            LH_CORE_ERROR("SceneSerializer::LoadFromString — parse error: {}", e.what());
+            LH_LOG(Scene, error, "SceneSerializer::LoadFromString — parse error: {}", e.what());
             return false;
         }
 
         if (!root.contains("entities") || !root["entities"].is_array()) {
-            LH_CORE_ERROR("SceneSerializer::LoadFromString — invalid scene format (missing entities array)");
+            LH_LOG(Scene, error, "SceneSerializer::LoadFromString — invalid scene format (missing entities array)");
             return false;
         }
 
@@ -452,6 +478,7 @@ namespace Luth
 
             // Active state
             entity.SetActive(ej.value("active", true));
+            if (ej.value("bone", false)) entity.GetScene()->Registry().emplace<Bone>((entt::entity)entity);
 
             // Transform (overwrite defaults)
             if (ej.contains("transform")) {
@@ -506,7 +533,7 @@ namespace Luth
                         const auto& uuids = modelPtr->GetAnimationClipUUIDs();
                         if (idx >= 0 && (u32)idx < uuids.size()) {
                             a.ClipUUID = uuids[idx];
-                            LH_CORE_INFO("SceneSerializer: migrated Animation index {} -> {} for {}",
+                            LH_LOG(Scene, info, "SceneSerializer: migrated Animation index {} -> {} for {}",
                                 idx, a.ClipUUID.ToString(), a.ModelUUID.ToString());
                         }
                     }
@@ -642,6 +669,17 @@ namespace Luth
                 pl.Range     = pj.value("range", 350.0f);
             }
 
+            // SpotLight
+            if (ej.contains("spotLight")) {
+                const auto& sj = ej["spotLight"];
+                auto& sl = entity.AddComponent<SpotLight>();
+                sl.Color             = DeserializeVec3(sj.value("color", json::array()), { 1, 1, 1 });
+                sl.Intensity         = sj.value("intensity", 1.0f);
+                sl.Range             = sj.value("range", 350.0f);
+                sl.InnerConeAngleDeg = sj.value("innerCone", 25.0f);
+                sl.OuterConeAngleDeg = sj.value("outerCone", 45.0f);
+            }
+
             // FogVolume — tagged-union; load type first, then the active union member.
             if (ej.contains("fogVolume")) {
                 const auto& fj = ej["fogVolume"];
@@ -667,6 +705,22 @@ namespace Luth
                 fv.falloffEnd     = fj.value("falloffEnd",     1.0f);
                 fv.affectsAmbient = fj.value("affectsAmbient", true);
                 entity.AddComponent<FogVolume>(fv);
+            }
+
+            // Wind — per-entity response to the global field (additive; absent → full global response).
+            if (ej.contains("wind")) {
+                const auto& wj = ej["wind"];
+                Wind w;
+                w.enabled              = wj.value("enabled", true);
+                w.strengthMultiplier   = wj.value("strengthMultiplier", 1.0f);
+                w.phaseOffset          = wj.value("phaseOffset", 0.0f);
+                w.gustMultiplier       = wj.value("gustMultiplier", 1.0f);
+                w.detailMultiplier     = wj.value("detailMultiplier", 1.0f);
+                w.useDirectionOverride = wj.value("useDirectionOverride", false);
+                w.directionOverride    = DeserializeVec3(wj.value("directionOverride", json::array()),
+                                                         Vec3(1.0f, 0.0f, 0.0f));
+                w.overrideIsWorldSpace = wj.value("overrideIsWorldSpace", true);
+                entity.AddComponent<Wind>(w);
             }
 
             // Collider / RigidBody — both populate a local first, then AddComponent copy-emplaces the
@@ -766,7 +820,7 @@ namespace Luth
                 child.SetParent(it->second);
             }
             else {
-                LH_CORE_WARN("SceneSerializer::LoadFromString — parent UUID '{}' not found for entity '{}'",
+                LH_LOG(Scene, warn, "SceneSerializer::LoadFromString — parent UUID '{}' not found for entity '{}'",
                     parentUUID, child.GetName());
             }
         }
@@ -778,12 +832,12 @@ namespace Luth
                 child.GetComponent<BoneAttachment>().TargetEntity = it->second;
             }
             else {
-                LH_CORE_WARN("SceneSerializer::LoadFromString — BoneAttachment target UUID '{}' not found for '{}'",
+                LH_LOG(Scene, warn, "SceneSerializer::LoadFromString — BoneAttachment target UUID '{}' not found for '{}'",
                     targetUUID, child.GetName());
             }
         }
 
-        LH_CORE_INFO("Scene loaded ({} entities)", uuidToEntity.size());
+        LH_LOG(Scene, info, "Scene loaded ({} entities)", uuidToEntity.size());
         return true;
     }
 }

@@ -44,6 +44,7 @@ namespace Luth
 
             for (auto [entity, wt, mr] : view.each())
             {
+                if (!wt.ActiveInHierarchy) continue;
                 if (!mr.ModelUUID.IsValid()) continue;
                 auto model = AssetManager::GetAsset<Model>(mr.ModelUUID);
                 if (!model) continue;
@@ -56,7 +57,23 @@ namespace Luth
                 dst->materialUUID = mr.MaterialUUID;
                 dst->meshIndex    = mr.MeshIndex;
                 dst->isSkinned    = meshesData[mr.MeshIndex].IsSkinned;
+                dst->isDeformable = meshesData[mr.MeshIndex].IsDeformable;
                 dst->entity       = static_cast<u32>(entity);
+
+                // Per-entity wind response. Captured unconditionally; the deform dispatch's
+                // !isDeformable filter makes Wind on a non-deformable mesh a silent no-op. Defaults
+                // already encode "no component," so absence needs no else branch.
+                if (auto* w = registry.try_get<Component::Wind>(entity))
+                {
+                    dst->windRespond         = w->enabled;
+                    dst->windStrengthMul     = w->strengthMultiplier;
+                    dst->windPhaseOffset     = w->phaseOffset;
+                    dst->windGustMul         = w->gustMultiplier;
+                    dst->windDetailMul       = w->detailMultiplier;
+                    dst->windDirOverride     = w->useDirectionOverride;
+                    dst->windOverrideDir     = w->directionOverride;
+                    dst->windOverrideIsWorld = w->overrideIsWorldSpace;
+                }
 
                 // Animation lives on this entity OR its direct parent. Without the parent
                 // fallback, child meshes read boneOffset=0 and render a frozen pose.
@@ -91,6 +108,7 @@ namespace Luth
             auto view = registry.view<Component::WorldTransform, Component::DirectionalLight>();
             for (auto [entity, wt, dl] : view.each())
             {
+                if (!wt.ActiveInHierarchy) continue;
                 out.directionalLight.present                 = true;
                 out.directionalLight.direction              = Math::Normalize(-Vec3(wt.Matrix[2]));
                 out.directionalLight.color                  = dl.Color;
@@ -124,6 +142,7 @@ namespace Luth
 
             for (auto [entity, wt, pl] : view.each())
             {
+                if (!wt.ActiveInHierarchy) continue;
                 PointLightSnapshot* dst = new (lightRows + count) PointLightSnapshot();
                 dst->position  = Vec3(wt.Matrix[3]);
                 dst->color     = pl.Color;
@@ -133,6 +152,33 @@ namespace Luth
             }
 
             out.pointLights = std::span<const PointLightSnapshot>(lightRows, count);
+        }
+
+        // ── Spot lights (unbounded — clustered alongside points) ──
+        {
+            auto view = registry.view<Component::WorldTransform, Component::SpotLight>();
+            const size_t maxCount = view.size_hint();
+            auto* lightRows = maxCount > 0
+                ? static_cast<SpotLightSnapshot*>(
+                      mem.Allocate(maxCount * sizeof(SpotLightSnapshot), alignof(SpotLightSnapshot)))
+                : nullptr;
+            size_t count = 0;
+
+            for (auto [entity, wt, sl] : view.each())
+            {
+                if (!wt.ActiveInHierarchy) continue;
+                SpotLightSnapshot* dst = new (lightRows + count) SpotLightSnapshot();
+                dst->position           = Vec3(wt.Matrix[3]);
+                dst->direction          = Math::Normalize(-Vec3(wt.Matrix[2]));   // -Z axis, like the sun
+                dst->color              = sl.Color;
+                dst->intensity          = sl.Intensity;
+                dst->range              = sl.Range;
+                dst->innerConeAngleDeg  = sl.InnerConeAngleDeg;
+                dst->outerConeAngleDeg  = sl.OuterConeAngleDeg;
+                ++count;
+            }
+
+            out.spotLights = std::span<const SpotLightSnapshot>(lightRows, count);
         }
 
         // ── Fog volumes ──
@@ -150,6 +196,7 @@ namespace Luth
 
             for (auto [entity, wt, fv] : view.each())
             {
+                if (!wt.ActiveInHierarchy) continue;
                 const Mat4 fogLocal =
                     Math::Translate(Mat4(1.0f), fv.localOffset) * Math::ToMat4(fv.localRotation);
 

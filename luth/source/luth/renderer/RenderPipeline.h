@@ -100,9 +100,11 @@ namespace Luth
         // sampler (4) are stable — replicated across all slots at WriteView time.
         std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> globalDescriptorSet{};
 
-        // Bloom half-res ping-pong textures (RGBA16F).
-        std::shared_ptr<Texture> bloomA;
-        std::shared_ptr<Texture> bloomB;
+        // Bloom pyramid mips (RGBA16F STORAGE+SAMPLED). mip[0] is half-res, each subsequent mip
+        // halves again. Prefilter writes mip[0]; downsample fills 1..N-1; upsample accumulates
+        // additively back down into mip[0], which the composite samples. see arch/rendering-pipeline.md.
+        static constexpr u32 kBloomMipCount = 6;
+        std::array<std::shared_ptr<Texture>, kBloomMipCount> bloomMip{};
 
         // GTAO half-res storage textures.
         std::shared_ptr<Texture> gtaoLinearDepth;
@@ -125,13 +127,14 @@ namespace Luth
         std::shared_ptr<Texture> volInScatterHistA;
         std::shared_ptr<Texture> volInScatterHistB;
 
-        // Bloom extract / blur / composite — bind view's SceneColor +
-        // bloomA/B + shared PP UBO. Cycled — UpdateUBO writes binding 2 of
-        // all 4 sets atomically against the per-frame slot.
-        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> bloomExtractDescSet{};
-        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> bloomBlurHDescSet{};
-        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> bloomBlurVDescSet{};
-        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> compositeDescSet{};
+        // Bloom pyramid descriptor sets. Prefilter is cycled — binding 0 (scene/TAA source) is
+        // rebound per frame by UpdateBloomCompositeInput (UAB). Down/up sets are single: they
+        // reference only stable per-view mip textures, written once per resize. Composite stays
+        // cycled (UpdateUBO writes its UBO binding 2 against the per-frame slot).
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT>   bloomPrefilterDescSet{};
+        std::array<VkDescriptorSet, kBloomMipCount - 1>     bloomDownDescSet{};
+        std::array<VkDescriptorSet, kBloomMipCount - 1>     bloomUpDescSet{};
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT>   compositeDescSet{};
 
         // GTAO compute passes.
         VkDescriptorSet gtaoPrefilterDescSet = VK_NULL_HANDLE;
@@ -234,8 +237,8 @@ namespace Luth
         std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> rtShadowPassDescSet{};
 
         // ReSTIR DI (Bitterli 2020). restirReservoir[2] is a ping-pong pair of Garlic device-local
-        // large-tagged buffers (w*h*32 B each) reused across frames — freed only on resize via
-        // FreeTag. Tags stay in NextReservoirTag's reserved high range, disjoint from the per-frame
+        // large-tagged buffers (w*h*32 B each) reused across frames — destroyed on resize via
+        // FreeTagAndDestroy. Tags stay in NextReservoirTag's reserved high range, disjoint from the per-frame
         // FreeTag(N-2) sweep. Temporal reuse reads last frame's reservoir (prev) while writing this
         // frame's (curr); parity = frameAbs & 1u picks which slot is curr — Set 2 b2/b4 rebound
         // per frame to swap. restirDI is viewport-sized rgba16f STORAGE+SAMPLED (demodulated diffuse
@@ -305,6 +308,19 @@ namespace Luth
         std::shared_ptr<Texture> svgfGiAtrous[2];
         VkDescriptorSet svgfGiMomentsDescSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
         VkDescriptorSet svgfGiAtrousDescSet[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        // Half-res GI: svgfGi* history + reservoirs allocate at half extent; the à-trous final writes
+        // svgfGiHalf, a bilateral upscale resolves it into the full-res svgfGiDenoised. giHalfCached
+        // drives EnsureViewResources realloc on a runtime toggle.
+        std::shared_ptr<Texture> svgfGiHalf;
+        u32 giHalfCached = ~0u;
+        VkDescriptorSet giUpscaleDescSet = VK_NULL_HANDLE;   // half-res GI bilateral-upscale set (Set 1)
+        // Half-res DI (both channels): à-trous finals write svgfDiHalf / svgfDiSpecHalf; bilateral upscales
+        // resolve them into the full-res svgfDenoised / svgfDiSpecDenoised. diHalfCached drives realloc.
+        std::shared_ptr<Texture> svgfDiHalf;
+        std::shared_ptr<Texture> svgfDiSpecHalf;
+        u32 diHalfCached = ~0u;
+        VkDescriptorSet diUpscaleDescSet     = VK_NULL_HANDLE;   // half-res DI diffuse upscale set
+        VkDescriptorSet diSpecUpscaleDescSet = VK_NULL_HANDLE;   // half-res DI specular upscale set
 
         // RT-reflection specular SVGF (rt-renderer D.1) — flat parallel to the GI SVGF fields. A third
         // SvgfDenoiser instance (DenoiserChannel::Reflections) denoises reflRadiance via the hit-distance
@@ -320,11 +336,14 @@ namespace Luth
         std::shared_ptr<Texture> svgfSpecAtrous[2];
         VkDescriptorSet svgfSpecMomentsDescSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
         VkDescriptorSet svgfSpecAtrousDescSet[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        // Half-res reflections: the à-trous final writes svgfSpecHalf; a bilateral upscale resolves it into
+        // the full-res svgfSpecDenoised. reflHalfCached drives realloc. Mirrors the svgfDiSpecHalf trio.
+        std::shared_ptr<Texture> svgfSpecHalf;
 
         // ReSTIR-DI specular SVGF (#154) — flat parallel to the spec fields above. A 4th SvgfDenoiser
         // instance (DenoiserChannel::DiSpecular) denoises restirDISpec via the SURFACE-MOTION reproject
         // (direct point-light specular is surface-attached, not a reflection's virtual image — so it reuses
-        // svgf_reproject.comp, not the hit-distance spec variant); svgfDiSpecDenoised feeds pbr.frag Set 3
+        // svgf_reproject.slang, not the hit-distance spec variant); svgfDiSpecDenoised feeds pbr.frag Set 3
         // b8. Same shapes/clears as the GI SVGF. see arch/rendering-pipeline.md
         std::shared_ptr<Texture> svgfDiSpecDenoised;
         VkDescriptorSet svgfDiSpecPassthroughDescSet = VK_NULL_HANDLE;
@@ -358,6 +377,8 @@ namespace Luth
         // (D.1 S3) lands beside the GI SVGF fields above.
         std::shared_ptr<Texture> reflRadiance;
         VkDescriptorSet          reflDescSet = VK_NULL_HANDLE;
+        VkDescriptorSet          reflUpscaleDescSet = VK_NULL_HANDLE;   // half-res reflection bilateral-upscale set
+        u32                      reflHalfCached = ~0u;                  // last-applied halfResolution; drives realloc
     };
 
     // Orchestrates per-frame render-graph assembly and execution. Created by RenderingSystem and
@@ -548,8 +569,6 @@ namespace Luth
         const RtRestirSubsystem&       GetRestir()         const { return m_Restir; }
         RtRestirGiSubsystem&           GetRestirGi()             { return m_RestirGi; }
         const RtRestirGiSubsystem&     GetRestirGi()       const { return m_RestirGi; }
-        SlangParityGuard&              GetSlangParity()          { return m_SlangParity; }
-        const SlangParityGuard&        GetSlangParity()    const { return m_SlangParity; }
         PathTraceSubsystem&            GetPathTrace()            { return m_PathTrace; }
         const PathTraceSubsystem&      GetPathTrace()      const { return m_PathTrace; }
         ReflectionsSubsystem&          GetReflections()          { return m_Reflections; }

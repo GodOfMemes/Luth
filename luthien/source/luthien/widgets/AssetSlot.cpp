@@ -42,13 +42,13 @@ namespace Luth::UI
         ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.0f, 0.5f));
 
         // Calculate icon based on type
-        const char* icon = ICON_FA_FILE;
+        const char* icon = ICON_FILE;
         switch(type) {
-            case AssetType::Model: icon = ICON_FA_CUBE; break;
-            case AssetType::Texture: icon = ICON_FA_IMAGE; break;
-            case AssetType::Material: icon = ICON_FA_CIRCLE_HALF_STROKE; break;
-            case AssetType::Shader: icon = ICON_FA_FILE_CODE; break;
-            case AssetType::Animation: icon = ICON_FA_PERSON_RUNNING; break;
+            case AssetType::Model: icon = ICON_CUBE; break;
+            case AssetType::Texture: icon = ICON_IMAGE; break;
+            case AssetType::Material: icon = ICON_MATERIAL; break;
+            case AssetType::Shader: icon = ICON_SHADER; break;
+            case AssetType::Animation: icon = ICON_ANIMATION; break;
             default: break;
         }
 
@@ -94,7 +94,7 @@ namespace Luth::UI
                 }
                 else
                 {
-                    LH_CORE_WARN("Invalid asset type dropped. Expected {0}, got {1}", (int)type, (int)meta.Type);
+                    LH_LOG(Editor, warn, "Invalid asset type dropped. Expected {0}, got {1}", (int)type, (int)meta.Type);
                 }
             }
             ImGui::EndDragDropTarget();

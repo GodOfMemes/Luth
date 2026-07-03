@@ -27,21 +27,11 @@ namespace Luth
                 { ShaderDataType::Float3, "a_Tangent"   }
             };
         }
-        BufferLayout MakeSkinnedVertexLayout() {
-            return BufferLayout{
-                { ShaderDataType::Float3, "a_Position"    },
-                { ShaderDataType::Float3, "a_Normal"      },
-                { ShaderDataType::Float2, "a_TexCoord0"   },
-                { ShaderDataType::Float2, "a_TexCoord1"   },
-                { ShaderDataType::Float3, "a_Tangent"     },
-                { ShaderDataType::Int4,   "a_BoneIDs"     },
-                { ShaderDataType::Float4, "a_BoneWeights" }
-            };
-        }
     }
 
     void TransparencySubsystem::Init(RenderPipeline& pipeline)
     {
+        LH_PROFILE_FUNCTION();
         m_Pipeline = &pipeline;
         VkDevice device = VulkanContext::Get().GetDevice();
 
@@ -99,18 +89,19 @@ namespace Luth
 
     void TransparencySubsystem::BuildPipelines(const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
-        if (auto sh = ShaderLibrary::LoadEngine("shaders/pbr_transparent.frag"))
+        LH_PROFILE_FUNCTION();
+        if (auto sh = ShaderLibrary::LoadEngine("shaders/pbr_transparent.slang"))
             m_TransparentFragSpv = sh->GetSpirV();
-        if (auto sh = ShaderLibrary::LoadEngine("shaders/pbr_oit_store.frag"))
+        if (auto sh = ShaderLibrary::LoadEngine("shaders/pbr_oit_store.slang"))
             m_OitStoreFragSpv = sh->GetSpirV();
-        if (auto sh = ShaderLibrary::LoadEngine("shaders/fullscreen.vert"))
+        if (auto sh = ShaderLibrary::LoadEngine("shaders/fullscreen.slang"))
             m_FullscreenVertSpv = sh->GetSpirV();
-        if (auto sh = ShaderLibrary::LoadEngine("shaders/oit_resolve.frag"))
+        if (auto sh = ShaderLibrary::LoadEngine("shaders/oit_resolve.slang"))
             m_ResolveFragSpv = sh->GetSpirV();
         if (m_TransparentFragSpv.empty() || m_OitStoreFragSpv.empty() ||
             m_FullscreenVertSpv.empty() || m_ResolveFragSpv.empty())
         {
-            LH_CORE_ERROR("TransparencySubsystem: failed to load transparent-tier shaders!");
+            LH_LOG(Renderer, error, "TransparencySubsystem: failed to load transparent-tier shaders!");
             return;
         }
 
@@ -122,9 +113,12 @@ namespace Luth
         // Sorted variants mirror GeometrySubsystem's Transparent/Fade arm: GeometryPass attachments
         // (sceneColor + entityID + depth), depth-test-no-write LESS_OR_EQUAL, standard alpha blend.
         // OIT store variants drop ALL color attachments (PPLL writes via Set 6 storage) and blending.
-        auto makeFactory = [pcRange](BufferLayout layout, bool oitStore) {
-            auto bindingDescs = layout.GetBindingDescriptions();
-            auto attribDescs  = layout.GetAttributeDescriptions();
+        // emptyInput: the skinned variants fetch the deformed buffer by gl_VertexIndex (no bound VB).
+        auto makeFactory = [pcRange](BufferLayout layout, bool oitStore, bool emptyInput = false) {
+            auto bindingDescs = emptyInput ? std::vector<VkVertexInputBindingDescription>{}
+                                           : layout.GetBindingDescriptions();
+            auto attribDescs  = emptyInput ? std::vector<VkVertexInputAttributeDescription>{}
+                                           : layout.GetAttributeDescriptions();
             return [bindingDescs, attribDescs, pcRange, oitStore](Material::RenderMode, Material::CullMode cullMode,
                                                                   VkPolygonMode polygonMode) -> PipelineConfig
             {
@@ -152,15 +146,16 @@ namespace Luth
         };
 
         m_SortedPm.Init(layouts, makeFactory(MakePBRVertexLayout(), false));
-        m_SortedSkinnedPm.Init(layouts, makeFactory(MakeSkinnedVertexLayout(), false));
+        m_SortedSkinnedPm.Init(layouts, makeFactory(BufferLayout{}, false, true));
         m_OitPm.Init(layouts, makeFactory(MakePBRVertexLayout(), true));
-        m_OitSkinnedPm.Init(layouts, makeFactory(MakeSkinnedVertexLayout(), true));
+        m_OitSkinnedPm.Init(layouts, makeFactory(BufferLayout{}, true, true));
 
         BuildResolvePipeline();
     }
 
     void TransparencySubsystem::BuildResolvePipeline()
     {
+        LH_PROFILE_FUNCTION();
         // Under-composite blend: shader outputs (C, T); final = C + background * T.
         PipelineConfig cfg{};
         cfg.colorFormats        = { VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32_UINT };
@@ -178,6 +173,7 @@ namespace Luth
 
     void TransparencySubsystem::Shutdown()
     {
+        LH_PROFILE_FUNCTION();
         m_SortedPm.Shutdown();
         m_SortedSkinnedPm.Shutdown();
         m_OitPm.Shutdown();
@@ -198,34 +194,35 @@ namespace Luth
 
     bool TransparencySubsystem::OnShaderReloaded(const std::string& name, const std::vector<u32>& spv)
     {
+        LH_PROFILE_FUNCTION();
         auto invalidateSorted = [this]() {
-            if (auto sh = ShaderLibrary::Get("pbr_transparent.frag"))
+            if (auto sh = ShaderLibrary::Get("pbr_transparent.slang"))
             {
                 m_SortedPm.DeferredInvalidateShader(sh->Handle);
                 m_SortedSkinnedPm.DeferredInvalidateShader(sh->Handle);
             }
         };
         auto invalidateOit = [this]() {
-            if (auto sh = ShaderLibrary::Get("pbr_oit_store.frag"))
+            if (auto sh = ShaderLibrary::Get("pbr_oit_store.slang"))
             {
                 m_OitPm.DeferredInvalidateShader(sh->Handle);
                 m_OitSkinnedPm.DeferredInvalidateShader(sh->Handle);
             }
         };
 
-        if (name == "pbr_transparent.frag")
+        if (name == "pbr_transparent.slang")
         {
             m_TransparentFragSpv = spv;
             invalidateSorted();
             return true;
         }
-        if (name == "pbr_oit_store.frag")
+        if (name == "pbr_oit_store.slang")
         {
             m_OitStoreFragSpv = spv;
             invalidateOit();
             return true;
         }
-        if (name == "oit_resolve.frag")
+        if (name == "oit_resolve.slang")
         {
             m_ResolveFragSpv = spv;
             // Defer-destroy the live pipeline (in-flight frames may still bind it), then rebuild.
@@ -236,7 +233,7 @@ namespace Luth
         }
         // Vert reloads are owned by GeometrySubsystem (cached spv there); our variants compiled
         // against the old spv must still drop. Return false so the geometry handler runs too.
-        if (name == "pbr.vert" || name == "pbr_skinned.vert")
+        if (name == "pbr_vert.slang" || name == "pbr_skinned.slang")
         {
             invalidateSorted();
             invalidateOit();
@@ -246,6 +243,7 @@ namespace Luth
 
     void TransparencySubsystem::WritePerFrame(ViewResources& vr, u32 frameAbs)
     {
+        LH_PROFILE_FUNCTION();
         if (m_TransparentSetLayout == VK_NULL_HANDLE) return;
         if (!vr.volInScatterHistA || !vr.volInScatterHistB) return;
 
@@ -273,6 +271,7 @@ namespace Luth
 
     void TransparencySubsystem::WriteOitView(ViewResources& vr)
     {
+        LH_PROFILE_FUNCTION();
         if (m_TransparentSetLayout == VK_NULL_HANDLE) return;
         if (!vr.oitHeads || vr.oitNodes.buffer == VK_NULL_HANDLE) return;
 
@@ -334,6 +333,7 @@ namespace Luth
                                                         RG::ResourceHandle fogResolved,
                                                         RG::BufferHandle indirectBufferHandle)
     {
+        LH_PROFILE_FUNCTION();
         auto& sys = m_Pipeline->GetSystem();
         if (sys.GetDrawList().transparent.empty())
             return sceneColor;
@@ -349,6 +349,7 @@ namespace Luth
                                                             RG::ResourceHandle fogResolved,
                                                             RG::BufferHandle indirectBufferHandle)
     {
+        LH_PROFILE_FUNCTION();
         auto& sys = m_Pipeline->GetSystem();
         ViewResources* vr = m_Pipeline->GetCurrentViewResources();
         if (!vr || !vr->oitHeads || vr->oitNodes.buffer == VK_NULL_HANDLE || !m_ResolvePipeline)
@@ -438,7 +439,7 @@ namespace Luth
                 sys.GetFrameDebugger().BeginCapturePass(ctx.passIndex, "OITStore", "SceneColor", false,
                     { "pbr_oit_store", 0, VK_CULL_MODE_BACK_BIT, polyMode, false, true, false, true });
 
-                auto shader = ShaderLibrary::Get("pbr_oit_store.frag");
+                auto shader = ShaderLibrary::Get("pbr_oit_store.slang");
                 if (!shader || draws.empty()) { sys.GetFrameDebugger().EndCapturePass(); return; }
                 const UUID fragUUID = shader->Handle;
 
@@ -483,10 +484,10 @@ namespace Luth
                 const auto& indirectRegion = geo.GetIndirectRegion();
                 for (const auto& dc : draws)
                 {
-                    if (dc.cullMode != currentCull || dc.isSkinned != currentSkinned)
+                    if (dc.cullMode != currentCull || dc.isDeformed != currentSkinned)
                     {
                         currentCull    = dc.cullMode;
-                        currentSkinned = dc.isSkinned;
+                        currentSkinned = dc.isDeformed;
                         VKPipeline* newPipeline = currentSkinned
                             ? m_OitSkinnedPm.GetOrCreate(fragUUID, Material::RenderMode::Transparent,
                                   currentCull, polyMode, geo.GetPBRSkinnedVertSpv(), m_OitStoreFragSpv)
@@ -504,9 +505,13 @@ namespace Luth
                     auto ib = std::static_pointer_cast<VKIndexBuffer >(mesh->GetIndexBuffer ());
                     if (!vb || !ib) continue;
 
-                    VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
-                    VkDeviceSize offsets[] = { 0 };
-                    vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                    // Deformable draws bind no VB — the VS fetches the deformed buffer by gl_VertexIndex.
+                    if (!dc.isDeformed)
+                    {
+                        VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
+                        VkDeviceSize offsets[] = { 0 };
+                        vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                    }
                     vkCmdBindIndexBuffer(cmd, ib->GetVulkanBuffer(), 0, VK_INDEX_TYPE_UINT32);
 
                     const u32 viewBaseRegion = m_Pipeline->GetCurrentView()->viewIndex * RenderPipeline::k_IndirectRegionsPerView;
@@ -595,6 +600,7 @@ namespace Luth
                                                             RG::ResourceHandle fogResolved,
                                                             RG::BufferHandle indirectBufferHandle)
     {
+        LH_PROFILE_FUNCTION();
         auto& sys = m_Pipeline->GetSystem();
         const auto& draws = sys.GetDrawList().transparent;
         const u32 n = static_cast<u32>(draws.size());
@@ -654,7 +660,7 @@ namespace Luth
                 sys.GetFrameDebugger().BeginCapturePass(ctx.passIndex, "TransparentPass", "SceneColor", false,
                     { "pbr_transparent", 0, VK_CULL_MODE_BACK_BIT, polyMode, false, true, true, true });
 
-                auto shader = ShaderLibrary::Get("pbr_transparent.frag");
+                auto shader = ShaderLibrary::Get("pbr_transparent.slang");
                 if (!shader || data.count == 0) { sys.GetFrameDebugger().EndCapturePass(); return; }
                 const UUID fragUUID = shader->Handle;
 
@@ -700,10 +706,10 @@ namespace Luth
                 {
                     const DrawCommand& dc = draws[data.order[k]];
 
-                    if (dc.cullMode != currentCull || dc.isSkinned != currentSkinned)
+                    if (dc.cullMode != currentCull || dc.isDeformed != currentSkinned)
                     {
                         currentCull    = dc.cullMode;
-                        currentSkinned = dc.isSkinned;
+                        currentSkinned = dc.isDeformed;
                         VKPipeline* newPipeline = currentSkinned
                             ? m_SortedSkinnedPm.GetOrCreate(fragUUID, Material::RenderMode::Transparent,
                                   currentCull, polyMode, geo.GetPBRSkinnedVertSpv(), m_TransparentFragSpv)
@@ -721,9 +727,13 @@ namespace Luth
                     auto ib = std::static_pointer_cast<VKIndexBuffer >(mesh->GetIndexBuffer ());
                     if (!vb || !ib) continue;
 
-                    VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
-                    VkDeviceSize offsets[] = { 0 };
-                    vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                    // Deformable draws bind no VB — the VS fetches the deformed buffer by gl_VertexIndex.
+                    if (!dc.isDeformed)
+                    {
+                        VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
+                        VkDeviceSize offsets[] = { 0 };
+                        vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                    }
                     vkCmdBindIndexBuffer(cmd, ib->GetVulkanBuffer(), 0, VK_INDEX_TYPE_UINT32);
 
                     // GPU cull zeroed instanceCount for off-frustum draws; the indirect slot is keyed

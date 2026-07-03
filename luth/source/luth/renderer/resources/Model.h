@@ -43,6 +43,7 @@ namespace Luth
         uint32_t MaterialIndex = 0;
         std::string Name;
         bool IsSkinned = false;
+        bool IsDeformable = false;   // static wind-deformable opt-in (per-asset import setting)
         AABB BindPoseAABB;
     };
 
@@ -105,10 +106,12 @@ namespace Luth
     };
 
     struct ModelLight {
-        i32  Type      = 0;        // 0 = directional, 1 = point (spot is mapped to point on import)
+        i32  Type      = 0;        // 0 = directional, 1 = point, 2 = spot
         Vec3 Color     = Vec3(1.0f);
         f32  Intensity = 1.0f;
-        f32  Range     = 350.0f;   // point only
+        f32  Range     = 350.0f;   // point + spot
+        f32  InnerConeAngleDeg = 25.0f;   // spot only (half-angle)
+        f32  OuterConeAngleDeg = 45.0f;   // spot only (half-angle)
     };
 
     class Model : public Asset

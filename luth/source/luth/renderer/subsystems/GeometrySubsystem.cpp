@@ -1,4 +1,5 @@
 #include "luthpch.h"
+#include <atomic>
 #include "luth/renderer/subsystems/GeometrySubsystem.h"
 #include "luth/renderer/subsystems/LightingSubsystem.h"
 #include "luth/renderer/RenderPipeline.h"
@@ -6,6 +7,7 @@
 #include "luth/renderer/FrameDebugger.h"
 #include "luth/scene/systems/RenderingSystem.h"
 #include "luth/renderer/material/Material.h"
+#include "luth/renderer/material/MaterialGraphCodegen.h"
 #include "luth/renderer/material/MaterialSystem.h"
 #include "luth/renderer/resources/BoneMatrixBuffer.h"
 #include "luth/renderer/resources/Buffer.h"
@@ -15,6 +17,7 @@
 #include "luth/renderer/backend/vulkan/VulkanContext.h"
 #include "luth/renderer/backend/vulkan/VulkanTexture.h"
 #include "luth/renderer/backend/vulkan/VulkanBuffer.h"
+#include "luth/renderer/backend/vulkan/VulkanAccelerationStructure.h"
 #include "luth/core/FrameData.h"
 #include "luth/core/RenderSnapshot.h"
 #include "luth/jobs/JobSystem.h"
@@ -33,17 +36,6 @@ namespace Luth
                 { ShaderDataType::Float3, "a_Tangent"   }
             };
         }
-        BufferLayout MakeSkinnedVertexLayout() {
-            return BufferLayout{
-                { ShaderDataType::Float3, "a_Position"    },
-                { ShaderDataType::Float3, "a_Normal"      },
-                { ShaderDataType::Float2, "a_TexCoord0"   },
-                { ShaderDataType::Float2, "a_TexCoord1"   },
-                { ShaderDataType::Float3, "a_Tangent"     },
-                { ShaderDataType::Int4,   "a_BoneIDs"     },
-                { ShaderDataType::Float4, "a_BoneWeights" }
-            };
-        }
         // Position-only attribute with full PBR vertex stride — depth-prepass and shadow
         // pipelines reuse the PBR vertex buffer but only consume a_Position.
         std::pair<std::vector<VkVertexInputBindingDescription>, std::vector<VkVertexInputAttributeDescription>>
@@ -59,26 +51,28 @@ namespace Luth
 
     void GeometrySubsystem::Init(RenderPipeline& pipeline)
     {
+        LH_PROFILE_FUNCTION();
         m_Pipeline = &pipeline;
 
         auto loadSpv = [](const char* relPath) -> std::vector<u32> {
             auto sh = ShaderLibrary::LoadEngine(relPath);
             return sh ? sh->GetSpirV() : std::vector<u32>{};
         };
-        m_PBRVertSpv                 = loadSpv("shaders/pbr.vert");
-        m_PBRFragSpv                 = loadSpv("shaders/pbr.frag");
-        m_PBRSkinnedVertSpv          = loadSpv("shaders/pbr_skinned.vert");
-        m_DepthPrepassVertSpv        = loadSpv("shaders/depthPrepass.vert");
-        m_DepthPrepassSkinnedVertSpv = loadSpv("shaders/depthPrepass_skinned.vert");
-        m_SlimGBufferVertSpv         = loadSpv("shaders/slim_gbuffer.vert");
-        m_SlimGBufferSkinnedVertSpv  = loadSpv("shaders/slim_gbuffer_skinned.vert");
-        m_SlimGBufferFragSpv         = loadSpv("shaders/slim_gbuffer.frag");
+        m_PBRVertSpv                 = loadSpv("shaders/pbr_vert.slang");
+        m_PBRFragSpv                 = loadSpv("shaders/pbr.slang");
+        m_PBRSkinnedVertSpv          = loadSpv("shaders/pbr_skinned.slang");
+        m_DepthPrepassVertSpv        = loadSpv("shaders/depthPrepass.slang");
+        m_DepthPrepassSkinnedVertSpv = loadSpv("shaders/depthPrepass_skinned.slang");
+        m_SlimGBufferVertSpv         = loadSpv("shaders/slim_gbuffer_vert.slang");
+        m_SlimGBufferSkinnedVertSpv  = loadSpv("shaders/slim_gbuffer_skinned.slang");
+        m_SlimGBufferFragSpv         = loadSpv("shaders/slim_gbuffer.slang");
+        m_WireframeOverlayFragSpv    = loadSpv("shaders/wireframe_overlay.slang");
 
         if (m_PBRVertSpv.empty() || m_PBRFragSpv.empty() || m_PBRSkinnedVertSpv.empty()
          || m_DepthPrepassVertSpv.empty() || m_DepthPrepassSkinnedVertSpv.empty()
          || m_SlimGBufferVertSpv.empty() || m_SlimGBufferSkinnedVertSpv.empty() || m_SlimGBufferFragSpv.empty())
         {
-            LH_CORE_ERROR("GeometrySubsystem: shader SPIR-V empty after asset load!");
+            LH_LOG(Renderer, error, "GeometrySubsystem: shader SPIR-V empty after asset load!");
             return;
         }
 
@@ -86,8 +80,26 @@ namespace Luth
         InitCullPipeline();
     }
 
+    const std::vector<u32>& GeometrySubsystem::ResolveFragSpv(const UUID& fragShaderUUID)
+    {
+        LH_PROFILE_FUNCTION();
+        if (!fragShaderUUID.IsValid()) return m_PBRFragSpv;
+
+        auto it = m_GraphFragSpv.find(fragShaderUUID);
+        if (it != m_GraphFragSpv.end()) return it->second;
+
+        // Generated graph shaders register in ShaderLibrary (keyed by name) — match on the asset Handle.
+        for (const auto& [name, sh] : ShaderLibrary::GetAll())
+        {
+            if (sh && sh->Handle == fragShaderUUID && !sh->GetSpirV().empty())
+                return m_GraphFragSpv.emplace(fragShaderUUID, sh->GetSpirV()).first->second;
+        }
+        return m_PBRFragSpv;  // not yet registered/loaded — stock this frame, retried next
+    }
+
     void GeometrySubsystem::InitObjectSSBO()
     {
+        LH_PROFILE_FUNCTION();
         VkDevice device = VulkanContext::Get().GetDevice();
 
         // Set 5 layout: binding 0 = ObjectSSBO. BuildGPUObjectBuffer rewrites binding 0
@@ -128,6 +140,7 @@ namespace Luth
 
     void GeometrySubsystem::InitCullPipeline()
     {
+        LH_PROFILE_FUNCTION();
         VkDevice device = VulkanContext::Get().GetDevice();
 
         // Cull descriptor layout: binding 0 = ObjectSSBO (read), binding 1 = IndirectBuffer (write).
@@ -176,11 +189,11 @@ namespace Luth
         pcRange.offset     = 0;
         pcRange.size       = sizeof(Vec4) * 6 + sizeof(u32) * 2;
 
-        auto cullShader = ShaderLibrary::LoadEngine("shaders/gpu_cull.comp");
+        auto cullShader = ShaderLibrary::LoadEngine("shaders/gpu_cull.slang");
         auto spv = cullShader ? cullShader->GetSpirV() : std::vector<u32>{};
         if (spv.empty())
         {
-            LH_CORE_ERROR("GeometrySubsystem: failed to load gpu_cull.comp!");
+            LH_LOG(Renderer, error, "GeometrySubsystem: failed to load gpu_cull.slang!");
             return;
         }
         m_CullPipeline = std::make_unique<VKComputePipeline>(
@@ -191,6 +204,7 @@ namespace Luth
 
     void GeometrySubsystem::BuildPipelines(const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         BuildPBRPipelines(geoLayouts);
         BuildDepthPrepassPipelines(geoLayouts);
         BuildSlimGBufferPipelines(geoLayouts);
@@ -198,6 +212,7 @@ namespace Luth
 
     void GeometrySubsystem::BuildPBRPipelines(const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         auto pbrLayout = MakePBRVertexLayout();
         auto bindingDescs = pbrLayout.GetBindingDescriptions();
         auto attribDescs  = pbrLayout.GetAttributeDescriptions();
@@ -238,19 +253,15 @@ namespace Luth
                 return config;
             });
 
-        auto skinnedLayout = MakeSkinnedVertexLayout();
-        auto skinnedBindingDescs = skinnedLayout.GetBindingDescriptions();
-        auto skinnedAttribDescs  = skinnedLayout.GetAttributeDescriptions();
-
+        // Skinned variant: empty vertex input — the deformable VS fetch pos/normal/tangent/uv from the
+        // deformed buffer by gl_VertexIndex, so no VB is bound. see arch/rendering-pipeline.md
         m_GeoSkinnedPipelineManager.Init(geoLayouts,
-            [skinnedBindingDescs, skinnedAttribDescs](Material::RenderMode mode, Material::CullMode cullMode, VkPolygonMode polygonMode) -> PipelineConfig
+            [](Material::RenderMode mode, Material::CullMode cullMode, VkPolygonMode polygonMode) -> PipelineConfig
             {
                 PipelineConfig config;
                 config.colorFormats = { VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32_UINT };
                 config.depthFormat  = VK_FORMAT_D32_SFLOAT;
                 config.frontFace    = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-                config.bindingDescriptions   = skinnedBindingDescs;
-                config.attributeDescriptions = skinnedAttribDescs;
                 config.polygonMode    = polygonMode;
                 config.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
@@ -275,10 +286,42 @@ namespace Luth
                 }
                 return config;
             });
+
+        // Shaded-wireframe overlay: flat line-polygon pipelines redrawn over the lit fill (LEQUAL depth,
+        // no write). Static uses the pbr vertex layout; skinned uses the empty deformable input. Created
+        // directly (not via a manager) for the custom line/depth config; a distinct frag keeps the fill's
+        // pipeline cache untouched.
+        if (!m_PBRVertSpv.empty() && !m_WireframeOverlayFragSpv.empty())
+        {
+            PipelineConfig cfg;
+            cfg.colorFormats   = { VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32_UINT };
+            cfg.depthFormat    = VK_FORMAT_D32_SFLOAT;
+            cfg.frontFace      = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            cfg.polygonMode    = VK_POLYGON_MODE_LINE;
+            cfg.cullMode       = VK_CULL_MODE_NONE;
+            cfg.depthTest      = true;
+            cfg.depthWrite     = false;
+            cfg.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+            cfg.blendEnabled   = false;
+            cfg.bindingDescriptions   = bindingDescs;
+            cfg.attributeDescriptions = attribDescs;
+            m_WireframeOverlayPipeline = std::make_unique<VKPipeline>(
+                cfg, m_PBRVertSpv, m_WireframeOverlayFragSpv, geoLayouts);
+
+            if (!m_PBRSkinnedVertSpv.empty())
+            {
+                PipelineConfig scfg = cfg;
+                scfg.bindingDescriptions.clear();
+                scfg.attributeDescriptions.clear();
+                m_WireframeOverlaySkinnedPipeline = std::make_unique<VKPipeline>(
+                    scfg, m_PBRSkinnedVertSpv, m_WireframeOverlayFragSpv, geoLayouts);
+            }
+        }
     }
 
     void GeometrySubsystem::BuildDepthPrepassPipelines(const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         auto [posOnlyBindings, posOnlyAttribs] = MakePositionOnlyWithFullStride();
         const auto& shadowFragSpv = m_Pipeline->GetLighting().GetShadowFragSpv();
 
@@ -302,10 +345,7 @@ namespace Luth
 
         if (!m_DepthPrepassSkinnedVertSpv.empty() && !shadowFragSpv.empty())
         {
-            auto skinned = MakeSkinnedVertexLayout();
-            auto skinnedBindings = skinned.GetBindingDescriptions();
-            auto skinnedAttribs  = skinned.GetAttributeDescriptions();
-
+            // Empty vertex input — deformable VS fetch the deformed buffer by gl_VertexIndex.
             PipelineConfig cfg;
             cfg.colorFormats = {};
             cfg.depthFormat  = VK_FORMAT_D32_SFLOAT;
@@ -315,8 +355,6 @@ namespace Luth
             cfg.blendEnabled = false;
             cfg.cullMode     = VK_CULL_MODE_BACK_BIT;
             cfg.frontFace    = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-            cfg.bindingDescriptions   = skinnedBindings;
-            cfg.attributeDescriptions = skinnedAttribs;
 
             m_DepthPrepassSkinnedPipeline = std::make_unique<VKPipeline>(
                 cfg, m_DepthPrepassSkinnedVertSpv, shadowFragSpv, geoLayouts);
@@ -325,6 +363,7 @@ namespace Luth
 
     void GeometrySubsystem::BuildSlimGBufferPipelines(const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         // 4 color attachments mirror SlimGBufferOutput. depthFormat lets the pipeline test against
         // prepass depth via EQUAL — no depth writes (DepthPrepass owns the buffer for this frame).
         auto makeConfig = [&](auto bindings, auto attribs) {
@@ -350,13 +389,13 @@ namespace Luth
 
         // Cutout variant: same shaders, but writes its own depth (LESS_OR_EQUAL) because the opaque-only
         // prepass omits cutout — the EQUAL opaque config would reject every cutout fragment (prepass cleared
-        // those pixels to 1.0 or holds the surface behind). slim_gbuffer.frag alpha-tests the holes away.
+        // those pixels to 1.0 or holds the surface behind). slim_gbuffer.slang alpha-tests the holes away.
         auto makeCutoutConfig = [&](auto bindings, auto attribs) {
             auto cfg = makeConfig(bindings, attribs);
             cfg.depthWrite     = true;
             cfg.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
             cfg.cullMode       = VK_CULL_MODE_NONE;   // cutout foliage is two-sided — back faces must reach
-            return cfg;                               // the slim G-buffer (slim_gbuffer.frag flips the normal),
+            return cfg;                               // the slim G-buffer (slim_gbuffer.slang flips the normal),
         };                                            // else RT shadows/reflections read the geometry behind it
 
         if (!m_SlimGBufferVertSpv.empty() && !m_SlimGBufferFragSpv.empty())
@@ -373,20 +412,21 @@ namespace Luth
         }
         if (!m_SlimGBufferSkinnedVertSpv.empty() && !m_SlimGBufferFragSpv.empty())
         {
-            auto skinned = MakeSkinnedVertexLayout();
-            auto skinnedBindings = skinned.GetBindingDescriptions();
-            auto skinnedAttribs  = skinned.GetAttributeDescriptions();
+            // Empty vertex input — deformable VS fetch the deformed buffer by gl_VertexIndex.
+            std::vector<VkVertexInputBindingDescription>   noBindings;
+            std::vector<VkVertexInputAttributeDescription> noAttribs;
             m_SlimGBufferSkinnedPipeline = std::make_unique<VKPipeline>(
-                makeConfig(skinnedBindings, skinnedAttribs),
+                makeConfig(noBindings, noAttribs),
                 m_SlimGBufferSkinnedVertSpv, m_SlimGBufferFragSpv, geoLayouts);
             m_SlimGBufferCutoutSkinnedPipeline = std::make_unique<VKPipeline>(
-                makeCutoutConfig(skinnedBindings, skinnedAttribs),
+                makeCutoutConfig(noBindings, noAttribs),
                 m_SlimGBufferSkinnedVertSpv, m_SlimGBufferFragSpv, geoLayouts);
         }
     }
 
     void GeometrySubsystem::Shutdown()
     {
+        LH_PROFILE_FUNCTION();
         VkDevice device = VulkanContext::Get().GetDevice();
 
         m_SlimGBufferCutoutSkinnedPipeline.reset();
@@ -410,6 +450,7 @@ namespace Luth
     bool GeometrySubsystem::OnShaderReloaded(const std::string& name, const std::vector<u32>& spv,
                                               const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         auto deferGfx = [](std::unique_ptr<VKPipeline>& p) {
             if (auto* raw = p.release(); raw)
                 VulkanContext::Get().PushDeletion([raw]() { delete raw; });
@@ -419,17 +460,17 @@ namespace Luth
                 VulkanContext::Get().PushDeletion([raw]() { delete raw; });
         };
 
-        if      (name == "pbr.vert")                   m_PBRVertSpv                 = spv;
-        else if (name == "pbr.frag")                   m_PBRFragSpv                 = spv;
-        else if (name == "pbr_skinned.vert")           m_PBRSkinnedVertSpv          = spv;
-        else if (name == "depthPrepass.vert")          m_DepthPrepassVertSpv        = spv;
-        else if (name == "depthPrepass_skinned.vert")  m_DepthPrepassSkinnedVertSpv = spv;
-        else if (name == "slim_gbuffer.vert")          m_SlimGBufferVertSpv         = spv;
-        else if (name == "slim_gbuffer.frag")          m_SlimGBufferFragSpv         = spv;
-        else if (name == "slim_gbuffer_skinned.vert")  m_SlimGBufferSkinnedVertSpv  = spv;
-        else if (name != "gpu_cull.comp") return false;
+        if      (name == "pbr_vert.slang")                   m_PBRVertSpv                 = spv;
+        else if (name == "pbr.slang")                  m_PBRFragSpv                 = spv;
+        else if (name == "pbr_skinned.slang")           m_PBRSkinnedVertSpv          = spv;
+        else if (name == "depthPrepass.slang")          m_DepthPrepassVertSpv        = spv;
+        else if (name == "depthPrepass_skinned.slang")  m_DepthPrepassSkinnedVertSpv = spv;
+        else if (name == "slim_gbuffer_vert.slang")          m_SlimGBufferVertSpv         = spv;
+        else if (name == "slim_gbuffer.slang")          m_SlimGBufferFragSpv         = spv;
+        else if (name == "slim_gbuffer_skinned.slang")  m_SlimGBufferSkinnedVertSpv  = spv;
+        else if (name != "gpu_cull.slang") return false;
 
-        if (name == "gpu_cull.comp" && m_CullDescLayout)
+        if (name == "gpu_cull.slang" && m_CullDescLayout)
         {
             deferComp(m_CullPipeline);
             VkPushConstantRange pc{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Vec4) * 6 + sizeof(u32) * 2 };
@@ -437,13 +478,13 @@ namespace Luth
                 std::vector<VkDescriptorSetLayout>{ m_CullDescLayout },
                 std::vector<VkPushConstantRange>{ pc });
         }
-        else if (name == "depthPrepass.vert" || name == "depthPrepass_skinned.vert")
+        else if (name == "depthPrepass.slang" || name == "depthPrepass_skinned.slang")
         {
             deferGfx(m_DepthPrepassPipeline);
             deferGfx(m_DepthPrepassSkinnedPipeline);
             BuildDepthPrepassPipelines(geoLayouts);
         }
-        else if (name == "slim_gbuffer.vert" || name == "slim_gbuffer.frag" || name == "slim_gbuffer_skinned.vert")
+        else if (name == "slim_gbuffer_vert.slang" || name == "slim_gbuffer.slang" || name == "slim_gbuffer_skinned.slang")
         {
             deferGfx(m_SlimGBufferPipeline);
             deferGfx(m_SlimGBufferSkinnedPipeline);
@@ -454,9 +495,9 @@ namespace Luth
         else
         {
             // pbr.* — invalidate the pipeline manager cache, rebuild the manager.
-            const bool isPBR = (name == "pbr.vert" || name == "pbr.frag");
+            const bool isPBR = (name == "pbr_vert.slang" || name == "pbr.slang");
             if (isPBR) {
-                UUID pbrKey = ShaderLibrary::Get("pbr.vert")->Handle;
+                UUID pbrKey = ShaderLibrary::Get("pbr_vert.slang")->Handle;
                 m_GeoPipelineManager.DeferredInvalidateShader(pbrKey);
                 m_GeoSkinnedPipelineManager.DeferredInvalidateShader(pbrKey);
             } else {
@@ -470,6 +511,13 @@ namespace Luth
 
     u32 GeometrySubsystem::EnsureMaterialRegistered(std::shared_ptr<Material> material)
     {
+        LH_PROFILE_FUNCTION();
+        // Lazily lower a graph material to its generated fragment shader on first encounter. This runs in
+        // the game-stage snapshot capture (off the render-recording path); the once-guard makes the Slang
+        // compile a one-time cost. An editor edit clears the guard entry to force a re-emit.
+        if (material->HasGraph() && m_GraphCompiled.insert(material->Handle).second)
+            MaterialGraphCodegen::GenerateAndCompile(*material);
+
         auto it = m_MaterialSlotMap.find(material->Handle);
         if (it != m_MaterialSlotMap.end()) return it->second;
 
@@ -478,8 +526,13 @@ namespace Luth
         return slot;
     }
 
+    // Perf observability: meshes dropped last build because the GPU object cap was hit.
+    static std::atomic<u32> s_DroppedObjects{ 0 };
+    u32 GeometrySubsystem::GetDroppedObjectCount() { return s_DroppedObjects.load(std::memory_order_relaxed); }
+
     void GeometrySubsystem::BuildGPUObjectBuffer(const RenderSnapshot& snapshot)
     {
+        LH_PROFILE_FUNCTION();
         // Allocate fresh regions from the GPU tagged heap. Tag = absolute render-frame index;
         // descriptor slot = same index modulo MAX_FRAMES_IN_FLIGHT (per-frame storage rotation).
         // FreeTag(N-2) reclaims regions once the GPU retires the consuming submission.
@@ -502,6 +555,7 @@ namespace Luth
         auto* objectData   = static_cast<GPUObjectData*>(m_ObjectRegion.mappedPtr);
         auto* indirectCmds = static_cast<VkDrawIndexedIndirectCommand*>(m_IndirectRegion.mappedPtr);
         u32   count        = 0;
+        u32   dropped      = 0;   // meshes skipped due to the k_MaxGPUObjects cap (observability)
 
         // Rebuild entity lookup. Index 0 = null sentinel; valid entities start at 1
         // (the geometry pass writes (entityID + 1) so 0 means "background").
@@ -511,7 +565,7 @@ namespace Luth
 
         for (const MeshDrawSnapshot& meshSnap : snapshot.meshes)
         {
-            if (count >= RenderPipeline::k_MaxGPUObjects) break;
+            if (count >= RenderPipeline::k_MaxGPUObjects) { ++dropped; continue; }
 
             auto model = AssetManager::GetAsset<Model>(meshSnap.modelUUID);
             if (!model) continue;
@@ -519,16 +573,22 @@ namespace Luth
             auto mesh = model->GetMesh(meshSnap.meshIndex);
             if (!mesh) continue;
 
+            // Skinned raster now fetches its deformed buffer by BDA — skip the draw until the skinned
+            // BLAS (+ deformed buffer) is ready, else the deformable VS derefs a null address and
+            // faults the device. Transient (one frame) for a still-loading model.
+            auto blas = mesh->GetBlas();
+            if ((meshSnap.isSkinned || meshSnap.isDeformable) && (!blas || !blas->IsDeformable() || blas->GetDeformedBdaCurr(frameAbs) == 0))
+                continue;
+
             GPUObjectData& obj = objectData[count];
             obj.model = meshSnap.worldMatrix;
 
             // Resolve previous-frame model from the render-side cache. Newly-spawned entities
             // (cache miss) fall back to current model → zero motion for one frame.
             entt::entity entity = static_cast<entt::entity>(meshSnap.entity);
-            if (auto pmIt = m_PrevModelByEntity.find(entity); pmIt != m_PrevModelByEntity.end())
-                obj.prevModel = pmIt->second;
-            else
-                obj.prevModel = obj.model;
+            auto pmIt = m_PrevModelByEntity.find(entity);
+            const bool firstFrame = (pmIt == m_PrevModelByEntity.end());
+            obj.prevModel = firstFrame ? obj.model : pmIt->second;
 
             const auto& aabb   = meshesData[meshSnap.meshIndex].BindPoseAABB;
             obj.boundingSphere = Vec4(aabb.Center(), Math::Length(aabb.Extents()));
@@ -554,6 +614,22 @@ namespace Luth
             // Don't-care for non-skinned draws (their shaders never read bones[]).
             obj.prevBoneOffset = meshSnap.boneOffset + BoneMatrixBuffer::PREV_BLOCK_OFFSET;
 
+            // Deformed-vertex buffer BDAs for the deformable raster path (skinned only). CURR holds
+            // this frame's skin; PREV is last frame's, for motion vectors. Rigid meshes get 0 — their
+            // VS reads the bound vertex buffer instead. (Skinned-but-unready meshes were skipped above.)
+            if (blas && blas->IsDeformable())
+            {
+                obj.deformedBdaCurr = blas->GetDeformedBdaCurr(frameAbs);
+                // Seed prev=curr on the entity's first frame (prev region still zero-filled) so motion
+                // is zero — matches the prevModel cache-miss fallback above.
+                obj.deformedBdaPrev = firstFrame ? obj.deformedBdaCurr : blas->GetDeformedBdaPrev(frameAbs);
+            }
+            else
+            {
+                obj.deformedBdaCurr = 0;
+                obj.deformedBdaPrev = 0;
+            }
+
             VkDrawIndexedIndirectCommand baseCmd{};
             baseCmd.indexCount    = obj.indexCount;
             baseCmd.instanceCount = 1;
@@ -566,6 +642,16 @@ namespace Luth
         }
 
         m_GPUObjectCount = count;
+
+        s_DroppedObjects.store(dropped, std::memory_order_relaxed);
+        if (dropped > 0)
+        {
+            static std::atomic<bool> warned{ false };
+            bool expected = false;
+            if (warned.compare_exchange_strong(expected, true))
+                LH_LOG(Renderer, warn, "GPU object cap ({}) exceeded — up to {} draws dropped. Raise k_MaxGPUObjects or add culling/LOD.",
+                             (u32)RenderPipeline::k_MaxGPUObjects, dropped);
+        }
 
         // Atomic-replace the prev-model cache from this frame's snapshot. Reads the ungated
         // snapshot list so entities with transient asset-load issues keep their prev-frame
@@ -624,6 +710,7 @@ namespace Luth
                                          const std::array<Vec4, 6>& frustumPlanes, u32 destOffset,
                                          const char* passName)
     {
+        LH_PROFILE_FUNCTION();
         if (!m_CullPipeline || m_GPUObjectCount == 0) return;
 
         struct CullPassData {
@@ -681,6 +768,7 @@ namespace Luth
 
     RG::ResourceHandle GeometrySubsystem::AddDepthPrepass(RG::RenderGraph& rg, RG::BufferHandle indirectBufferHandle)
     {
+        LH_PROFILE_FUNCTION();
         struct DepthPrepassData {
             RG::ResourceHandle depthTex;
             RG::BufferHandle   indirectBuf;
@@ -719,7 +807,7 @@ namespace Luth
                 sys.GetFrameDebugger().BeginCapturePass(ctx.passIndex, "DepthPrepass", "SceneDepth", true,
                     { "depthPrepass", 0, VK_CULL_MODE_BACK_BIT, VK_POLYGON_MODE_FILL, false, true, true, false });
 
-                if (!m_DepthPrepassPipeline) { LH_CORE_ERROR("DepthPrepass pipeline is null!"); sys.GetFrameDebugger().EndCapturePass(); return; }
+                if (!m_DepthPrepassPipeline) { LH_LOG(Renderer, error, "DepthPrepass pipeline is null!"); sys.GetFrameDebugger().EndCapturePass(); return; }
 
                 const u32 slot = static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex()) % MAX_FRAMES_IN_FLIGHT;
                 VkDescriptorSet bindlessSet = VulkanContext::Get().GetBindlessSet().GetSet();
@@ -756,10 +844,12 @@ namespace Luth
                     auto vb = std::static_pointer_cast<VKVertexBuffer>(mesh->GetVertexBuffer());
                     auto ib = std::static_pointer_cast<VKIndexBuffer>(mesh->GetIndexBuffer());
                     if (!vb || !ib) continue;
+                    // Deformed draws need the empty-input pipeline; skip if absent — static binds no VB.
+                    if (dc.isDeformed && !m_DepthPrepassSkinnedPipeline) continue;
 
-                    if (dc.isSkinned != currentSkinned)
+                    if (dc.isDeformed != currentSkinned)
                     {
-                        currentSkinned = dc.isSkinned;
+                        currentSkinned = dc.isDeformed;
                         if (currentSkinned && m_DepthPrepassSkinnedPipeline)
                         {
                             m_DepthPrepassSkinnedPipeline->Bind(cmd);
@@ -774,9 +864,13 @@ namespace Luth
                         }
                     }
 
-                    VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
-                    VkDeviceSize offsets[] = { 0 };
-                    vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                    // Deformable draws bind no VB — the VS fetches the deformed buffer by gl_VertexIndex.
+                    if (!dc.isDeformed)
+                    {
+                        VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
+                        VkDeviceSize offsets[] = { 0 };
+                        vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                    }
                     vkCmdBindIndexBuffer(cmd, ib->GetVulkanBuffer(), 0, VK_INDEX_TYPE_UINT32);
 
                     const u32 viewBaseRegion = m_Pipeline->GetCurrentView()->viewIndex * RenderPipeline::k_IndirectRegionsPerView;
@@ -811,6 +905,7 @@ namespace Luth
                                                             RG::BufferHandle indirectBufferHandle,
                                                             RG::ResourceHandle sceneDepth)
     {
+        LH_PROFILE_FUNCTION();
         struct SlimGBufferData {
             RG::ResourceHandle normalTex;
             RG::ResourceHandle roughnessTex;
@@ -874,7 +969,7 @@ namespace Luth
                 sys.GetFrameDebugger().BeginCapturePass(ctx.passIndex, "SlimGBufferPass", "SlimNormal", false,
                     { "slim_gbuffer", 0, VK_CULL_MODE_BACK_BIT, VK_POLYGON_MODE_FILL, false, true, false, false });
 
-                if (!m_SlimGBufferPipeline) { LH_CORE_ERROR("SlimGBuffer pipeline is null!"); sys.GetFrameDebugger().EndCapturePass(); return; }
+                if (!m_SlimGBufferPipeline) { LH_LOG(Renderer, error, "SlimGBuffer pipeline is null!"); sys.GetFrameDebugger().EndCapturePass(); return; }
 
                 const u32 slot = static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex()) % MAX_FRAMES_IN_FLIGHT;
                 VkDescriptorSet bindlessSet = VulkanContext::Get().GetBindlessSet().GetSet();
@@ -912,10 +1007,12 @@ namespace Luth
                     auto vb = std::static_pointer_cast<VKVertexBuffer>(mesh->GetVertexBuffer());
                     auto ib = std::static_pointer_cast<VKIndexBuffer>(mesh->GetIndexBuffer());
                     if (!vb || !ib) continue;
+                    // Deformed draws need the empty-input pipeline; skip if absent — static binds no VB.
+                    if (dc.isDeformed && !m_SlimGBufferSkinnedPipeline) continue;
 
-                    if (dc.isSkinned != currentSkinned)
+                    if (dc.isDeformed != currentSkinned)
                     {
-                        currentSkinned = dc.isSkinned;
+                        currentSkinned = dc.isDeformed;
                         if (currentSkinned && m_SlimGBufferSkinnedPipeline)
                         {
                             m_SlimGBufferSkinnedPipeline->Bind(cmd);
@@ -930,9 +1027,13 @@ namespace Luth
                         }
                     }
 
-                    VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
-                    VkDeviceSize offsets[] = { 0 };
-                    vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                    // Deformable draws bind no VB — the VS fetches the deformed buffer by gl_VertexIndex.
+                    if (!dc.isDeformed)
+                    {
+                        VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
+                        VkDeviceSize offsets[] = { 0 };
+                        vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                    }
                     vkCmdBindIndexBuffer(cmd, ib->GetVulkanBuffer(), 0, VK_INDEX_TYPE_UINT32);
 
                     const u32 viewBaseRegion = m_Pipeline->GetCurrentView()->viewIndex * RenderPipeline::k_IndirectRegionsPerView;
@@ -972,10 +1073,12 @@ namespace Luth
                         auto vb = std::static_pointer_cast<VKVertexBuffer>(mesh->GetVertexBuffer());
                         auto ib = std::static_pointer_cast<VKIndexBuffer>(mesh->GetIndexBuffer());
                         if (!vb || !ib) continue;
+                        // Deformed draws need the empty-input pipeline; skip if absent — static binds no VB.
+                        if (dc.isDeformed && !m_SlimGBufferCutoutSkinnedPipeline) continue;
 
-                        if (dc.isSkinned != currentSkinned)
+                        if (dc.isDeformed != currentSkinned)
                         {
-                            currentSkinned = dc.isSkinned;
+                            currentSkinned = dc.isDeformed;
                             VKPipeline* p = (currentSkinned && m_SlimGBufferCutoutSkinnedPipeline)
                                 ? m_SlimGBufferCutoutSkinnedPipeline.get()
                                 : m_SlimGBufferCutoutPipeline.get();
@@ -984,9 +1087,13 @@ namespace Luth
                                 p->GetLayout(), 0, 6, sets, 0, nullptr);
                         }
 
-                        VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
-                        VkDeviceSize offsets[] = { 0 };
-                        vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                        // Deformable draws bind no VB — the VS fetches the deformed buffer by gl_VertexIndex.
+                        if (!dc.isDeformed)
+                        {
+                            VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
+                            VkDeviceSize offsets[] = { 0 };
+                            vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                        }
                         vkCmdBindIndexBuffer(cmd, ib->GetVulkanBuffer(), 0, VK_INDEX_TYPE_UINT32);
 
                         const u32 viewBaseRegion = m_Pipeline->GetCurrentView()->viewIndex * RenderPipeline::k_IndirectRegionsPerView;
@@ -1029,6 +1136,7 @@ namespace Luth
                                                       RG::ResourceHandle reflHandle,
                                                       RG::ResourceHandle diSpecHandle)
     {
+        LH_PROFILE_FUNCTION();
         struct GeometryPassData {
             RG::ResourceHandle outputTex;
             RG::ResourceHandle entityIDTex;
@@ -1138,7 +1246,7 @@ namespace Luth
                 sys.GetFrameDebugger().BeginCapturePass(ctx.passIndex, "GeometryPass", "SceneColor", false,
                     { "pbr", 0, VK_CULL_MODE_BACK_BIT, polyMode, false, true, true, false });
 
-                UUID pbrUUID = ShaderLibrary::Get("pbr.vert")->Handle;
+                UUID pbrUUID = ShaderLibrary::Get("pbr_vert.slang")->Handle;
                 auto* opaquePipeline = m_GeoPipelineManager.GetOrCreate(
                     pbrUUID, Material::RenderMode::Opaque, Material::CullMode::Back, polyMode, m_PBRVertSpv, m_PBRFragSpv);
                 if (!opaquePipeline) { sys.GetFrameDebugger().EndCapturePass(); return; }
@@ -1172,34 +1280,44 @@ namespace Luth
                 {
                     if (draws.empty()) return;
 
-                    Material::CullMode currentCull = Material::CullMode::Back;
+                    // Sentinel cull never matches a real CullMode, so the first draw always binds.
+                    Material::CullMode currentCull = static_cast<Material::CullMode>(0xFF);
                     bool currentSkinned = false;
-                    auto* pipeline = m_GeoPipelineManager.GetOrCreate(
-                        pbrUUID, mode, currentCull, polyMode, m_PBRVertSpv, m_PBRFragSpv);
-                    if (!pipeline) return;
-                    pipeline->Bind(cmd);
+                    UUID currentFrag = UUID::Invalid();
+                    VKPipeline* pipeline = nullptr;
 
                     for (const auto& dc : draws)
                     {
-                        if (dc.cullMode != currentCull || dc.isSkinned != currentSkinned)
+                        if (dc.cullMode != currentCull || dc.isDeformed != currentSkinned || dc.fragShaderUUID != currentFrag)
                         {
                             currentCull    = dc.cullMode;
-                            currentSkinned = dc.isSkinned;
-                            VKPipeline* newPipeline = currentSkinned
-                                ? m_GeoSkinnedPipelineManager.GetOrCreate(pbrUUID, mode, currentCull, polyMode, m_PBRSkinnedVertSpv, m_PBRFragSpv)
-                                : m_GeoPipelineManager.GetOrCreate       (pbrUUID, mode, currentCull, polyMode, m_PBRVertSpv,        m_PBRFragSpv);
-                            if (!newPipeline) continue;
-                            newPipeline->Bind(cmd);
+                            currentSkinned = dc.isDeformed;
+                            currentFrag    = dc.fragShaderUUID;
+
+                            // Default materials key on pbrUUID (shared stock frag); a graph material keys on
+                            // its own frag UUID so PipelineManager caches one pipeline per distinct graph.
+                            const UUID keyUUID = dc.fragShaderUUID.IsValid() ? dc.fragShaderUUID : pbrUUID;
+                            const std::vector<u32>& fragSpv = ResolveFragSpv(dc.fragShaderUUID);
+                            pipeline = currentSkinned
+                                ? m_GeoSkinnedPipelineManager.GetOrCreate(keyUUID, mode, currentCull, polyMode, m_PBRSkinnedVertSpv, fragSpv)
+                                : m_GeoPipelineManager.GetOrCreate       (keyUUID, mode, currentCull, polyMode, m_PBRVertSpv,        fragSpv);
+                            if (!pipeline) continue;
+                            pipeline->Bind(cmd);
                         }
+                        if (!pipeline) continue;
 
                         auto mesh = dc.model->GetMesh(dc.meshIndex);
                         auto vb = std::static_pointer_cast<VKVertexBuffer>(mesh->GetVertexBuffer());
                         auto ib = std::static_pointer_cast<VKIndexBuffer >(mesh->GetIndexBuffer ());
                         if (!vb || !ib) continue;
 
-                        VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
-                        VkDeviceSize offsets[] = { 0 };
-                        vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                        // Deformable draws bind no VB — the VS fetches the deformed buffer by gl_VertexIndex.
+                        if (!dc.isDeformed)
+                        {
+                            VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
+                            VkDeviceSize offsets[] = { 0 };
+                            vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                        }
                         vkCmdBindIndexBuffer(cmd, ib->GetVulkanBuffer(), 0, VK_INDEX_TYPE_UINT32);
 
                         // GPU cull sets instanceCount=0 for culled draws. gl_BaseInstance =
@@ -1233,6 +1351,51 @@ namespace Luth
                 // Transparent moved to TransparencySubsystem's pass after skybox + fog composite.
                 DrawBatch(sys.GetDrawList().opaque, Material::RenderMode::Opaque);
                 DrawBatch(sys.GetDrawList().cutout, Material::RenderMode::Cutout);
+
+                // Shaded wireframe: redraw opaque + cutout as flat lines over the lit fill. LEQUAL depth
+                // against the prepass depth hides occluded edges; reuses the bound Sets 0-5 + indirect draws.
+                if (sys.GetShadeMode() == ShadeMode::WireframeShaded && m_WireframeOverlayPipeline)
+                {
+                    auto DrawOverlay = [&](const std::vector<DrawCommand>& draws)
+                    {
+                        VKPipeline* cur = nullptr;
+                        for (const auto& dc : draws)
+                        {
+                            VKPipeline* want = dc.isDeformed ? m_WireframeOverlaySkinnedPipeline.get()
+                                                             : m_WireframeOverlayPipeline.get();
+                            if (!want) continue;
+                            if (want != cur)
+                            {
+                                cur = want;
+                                cur->Bind(cmd);
+                                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    cur->GetLayout(), 0, 6, sets, 0, nullptr);
+                            }
+                            auto mesh = dc.model->GetMesh(dc.meshIndex);
+                            auto vb = std::static_pointer_cast<VKVertexBuffer>(mesh->GetVertexBuffer());
+                            auto ib = std::static_pointer_cast<VKIndexBuffer >(mesh->GetIndexBuffer ());
+                            if (!ib) continue;
+                            if (!dc.isDeformed)
+                            {
+                                if (!vb) continue;
+                                VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
+                                VkDeviceSize offsets[] = { 0 };
+                                vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                            }
+                            vkCmdBindIndexBuffer(cmd, ib->GetVulkanBuffer(), 0, VK_INDEX_TYPE_UINT32);
+                            // Direct draw (not indirect): firstInstance = gpuObjectIndex feeds gl_BaseInstance
+                            // so the VS reads objects[idx]. Skips GPU cull (minor overdraw, fine for a debug
+                            // overlay) and stays independent of which indirect region a draw list lives in.
+                            vkCmdDrawIndexed(cmd, ib->GetCount(), 1, 0, 0, dc.gpuObjectIndex);
+                        }
+                    };
+                    DrawOverlay(sys.GetDrawList().opaque);
+                    DrawOverlay(sys.GetDrawList().cutout);
+                    // Transparent meshes render their lit fill later (OIT); draw their wireframe here too so
+                    // Shaded Wireframe shows glass edges. They test against opaque depth (glass wrote none),
+                    // so the full silhouette shows through the surface.
+                    DrawOverlay(sys.GetDrawList().transparent);
+                }
 
                 sys.GetFrameDebugger().EndCapturePass();
             }

@@ -6,6 +6,7 @@
 #include "luth/resources/FileSystem.h"
 #include "luth/resources/AssetSerializer.h"
 #include "luth/resources/importers/TextureResolver.h"
+#include "luth/resources/importers/TextureBaker.h"
 #include "luth/resources/importers/ImportReport.h"
 #include "luth/resources/importers/AnimationClipImporter.h"
 #include "luth/renderer/material/Material.h"
@@ -18,6 +19,8 @@
 #include <assimp/GltfMaterial.h>
 #include <fstream>
 #include <queue>
+#include <algorithm>
+#include <cctype>
 
 namespace Luth
 {
@@ -37,6 +40,7 @@ namespace Luth
         s.ImportNormals                = j.value("import_normals", true);
         s.ImportTangents               = j.value("import_tangents", false);
         s.OptimizeMesh                 = j.value("optimize_mesh", true);
+        s.MarkDeformable               = j.value("mark_deformable", false);
         s.ScaleFactor                  = j.value("scale_factor", 1.0f);
         s.UpAxis                       = j.value("up_axis", -1);
         s.BakeAxisConversion           = j.value("bake_axis_conversion", true);
@@ -45,6 +49,7 @@ namespace Luth
         s.ImportCameras                = j.value("import_cameras", true);
         s.ImportLights                 = j.value("import_lights", true);
         s.PhysicsBake                  = static_cast<PhysicsBakeMode>(j.value("physics_bake", 0));
+        s.AutoDetectTextureRoles       = j.value("auto_detect_texture_roles", true);
         return s;
     }
 
@@ -54,6 +59,7 @@ namespace Luth
             { "import_normals",                  ImportNormals },
             { "import_tangents",                 ImportTangents },
             { "optimize_mesh",                   OptimizeMesh },
+            { "mark_deformable",                 MarkDeformable },
             { "scale_factor",                    ScaleFactor },
             { "up_axis",                         UpAxis },
             { "bake_axis_conversion",            BakeAxisConversion },
@@ -61,7 +67,8 @@ namespace Luth
             { "extract_clips_as_separate_assets", ExtractClipsAsSeparateAssets },
             { "import_cameras",                  ImportCameras },
             { "import_lights",                   ImportLights },
-            { "physics_bake",                    static_cast<int>(PhysicsBake) }
+            { "physics_bake",                    static_cast<int>(PhysicsBake) },
+            { "auto_detect_texture_roles",       AutoDetectTextureRoles }
         };
     }
 
@@ -318,7 +325,7 @@ namespace Luth
             }
         }
 
-        LH_CORE_INFO("ModelImporter: Extracted skeleton with {0} bones ({1} actual bones, rest structural)",
+        LH_LOG(Assets, info, "ModelImporter: Extracted skeleton with {0} bones ({1} actual bones, rest structural)",
             skeleton.BoneCount(), boneInvBindPoses.size());
     }
 
@@ -359,7 +366,7 @@ namespace Luth
             i32 boneIndex = skeleton.FindBone(boneName);
 
             if (boneIndex < 0) {
-                LH_CORE_WARN("ModelImporter: Bone '{0}' not found in skeleton", boneName);
+                LH_LOG(Assets, warn, "ModelImporter: Bone '{0}' not found in skeleton", boneName);
                 continue;
             }
 
@@ -418,7 +425,7 @@ namespace Luth
 
                 i32 boneIndex = skeleton.FindBone(nodeName);
                 if (boneIndex < 0) {
-                    LH_CORE_WARN("ModelImporter: Animation channel '{}' not found in skeleton — skipping", nodeName);
+                    LH_LOG(Assets, warn, "ModelImporter: Animation channel '{}' not found in skeleton — skipping", nodeName);
                     continue;
                 }
 
@@ -463,7 +470,7 @@ namespace Luth
             clips.push_back(std::move(clip));
         }
 
-        LH_CORE_INFO("ModelImporter: Extracted {0} animation clips", clips.size());
+        LH_LOG(Assets, info, "ModelImporter: Extracted {0} animation clips", clips.size());
     }
 
     // --- Mesh Processing ---
@@ -648,12 +655,14 @@ namespace Luth
                 case aiLightSource_DIRECTIONAL: ml.Type = 0; break;
                 case aiLightSource_POINT:       ml.Type = 1; break;
                 case aiLightSource_SPOT:
-                    ml.Type = 1;
-                    LH_CORE_WARN("ModelImporter: spot light '{}' imported as point (cone dropped)",
-                        light->mName.C_Str());
+                    // Assimp cone angles are radians; treated as half-angles (glTF convention).
+                    // The gatherer clamps to a sane range, so a full-angle source just imports wide.
+                    ml.Type = 2;
+                    ml.InnerConeAngleDeg = Math::Degrees(light->mAngleInnerCone);
+                    ml.OuterConeAngleDeg = Math::Degrees(light->mAngleOuterCone);
                     break;
                 default:
-                    LH_CORE_WARN("ModelImporter: unsupported light type ('{}') skipped", light->mName.C_Str());
+                    LH_LOG(Assets, warn, "ModelImporter: unsupported light type ('{}') skipped", light->mName.C_Str());
                     continue;
             }
             // Assimp folds intensity into the color magnitude; split it back out for a sane editor range.
@@ -661,7 +670,7 @@ namespace Luth
             float maxc = std::max({ color.x, color.y, color.z });
             if (maxc > 1.0f) { ml.Intensity = maxc; color /= maxc; }
             ml.Color = color;
-            if (ml.Type == 1 && light->mAttenuationQuadratic > 1e-4f)
+            if (ml.Type != 0 && light->mAttenuationQuadratic > 1e-4f)   // point + spot
                 ml.Range = std::clamp(std::sqrt(1.0f / (0.01f * light->mAttenuationQuadratic)), 1.0f, 10000.0f);
             lightByName[light->mName.C_Str()] = (i32)modelData.Lights.size();
             modelData.Lights.push_back(ml);
@@ -691,19 +700,38 @@ namespace Luth
         walk(scene->mRootNode, -1);
     }
 
-    static MapType AssimpToLuthMapType(aiTextureType type)
+    // Lowercased filename stem, used to refine a texture's role beyond what the Assimp semantic type says.
+    static std::string StemLower(const fs::path& p)
     {
-        switch (type) {
-            case aiTextureType_DIFFUSE:             return MapType::Diffuse;
-            case aiTextureType_BASE_COLOR:          return MapType::Diffuse;
-            case aiTextureType_NORMALS:             return MapType::Normal;
-            case aiTextureType_NORMAL_CAMERA:       return MapType::Normal;
-            case aiTextureType_METALNESS:           return MapType::Metalness;
-            case aiTextureType_DIFFUSE_ROUGHNESS:   return MapType::Roughness;
-            case aiTextureType_EMISSIVE:            return MapType::Emissive;
-            case aiTextureType_AMBIENT:             return MapType::Occlusion;
-            default:                                return MapType::Diffuse;
-        }
+        std::string s = p.stem().string();
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    }
+
+    static bool StemHasAny(const std::string& stem, std::initializer_list<const char*> needles)
+    {
+        for (const char* n : needles)
+            if (stem.find(n) != std::string::npos) return true;
+        return false;
+    }
+
+    // ORM / ARM / RMA packs carry occlusion in R, roughness in G, metallic in B, already canonical for the
+    // decode, so they alias into both the occlusion and metalRough slots with no pixel transform.
+    static bool IsOrmStem(const fs::path& p) { return StemHasAny(StemLower(p), { "_orm", "_arm", "_rma" }); }
+
+    // DirectX normals (-Y green) need a flip; not reliably filename-detectable, so default to GL and let a
+    // _dx suffix or the texture inspector override decide.
+    static TextureRole InferNormalRole(const fs::path& p)
+    {
+        return StemHasAny(StemLower(p), { "_dx", "_directx" }) ? TextureRole::NormalDX : TextureRole::NormalGL;
+    }
+
+    // A metalRough/ORM-bound map is canonical unless its green channel is authored as glossiness.
+    static TextureRole InferMetalRoughRole(const fs::path& p)
+    {
+        return StemHasAny(StemLower(p), { "_gloss", "_glossiness" })
+             ? TextureRole::GlossToRoughness : TextureRole::LinearData;
     }
 
     // --- Importer Logic ---
@@ -715,6 +743,7 @@ namespace Luth
         const aiScene* Scene;
         std::unordered_map<std::string, UUID> TexturePathToUUID;
         std::vector<UUID> MaterialUUIDs;
+        bool AutoDetectRoles = true;
     };
 
     static void ProcessTextures(ImportContext& ctx)
@@ -746,7 +775,7 @@ namespace Luth
                     file.write((const char*)texture->pcData, texture->mWidth);
                 } else {
                     // Raw ARGB8888, would need encoding (skip for now or use stbi_write)
-                    LH_CORE_WARN("Raw embedded textures not fully supported yet: {0}", fileName);
+                    LH_LOG(Assets, warn, "Raw embedded textures not fully supported yet: {0}", fileName);
                     continue;
                 }
             }
@@ -781,7 +810,7 @@ namespace Luth
 
         // Create new Material
         nlohmann::json matJson;
-        UUID pbrUUID = AssetDatabase::GetUUID(FileSystem::EngineAssetsPath("shaders/pbr.vert"));
+        UUID pbrUUID = AssetDatabase::GetUUID(FileSystem::EngineAssetsPath("shaders/pbr_vert.slang"));
         matJson["shader"] = pbrUUID.IsValid() ? pbrUUID.ToString() : "";
         // Render mode (Opaque=0/Cutout=1/Transparent=2; Fade=3 is editor-only): glTF alphaMode wins,
         // else opacity<1 → Transparent. The opacity>0.001 floor dodges the FBX "0 means default" quirk.
@@ -824,74 +853,189 @@ namespace Luth
         if (aiMat->Get(AI_MATKEY_METALLIC_FACTOR, floatVal) == AI_SUCCESS)  matJson["metalness"] = floatVal;
         if (aiMat->Get(AI_MATKEY_ROUGHNESS_FACTOR, floatVal) == AI_SUCCESS) matJson["roughness"] = floatVal;
 
-        // Textures
+        // Textures: resolve each Assimp slot to a UUID + source path, classify a TextureRole, then route
+        // into the bounded material slots. Packed layouts (ORM alias, separate metal+rough bake) land here
+        // so material.slang's fixed-swizzle decode always reads canonical channels with no shader change.
         matJson["textures"] = nlohmann::json::array();
 
-        auto TryAddTexture = [&](aiTextureType aiType, MapType luthType) {
-            // Skip if this slot is already filled — glTF exposes metal-rough under both METALNESS and
-            // DIFFUSE_ROUGHNESS (same file), and occlusion under AMBIENT_OCCLUSION and LIGHTMAP.
-            for (const auto& existing : matJson["textures"])
-                if (existing["type"].get<int>() == (int)luthType) return;
+        struct Resolved { UUID uuid = UUID::Invalid(); fs::path path; int uv = 0; };
 
-            if (aiMat->GetTextureCount(aiType) > 0) {
-                aiString path;
-                if (aiMat->GetTexture(aiType, 0, &path) == AI_SUCCESS) {
-                    std::string pathStr = path.C_Str();
-                    UUID texUUID = UUID::Invalid();
+        auto ResolveSlot = [&](aiTextureType aiType, MapType reportType) -> Resolved {
+            if (aiMat->GetTextureCount(aiType) == 0) return {};
+            aiString path;
+            if (aiMat->GetTexture(aiType, 0, &path) != AI_SUCCESS) return {};
+            std::string pathStr = path.C_Str();
 
-                    // 1. Check embedded textures ("*0", "*1", ...)
-                    if (ctx.TexturePathToUUID.count(pathStr)) {
-                        texUUID = ctx.TexturePathToUUID[pathStr];
-                    }
-                    else {
-                        // 2. Multi-strategy filesystem search
-                        ResolveResult result = ResolveTexturePath(ctx.SourcePath.parent_path(), pathStr);
-                        if (!result.ResolvedPath.empty()) {
-                            texUUID = AssetDatabase::GetUUID(result.ResolvedPath);
-                            if (!texUUID.IsValid()) {
-                                texUUID = MetaFile::Create(result.ResolvedPath, AssetType::Texture);
-                                AssetDatabase::RegisterAsset(result.ResolvedPath, texUUID, AssetType::Texture);
-                            }
-                            if (result.Strategy != "direct") {
-                                LH_CORE_INFO("ModelImporter: Found texture via '{}' strategy: {} -> {}",
-                                    result.Strategy, pathStr, result.ResolvedPath.filename().string());
-                            }
-                        }
-                        else {
-                            // LH_CORE_WARN("ModelImporter: Could not find texture '{}' for material '{}' ({})",
-                            //     pathStr, matName, Material::ToString(luthType));
-                            s_LastImportReport.Unresolved.push_back({
-                                matName, matPath, pathStr, luthType
-                            });
-                        }
-                    }
-
-                    if (texUUID.IsValid()) {
-                        // UV set from the DCC; the engine carries two (TexCoord0/1), so clamp >0 to 1.
-                        int uvChannel = 0;
-                        aiMat->Get(AI_MATKEY_UVWSRC(aiType, 0), uvChannel);
-
-                        nlohmann::json texNode;
-                        texNode["type"] = (int)luthType;
-                        texNode["uuid"] = texUUID.ToString();
-                        texNode["uv"] = (uvChannel <= 0) ? 0 : 1;
-                        texNode["useTexture"] = true;
-                        matJson["textures"].push_back(texNode);
-                    }
-                }
+            Resolved t;
+            if (ctx.TexturePathToUUID.count(pathStr)) {
+                t.uuid = ctx.TexturePathToUUID[pathStr];           // embedded ("*0", "*1", ...)
+                t.path = AssetDatabase::GetMetadata(t.uuid).Path;
             }
+            else {
+                ResolveResult r = ResolveTexturePath(ctx.SourcePath.parent_path(), pathStr);
+                if (r.ResolvedPath.empty()) {
+                    s_LastImportReport.Unresolved.push_back({ matName, matPath, pathStr, reportType });
+                    return {};
+                }
+                t.uuid = AssetDatabase::GetUUID(r.ResolvedPath);
+                if (!t.uuid.IsValid()) {
+                    t.uuid = MetaFile::Create(r.ResolvedPath, AssetType::Texture);
+                    AssetDatabase::RegisterAsset(r.ResolvedPath, t.uuid, AssetType::Texture);
+                }
+                t.path = r.ResolvedPath;
+                if (r.Strategy != "direct")
+                    LH_LOG(Assets, info, "ModelImporter: Found texture via '{0}' strategy: {1} -> {2}",
+                        r.Strategy, pathStr, r.ResolvedPath.filename().string());
+            }
+            // UV set from the DCC; the engine carries two (TexCoord0/1), so clamp >0 to 1.
+            int uvChannel = 0;
+            aiMat->Get(AI_MATKEY_UVWSRC(aiType, 0), uvChannel);
+            t.uv = (uvChannel <= 0) ? 0 : 1;
+            return t;
         };
 
-        TryAddTexture(aiTextureType_DIFFUSE, MapType::Diffuse);
-        TryAddTexture(aiTextureType_BASE_COLOR, MapType::Diffuse);
-        TryAddTexture(aiTextureType_NORMALS, MapType::Normal);
-        // metalRoughIndex samples MapType::Metalness only; glTF's combined map arrives under either
-        // METALNESS or DIFFUSE_ROUGHNESS (same file), so both target Metalness and the dedupe keeps one.
-        TryAddTexture(aiTextureType_METALNESS, MapType::Metalness);
-        TryAddTexture(aiTextureType_DIFFUSE_ROUGHNESS, MapType::Metalness);
-        TryAddTexture(aiTextureType_EMISSIVE, MapType::Emissive);
-        TryAddTexture(aiTextureType_AMBIENT_OCCLUSION, MapType::Occlusion);
-        TryAddTexture(aiTextureType_LIGHTMAP, MapType::Occlusion);
+        auto AddNode = [&](MapType luthType, const Resolved& t) {
+            if (!t.uuid.IsValid()) return;
+            for (const auto& existing : matJson["textures"])       // one texture per canonical slot
+                if (existing["type"].get<int>() == (int)luthType) return;
+            nlohmann::json node;
+            node["type"] = (int)luthType;
+            node["uuid"] = t.uuid.ToString();
+            node["uv"] = t.uv;
+            node["useTexture"] = true;
+            matJson["textures"].push_back(node);
+        };
+
+        // Stamp the inferred role into the texture's .meta unless auto-detect is off or a role is already
+        // set. On a fresh stamp, drop any stale artifact so the next load reimports with the transform.
+        auto StampRole = [&](const Resolved& t, TextureRole role) {
+            if (!ctx.AutoDetectRoles || !t.uuid.IsValid() || t.path.empty()) return;
+            fs::path metaPath = t.path.string() + ".meta";
+            MetaFile meta(t.uuid);
+            meta.Load(metaPath);
+            auto& ts = meta.GetTypeSettings();
+            if (ts.contains("role")) return;                       // never clobber a prior / user-set role
+            ts["role"] = (int)role;
+            meta.Save(metaPath);
+            fs::path artifact = AssetDatabase::GetArtifactPath(t.uuid);
+            if (fs::exists(artifact)) fs::remove(artifact);
+        };
+
+        // Base color / normal / emissive: straight one-to-one routing.
+        Resolved diffuse = ResolveSlot(aiTextureType_BASE_COLOR, MapType::Diffuse);
+        if (!diffuse.uuid.IsValid()) diffuse = ResolveSlot(aiTextureType_DIFFUSE, MapType::Diffuse);
+        StampRole(diffuse, TextureRole::Color);
+        AddNode(MapType::Diffuse, diffuse);
+
+        Resolved normal = ResolveSlot(aiTextureType_NORMALS, MapType::Normal);
+        if (!normal.uuid.IsValid()) normal = ResolveSlot(aiTextureType_NORMAL_CAMERA, MapType::Normal);
+        StampRole(normal, InferNormalRole(normal.path));
+        AddNode(MapType::Normal, normal);
+
+        Resolved emissive = ResolveSlot(aiTextureType_EMISSIVE, MapType::Emissive);
+        StampRole(emissive, TextureRole::Color);
+        AddNode(MapType::Emissive, emissive);
+
+        // Occlusion: a dedicated AO map; an ORM metalRough may also alias into this slot below.
+        Resolved occlusion = ResolveSlot(aiTextureType_AMBIENT_OCCLUSION, MapType::Occlusion);
+        if (!occlusion.uuid.IsValid()) occlusion = ResolveSlot(aiTextureType_LIGHTMAP, MapType::Occlusion);
+        StampRole(occlusion, TextureRole::LinearData);
+        AddNode(MapType::Occlusion, occlusion);
+
+        // Metal-rough: the crux. glTF reports the combined map under METALNESS and/or DIFFUSE_ROUGHNESS
+        // (same file). Separate single-channel files are baked into one packed map; an ORM pack aliases
+        // into the occlusion slot too (its R channel feeds the occlusion read).
+        {
+            Resolved metal = ResolveSlot(aiTextureType_METALNESS, MapType::Metalness);
+            Resolved rough = ResolveSlot(aiTextureType_DIFFUSE_ROUGHNESS, MapType::Metalness);
+            bool sameFile = metal.uuid.IsValid() && rough.uuid.IsValid() && metal.uuid == rough.uuid;
+
+            auto routeCombined = [&](const Resolved& mr) {
+                StampRole(mr, InferMetalRoughRole(mr.path));
+                AddNode(MapType::Metalness, mr);
+                if (!occlusion.uuid.IsValid() && IsOrmStem(mr.path))
+                    AddNode(MapType::Occlusion, mr);
+            };
+
+            if (metal.uuid.IsValid() && (sameFile || !rough.uuid.IsValid()))
+                routeCombined(metal);
+            else if (rough.uuid.IsValid() && !metal.uuid.IsValid())
+                routeCombined(rough);
+            else if (metal.uuid.IsValid() && rough.uuid.IsValid())  // separate files -> bake one packed map
+            {
+                UUID baked = TextureBaker::BakeMetalRough(ctx.TextureDir, matName,
+                                                          rough.path, rough.uuid, metal.path, metal.uuid);
+                if (baked.IsValid()) {
+                    Resolved t; t.uuid = baked; t.uv = rough.uv;
+                    AddNode(MapType::Metalness, t);
+                }
+                else {
+                    StampRole(rough, TextureRole::LinearData);
+                    AddNode(MapType::Metalness, rough);
+                    LH_LOG(Assets, warn, "ModelImporter: '{0}' metal+rough bake failed; routed roughness only", matName);
+                    s_LastImportReport.Degraded.push_back({ matName, matPath,
+                        "separate metal+rough bake failed: roughness routed, metallic from factor" });
+                }
+            }
+        }
+
+        // Spec-gloss workflow: a material with a specular(-glossiness) map and no metal-rough is converted
+        // to metal-rough (+ baseColor) so the decode reads canonical channels. Lossy by nature; see history.
+        bool hasMetalRough = false;
+        for (const auto& t : matJson["textures"])
+            if (t["type"].get<int>() == (int)MapType::Metalness) { hasMetalRough = true; break; }
+
+        if (!hasMetalRough && aiMat->GetTextureCount(aiTextureType_SPECULAR) > 0)
+        {
+            Resolved spec = ResolveSlot(aiTextureType_SPECULAR, MapType::Metalness);
+            if (spec.uuid.IsValid())
+            {
+                TextureBaker::SpecGlossInputs sgIn;
+                sgIn.specGlossSrc = spec.path; sgIn.specGlossUuid = spec.uuid;
+                if (diffuse.uuid.IsValid()) { sgIn.diffuseSrc = diffuse.path; sgIn.diffuseUuid = diffuse.uuid; }
+
+                aiColor4D dc;
+                if (aiMat->Get(AI_MATKEY_COLOR_DIFFUSE, dc) == AI_SUCCESS) {
+                    sgIn.diffuseFactor[0] = dc.r; sgIn.diffuseFactor[1] = dc.g;
+                    sgIn.diffuseFactor[2] = dc.b; sgIn.diffuseFactor[3] = dc.a;
+                }
+                aiColor3D sc;
+                if (aiMat->Get(AI_MATKEY_COLOR_SPECULAR, sc) == AI_SUCCESS) {
+                    sgIn.specularFactor[0] = sc.r; sgIn.specularFactor[1] = sc.g; sgIn.specularFactor[2] = sc.b;
+                }
+                aiMat->Get(AI_MATKEY_GLOSSINESS_FACTOR, sgIn.glossinessFactor);
+
+                TextureBaker::SpecGlossResult res =
+                    TextureBaker::BakeSpecGlossToMetalRough(ctx.TextureDir, matName, sgIn);
+                if (res.metalRough.IsValid())
+                {
+                    Resolved mr; mr.uuid = res.metalRough; mr.uv = spec.uv;
+                    AddNode(MapType::Metalness, mr);
+
+                    if (res.baseColor.IsValid())
+                    {
+                        // The converted baseColor folds the diffuse factor in, so swap the raw diffuse node
+                        // for it and neutralize the scalar color (the decode multiplies color * baseColor).
+                        auto& arr = matJson["textures"];
+                        for (auto it = arr.begin(); it != arr.end(); ++it)
+                            if ((*it)["type"].get<int>() == (int)MapType::Diffuse) { arr.erase(it); break; }
+                        Resolved bc; bc.uuid = res.baseColor; bc.uv = diffuse.uv;
+                        AddNode(MapType::Diffuse, bc);
+                        matJson["color"] = { 1.0f, 1.0f, 1.0f, 1.0f };
+                    }
+                    LH_LOG(Assets, info, "ModelImporter: '{0}' converted spec-gloss to metal-rough", matName);
+                }
+                else
+                {
+                    float gloss = 1.0f;
+                    aiMat->Get(AI_MATKEY_GLOSSINESS_FACTOR, gloss);
+                    matJson["roughness"] = 1.0f - gloss;
+                    LH_LOG(Assets, warn, "ModelImporter: '{0}' spec-gloss bake failed; roughness from gloss factor", matName);
+                    s_LastImportReport.Degraded.push_back({ matName, matPath,
+                        "spec-gloss bake failed: roughness from factor, metallic from factor" });
+                }
+            }
+        }
 
         // Emissive factor -> the direct "emissive" key (rgb factor, a strength), NOT the dead u_*
         // uniform channel. Default to white when only a resolved emissive texture is present, so glTF
@@ -945,6 +1089,7 @@ namespace Luth
         ctx.SourcePath = source;
         ctx.TextureDir = source.parent_path() / (source.stem().string() + "_Textures");
         ctx.MaterialDir = source.parent_path() / (source.stem().string() + "_Materials");
+        ctx.AutoDetectRoles = settings.AutoDetectTextureRoles;
 
         Assimp::Importer importer;
         importer.SetPropertyBool(AI_CONFIG_IMPORT_FBX_PRESERVE_PIVOTS, false);
@@ -956,10 +1101,14 @@ namespace Luth
         if (settings.ImportTangents) flags |= aiProcess_CalcTangentSpace;
         if (settings.OptimizeMesh)   flags |= aiProcess_OptimizeMeshes;
 
-        const aiScene* scene = importer.ReadFile(source.string(), flags);
+        const aiScene* scene;
+        {
+            LH_PROFILE_SCOPE("ParseScene");
+            scene = importer.ReadFile(source.string(), flags);
+        }
 
         if (!scene || scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE || !scene->mRootNode) {
-            LH_CORE_ERROR("ModelImporter: Failed to load model {0} : {1}", source.string(), importer.GetErrorString());
+            LH_LOG(Assets, error, "ModelImporter: Failed to load model {0} : {1}", source.string(), importer.GetErrorString());
             return false;
         }
 
@@ -969,13 +1118,16 @@ namespace Luth
         ProcessTextures(ctx);
 
         // 2. Process Materials
-        ctx.MaterialUUIDs.resize(scene->mNumMaterials);
-        for (unsigned int i = 0; i < scene->mNumMaterials; i++) {
-            ctx.MaterialUUIDs[i] = ProcessMaterial(ctx, scene->mMaterials[i], i);
+        {
+            LH_PROFILE_SCOPE("ProcessMaterials");
+            ctx.MaterialUUIDs.resize(scene->mNumMaterials);
+            for (unsigned int i = 0; i < scene->mNumMaterials; i++) {
+                ctx.MaterialUUIDs[i] = ProcessMaterial(ctx, scene->mMaterials[i], i);
+            }
         }
 
         if (s_LastImportReport.HasUnresolved()) {
-            LH_CORE_WARN("ModelImporter: {} texture(s) could not be resolved for '{}'."
+            LH_LOG(Assets, warn, "ModelImporter: {} texture(s) could not be resolved for '{}'."
                 " Use the Texture Remap dialog to assign them.",
                 s_LastImportReport.Unresolved.size(), source.filename().string());
         }
@@ -1048,7 +1200,7 @@ namespace Luth
                     AnimationAssetData animData;
                     animData.Clip = clip;
                     if (!AssetSerializer::SerializeAnimation(clipPath, animData)) {
-                        LH_CORE_WARN("ModelImporter: Failed to write clip '{}'", clipPath.string());
+                        LH_LOG(Assets, warn, "ModelImporter: Failed to write clip '{}'", clipPath.string());
                         continue;
                     }
 
@@ -1066,13 +1218,24 @@ namespace Luth
 
         // 4. Process Geometry — skinned keeps the baked/flattened path (verts in skeleton space,
         // bone-driven); static reconstructs the node graph with un-baked meshes + cameras + lights.
-        if (isSkinned)
-            ProcessNode(scene->mRootNode, scene, axisCorrection, modelData.Meshes, isSkinned, modelData.SkeletonData);
-        else
-            BuildStaticSceneGraph(scene, axisCorrection, settings.ImportCameras, settings.ImportLights, modelData);
+        {
+            LH_PROFILE_SCOPE("ProcessGeometry");
+            if (isSkinned)
+                ProcessNode(scene->mRootNode, scene, axisCorrection, modelData.Meshes, isSkinned, modelData.SkeletonData);
+            else
+                BuildStaticSceneGraph(scene, axisCorrection, settings.ImportCameras, settings.ImportLights, modelData);
+        }
+
+        // Wind-deformable opt-in applies to STATIC meshes only (skinned meshes deform via skinning).
+        if (settings.MarkDeformable)
+            for (auto& m : modelData.Meshes)
+                if (!m.IsSkinned) m.IsDeformable = true;
 
         modelData.Materials = ctx.MaterialUUIDs;
 
-        return AssetSerializer::SerializeModel(destination, modelData);
+        {
+            LH_PROFILE_SCOPE("SerializeModel");
+            return AssetSerializer::SerializeModel(destination, modelData);
+        }
     }
 }

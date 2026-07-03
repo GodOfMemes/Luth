@@ -24,20 +24,22 @@ namespace Luth
             m_MinFilter = (int)texture.GetFilterMode().first;
             m_MagFilter = (int)texture.GetFilterMode().second;
 
-            // Read generate_mipmaps from .meta
+            // Read generate_mipmaps + channel role from .meta
             m_GenerateMipmaps = true;
+            m_Role = 0;
             fs::path metaPath = texture.GetPath().string() + ".meta";
             MetaFile meta(texture.Handle);
             if (meta.Load(metaPath))
             {
                 auto& ts = meta.GetTypeSettings();
                 if (ts.contains("generate_mipmaps")) m_GenerateMipmaps = ts["generate_mipmaps"].get<bool>();
+                if (ts.contains("role"))             m_Role = ts["role"].get<int>();
             }
         }
 
         // Header: thumbnail-on-left, name + dimensions on right.
         ImTextureID headerThumb = UI::ThumbnailCache::Get(texture.Handle, AssetType::Texture);
-        UI::InspectorHeader(headerThumb, ICON_FA_IMAGE, 48.0f, [&]() {
+        UI::InspectorHeader(headerThumb, ICON_IMAGE, 48.0f, [&]() {
             const ImVec4 nameCol = { 1.0f, 0.7f, 0.2f, 1.0f };
             ImGui::TextColored(nameCol, "%s (Texture)", texture.GetName().c_str());
             ImGui::TextDisabled("%dx%d  ·  %s  ·  %d mip%s",
@@ -86,12 +88,15 @@ namespace Luth
             {
                 const char* wrapModes[] = { "Repeat", "Clamp to Edge", "Mirrored Repeat" };
                 const char* filterModes[] = { "Linear", "Nearest", "Linear Mipmap", "Nearest Mipmap" };
+                // Order matches TextureRole (Color, NormalGL, NormalDX, LinearData, GlossToRoughness).
+                const char* roleModes[] = { "Color", "Normal (GL)", "Normal (DX)", "Linear Data", "Gloss to Roughness" };
 
                 if (UI::BeginProperties("TextureSettings")) {
                     UI::Property("Generate Mipmaps", m_GenerateMipmaps);
                     UI::PropertyCombo("Wrap Mode",  m_WrapMode,  wrapModes,   IM_ARRAYSIZE(wrapModes));
                     UI::PropertyCombo("Min Filter", m_MinFilter, filterModes, IM_ARRAYSIZE(filterModes));
                     UI::PropertyCombo("Mag Filter", m_MagFilter, filterModes, IM_ARRAYSIZE(filterModes));
+                    UI::PropertyCombo("Channel Role", m_Role, roleModes, IM_ARRAYSIZE(roleModes));
                     UI::EndProperties();
                 }
 
@@ -110,6 +115,7 @@ namespace Luth
                         ts["wrap_mode"] = m_WrapMode;
                         ts["filter_min"] = m_MinFilter;
                         ts["filter_mag"] = m_MagFilter;
+                        ts["role"] = m_Role;
                         meta.Save(metaPath);
 
                         // Delete artifact to force reimport with new settings

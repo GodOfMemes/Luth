@@ -45,6 +45,7 @@ namespace Luth
 
     void VolumetricSubsystem::Init(RenderPipeline& pipeline)
     {
+        LH_PROFILE_FUNCTION();
         m_Pipeline = &pipeline;
         VkDevice device = VulkanContext::Get().GetDevice();
 
@@ -94,11 +95,11 @@ namespace Luth
 
             VkPushConstantRange pcRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(InjectPC) };
 
-            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_inject_density.comp"))
+            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_inject_density.slang"))
                 m_InjectDensitySpv = sh->GetSpirV();
             if (m_InjectDensitySpv.empty())
             {
-                LH_CORE_ERROR("VolumetricSubsystem: failed to load volumetric_inject_density.comp!");
+                LH_LOG(Renderer, error, "VolumetricSubsystem: failed to load volumetric_inject_density.slang!");
                 return;
             }
             // Pipeline layout: Set 0 = GlobalSubsystem's, Set 1 = density-only inject state.
@@ -148,21 +149,21 @@ namespace Luth
             layoutCI.pBindings    = bindings;
             vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &m_InjectScatterDescLayout);
 
-            // Empty Set 2 placeholder — geom_table.glsl pins Material to Set 3 + bindless to Set 4, but the
+            // Empty Set 2 placeholder — material_bindings_rt.slang pins Material to Set 3 + bindless to Set 4, but the
             // scatter pipeline has no pass-local Set 2. A 0-binding layout fills the gap; it's never bound.
             VkDescriptorSetLayoutCreateInfo emptyCI{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
             vkCreateDescriptorSetLayout(device, &emptyCI, nullptr, &m_EmptySet2Layout);
 
             VkPushConstantRange pcRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(InjectPC) };
 
-            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_inject_scatter.comp"))
+            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_inject_scatter.slang"))
                 m_InjectScatterSpv = sh->GetSpirV();
             if (m_InjectScatterSpv.empty())
             {
-                LH_CORE_ERROR("VolumetricSubsystem: failed to load volumetric_inject_scatter.comp!");
+                LH_LOG(Renderer, error, "VolumetricSubsystem: failed to load volumetric_inject_scatter.slang!");
                 return;
             }
-            // Cutout 5-set layout: Set 3 Material + Set 4 bindless feed geom_table's RT alpha-test.
+            // Cutout 5-set layout: Set 3 Material + Set 4 bindless feed material_bindings_rt.slang's RT alpha-test.
             m_InjectScatterPipeline = std::make_unique<VKComputePipeline>(
                 m_InjectScatterSpv,
                 std::vector<VkDescriptorSetLayout>{
@@ -195,11 +196,11 @@ namespace Luth
 
             VkPushConstantRange pcRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(IntegratePC) };
 
-            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_integrate.comp"))
+            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_integrate.slang"))
                 m_IntegrateSpv = sh->GetSpirV();
             if (m_IntegrateSpv.empty())
             {
-                LH_CORE_ERROR("VolumetricSubsystem: failed to load volumetric_integrate.comp!");
+                LH_LOG(Renderer, error, "VolumetricSubsystem: failed to load volumetric_integrate.slang!");
                 return;
             }
             m_IntegratePipeline = std::make_unique<VKComputePipeline>(
@@ -242,11 +243,11 @@ namespace Luth
 
             VkPushConstantRange pcRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ResolvePC) };
 
-            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_resolve.comp"))
+            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_resolve.slang"))
                 m_ResolveSpv = sh->GetSpirV();
             if (m_ResolveSpv.empty())
             {
-                LH_CORE_ERROR("VolumetricSubsystem: failed to load volumetric_resolve.comp!");
+                LH_LOG(Renderer, error, "VolumetricSubsystem: failed to load volumetric_resolve.slang!");
                 return;
             }
             // Set 0 = GlobalUniforms (prevViewProjection + prevViewParams + temporalAlpha).
@@ -286,13 +287,13 @@ namespace Luth
             layoutCI.pBindings    = bindings;
             vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &m_CompositeDescLayout);
 
-            if (auto sh = ShaderLibrary::LoadEngine("shaders/fullscreen.vert"))
+            if (auto sh = ShaderLibrary::LoadEngine("shaders/fullscreen.slang"))
                 m_FullscreenVertSpv = sh->GetSpirV();
-            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_composite.frag"))
+            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_composite.slang"))
                 m_CompositeFragSpv = sh->GetSpirV();
             if (m_FullscreenVertSpv.empty() || m_CompositeFragSpv.empty())
             {
-                LH_CORE_ERROR("VolumetricSubsystem: failed to load composite shaders!");
+                LH_LOG(Renderer, error, "VolumetricSubsystem: failed to load composite shaders!");
                 return;
             }
 
@@ -338,7 +339,7 @@ namespace Luth
             layoutCI.pBindings    = bindings;
             vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &m_VizDescLayout);
 
-            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_viz.frag"))
+            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_viz.slang"))
                 m_VizFragSpv = sh->GetSpirV();
             if (!m_VizFragSpv.empty() && !m_FullscreenVertSpv.empty())
             {
@@ -380,11 +381,11 @@ namespace Luth
 
             // Bake pipeline + descriptor — ephemeral, destroyed at end of this block.
             std::vector<u32> bakeSpv;
-            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_noise_bake.comp"))
+            if (auto sh = ShaderLibrary::LoadEngine("shaders/volumetric_noise_bake.slang"))
                 bakeSpv = sh->GetSpirV();
             if (bakeSpv.empty())
             {
-                LH_CORE_ERROR("VolumetricSubsystem: failed to load volumetric_noise_bake.comp!");
+                LH_LOG(Renderer, error, "VolumetricSubsystem: failed to load volumetric_noise_bake.slang!");
                 return;
             }
 
@@ -490,11 +491,11 @@ namespace Luth
             vkCreateSampler(device, &bsCI, nullptr, &m_BlueNoiseSampler);
 
             std::vector<u32> bakeSpv;
-            if (auto sh = ShaderLibrary::LoadEngine("shaders/blue_noise_bake.comp"))
+            if (auto sh = ShaderLibrary::LoadEngine("shaders/blue_noise_bake.slang"))
                 bakeSpv = sh->GetSpirV();
             if (bakeSpv.empty())
             {
-                LH_CORE_ERROR("VolumetricSubsystem: failed to load blue_noise_bake.comp!");
+                LH_LOG(Renderer, error, "VolumetricSubsystem: failed to load blue_noise_bake.slang!");
                 return;
             }
 
@@ -584,6 +585,7 @@ namespace Luth
 
     void VolumetricSubsystem::Shutdown()
     {
+        LH_PROFILE_FUNCTION();
         VkDevice device = VulkanContext::Get().GetDevice();
         m_InjectDensityPipeline.reset();
         m_InjectScatterPipeline.reset();
@@ -617,12 +619,13 @@ namespace Luth
 
     bool VolumetricSubsystem::OnShaderReloaded(const std::string& name, const std::vector<u32>& spv)
     {
+        LH_PROFILE_FUNCTION();
         auto deferComp = [](std::unique_ptr<VKComputePipeline>& p) {
             if (auto* raw = p.release(); raw)
                 VulkanContext::Get().PushDeletion([raw]() { delete raw; });
         };
 
-        if (name == "volumetric_inject_density.comp" && m_InjectDensityDescLayout)
+        if (name == "volumetric_inject_density.slang" && m_InjectDensityDescLayout)
         {
             m_InjectDensitySpv = spv;
             deferComp(m_InjectDensityPipeline);
@@ -635,7 +638,7 @@ namespace Luth
                 std::vector<VkPushConstantRange>{ pc });
             return true;
         }
-        if (name == "volumetric_inject_scatter.comp" && m_InjectScatterDescLayout)
+        if (name == "volumetric_inject_scatter.slang" && m_InjectScatterDescLayout)
         {
             m_InjectScatterSpv = spv;
             deferComp(m_InjectScatterPipeline);
@@ -651,7 +654,7 @@ namespace Luth
                 std::vector<VkPushConstantRange>{ pc });
             return true;
         }
-        if (name == "volumetric_integrate.comp" && m_IntegrateDescLayout)
+        if (name == "volumetric_integrate.slang" && m_IntegrateDescLayout)
         {
             m_IntegrateSpv = spv;
             deferComp(m_IntegratePipeline);
@@ -661,7 +664,7 @@ namespace Luth
                 std::vector<VkPushConstantRange>{ pc });
             return true;
         }
-        if (name == "volumetric_resolve.comp" && m_ResolveDescLayout)
+        if (name == "volumetric_resolve.slang" && m_ResolveDescLayout)
         {
             m_ResolveSpv = spv;
             deferComp(m_ResolvePipeline);
@@ -674,10 +677,10 @@ namespace Luth
                 std::vector<VkPushConstantRange>{ pc });
             return true;
         }
-        if ((name == "volumetric_composite.frag" || name == "fullscreen.vert")
+        if ((name == "volumetric_composite.slang" || name == "fullscreen.slang")
             && m_CompositeDescLayout)
         {
-            if (name == "volumetric_composite.frag") m_CompositeFragSpv = spv;
+            if (name == "volumetric_composite.slang") m_CompositeFragSpv = spv;
             else                                     m_FullscreenVertSpv = spv;
             if (auto* raw = m_CompositePipeline.release(); raw)
                 VulkanContext::Get().PushDeletion([raw]() { delete raw; });
@@ -698,7 +701,7 @@ namespace Luth
                 cfg, m_FullscreenVertSpv, m_CompositeFragSpv, setLayouts);
             return true;
         }
-        if (name == "volumetric_viz.frag" && m_VizDescLayout)
+        if (name == "volumetric_viz.slang" && m_VizDescLayout)
         {
             m_VizFragSpv = spv;
             if (auto* raw = m_VizPipeline.release(); raw)
@@ -726,6 +729,7 @@ namespace Luth
 
     Memory::GPUSubRegion VolumetricSubsystem::UploadFogVolumeSSBO(const GatheredFogVolumes& volumes)
     {
+        LH_PROFILE_FUNCTION();
         Memory::GPUSubRegion region{};
         auto* jobCtx = JobSystem::GetCurrentJobContext();
         if (!jobCtx) return region;
@@ -753,6 +757,7 @@ namespace Luth
 
     void VolumetricSubsystem::WriteInjectDensityView(ViewResources& vr)
     {
+        LH_PROFILE_FUNCTION();
         // Stable across frames: b0 (volDensity storage write), b2 (3D noise sampler).
         // b1 (FogVolume SSBO) rewrites per frame in WriteInjectDensityPerFrame.
         if (m_InjectDensityDescLayout == VK_NULL_HANDLE) return;
@@ -804,6 +809,7 @@ namespace Luth
 
     void VolumetricSubsystem::WriteInjectDensityPerFrame(const Memory::GPUSubRegion& fogVolumeRegion)
     {
+        LH_PROFILE_FUNCTION();
         const u32 frameAbs = static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex());
         const u32 slot     = frameAbs % MAX_FRAMES_IN_FLIGHT;
 
@@ -823,6 +829,7 @@ namespace Luth
 
     void VolumetricSubsystem::WriteInjectScatterView(ViewResources& vr)
     {
+        LH_PROFILE_FUNCTION();
         // Stable across frames: b0 (volDensity sampler3D, read), b1 (volInScatter storage write),
         // b5 (shadow array sampler). SSBOs b2-b4 rewrite per frame in WriteInjectScatterPerFrame.
         // RG transitions volDensity to SHADER_READ_ONLY before this pass runs (it's a Read here).
@@ -892,6 +899,7 @@ namespace Luth
                                                          const Memory::GPUSubRegion& clusterGridRegion,
                                                          const Memory::GPUSubRegion& lightIndexRegion)
     {
+        LH_PROFILE_FUNCTION();
         const u32 frameAbs = static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex());
         const u32 slot     = frameAbs % MAX_FRAMES_IN_FLIGHT;
 
@@ -919,6 +927,7 @@ namespace Luth
 
     void VolumetricSubsystem::WriteIntegrateView(ViewResources& vr)
     {
+        LH_PROFILE_FUNCTION();
         // Both b0 (density sampler) and b1 (in-scatter storage R/W = scratch atlas) are stable.
         // Integrate works in-place over volInScatter every frame.
         if (m_IntegrateDescLayout == VK_NULL_HANDLE) return;
@@ -964,6 +973,7 @@ namespace Luth
 
     void VolumetricSubsystem::WriteResolveView(ViewResources& vr)
     {
+        LH_PROFILE_FUNCTION();
         // Only b0 (scratch sampler) is stable. b1 (prev resolved sampler) + b2 (curr resolved
         // storage) parity-rewrite per frame to ping-pong HistA / HistB.
         if (m_ResolveDescLayout == VK_NULL_HANDLE) return;
@@ -996,6 +1006,7 @@ namespace Luth
 
     void VolumetricSubsystem::WriteResolvePerFrame(ViewResources& vr, u32 frameAbs)
     {
+        LH_PROFILE_FUNCTION();
         if (m_ResolveDescLayout == VK_NULL_HANDLE) return;
         if (!vr.volInScatterHistA || !vr.volInScatterHistB) return;
 
@@ -1036,6 +1047,7 @@ namespace Luth
 
     void VolumetricSubsystem::WriteCompositeView(ViewResources& vr, FrameTargets& targets)
     {
+        LH_PROFILE_FUNCTION();
         // b0 (sceneDepth) + b2 (blueNoise) are stable per-view. b1 (in-scatter sampler) rewrites
         // each frame in WriteCompositePerFrame to follow integrate's ping-pong parity.
         if (m_CompositeDescLayout == VK_NULL_HANDLE) return;
@@ -1089,6 +1101,7 @@ namespace Luth
 
     void VolumetricSubsystem::WriteCompositePerFrame(ViewResources& vr, FrameTargets& /*targets*/, u32 frameAbs)
     {
+        LH_PROFILE_FUNCTION();
         if (m_CompositeDescLayout == VK_NULL_HANDLE) return;
         if (!vr.volInScatterHistA || !vr.volInScatterHistB) return;
 
@@ -1119,6 +1132,7 @@ namespace Luth
                                                               RG::ResourceHandle sceneDepth,
                                                               RG::ResourceHandle resolvedInScatter)
     {
+        LH_PROFILE_FUNCTION();
         if (!m_CompositePipeline) return sceneColor;
 
         struct CompositeData {
@@ -1190,6 +1204,7 @@ namespace Luth
 
     RG::ResourceHandle VolumetricSubsystem::AddIntegratePass(RG::RenderGraph& rg, InjectOutputs injectOut)
     {
+        LH_PROFILE_FUNCTION();
         struct IntegrateData
         {
             RG::ResourceHandle density;
@@ -1252,6 +1267,7 @@ namespace Luth
     RG::ResourceHandle VolumetricSubsystem::AddResolvePass(RG::RenderGraph& rg,
                                                            RG::ResourceHandle scratchInScatter)
     {
+        LH_PROFILE_FUNCTION();
         struct ResolveData
         {
             RG::ResourceHandle scratch;   // reads post-integrate this frame
@@ -1333,6 +1349,7 @@ namespace Luth
 
     RG::ResourceHandle VolumetricSubsystem::AddInjectDensityPass(RG::RenderGraph& rg)
     {
+        LH_PROFILE_FUNCTION();
         struct DensityData
         {
             RG::ResourceHandle density;
@@ -1409,6 +1426,7 @@ namespace Luth
         RG::ResourceHandle density,
         const RG::ResourceHandle (&shadowHandles)[k_ShadowCascadeCount])
     {
+        LH_PROFILE_FUNCTION();
         struct ScatterData
         {
             RG::ResourceHandle density;
@@ -1485,7 +1503,7 @@ namespace Luth
 
                 m_InjectScatterPipeline->Bind(cmd);
                 // Sets 0-1 (global, scatter state) then Sets 3-4 (Material, bindless) — two binds straddle
-                // the empty Set 2. Set 3/4 are statically referenced by geom_table.glsl, so they bind every
+                // the empty Set 2. Set 3/4 are statically referenced by material_bindings_rt.slang, so they bind every
                 // dispatch even when RT fog is off (validation requires bound sets for static references).
                 VkDescriptorSet sets01[2] = {
                     vr->globalDescriptorSet[slot],
@@ -1521,6 +1539,7 @@ namespace Luth
 
     void VolumetricSubsystem::WriteVizView(ViewResources& vr, FrameTargets& targets)
     {
+        LH_PROFILE_FUNCTION();
         // Stable: b0 (sceneDepth sampler), b1 (volDensity sampler). b2 (volInScatter) follows
         // ping-pong parity, rewritten in WriteVizPerFrame.
         if (m_VizDescLayout == VK_NULL_HANDLE) return;
@@ -1566,6 +1585,7 @@ namespace Luth
 
     void VolumetricSubsystem::WriteVizPerFrame(ViewResources& vr, u32 frameAbs)
     {
+        LH_PROFILE_FUNCTION();
         if (m_VizDescLayout == VK_NULL_HANDLE) return;
         if (!vr.volInScatterHistA || !vr.volInScatterHistB) return;
 
@@ -1598,6 +1618,7 @@ namespace Luth
                                                        RG::ResourceHandle sceneDepth,
                                                        u32 mode)
     {
+        LH_PROFILE_FUNCTION();
         if (!m_VizPipeline) return ldrInput;
 
         struct VizData {

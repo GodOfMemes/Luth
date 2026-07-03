@@ -57,6 +57,7 @@ namespace Luth
 
     void RenderPipeline::Initialize(u32 viewportWidth, u32 viewportHeight)
     {
+        LH_PROFILE_FUNCTION();
         if (Renderer::GetBackend()->GetAPI() != RenderBackend::API::Vulkan) return;
 
         m_System.GetSceneTargets().Allocate(viewportWidth, viewportHeight);
@@ -114,7 +115,7 @@ namespace Luth
         // Shader hot-reload callback: pulls fresh SPIR-V into the cached blob
         // and rebuilds pipelines that use it. Fires after ShaderLibrary::Reload
         // has already recompiled and re-reflected the single-stage shader.
-        // Library keys are the shader filename (e.g. "pbr.vert", "gtao_main.comp").
+        // Library keys are the shader filename (e.g. "pbr_vert.slang", "gtao_main.slang").
         ShaderLibrary::SetReloadCallback([this](const std::string& name) {
             // No vkDeviceWaitIdle: old pipelines are deferred-destroyed via
             // VulkanContext::PushDeletion, which drains MAX_FRAMES_IN_FLIGHT
@@ -123,7 +124,7 @@ namespace Luth
             auto vk = std::static_pointer_cast<VulkanShader>(ShaderLibrary::Get(name));
             if (!vk || !vk->IsValid())
             {
-                LH_CORE_ERROR("Shader reload: '{}' invalid — keeping existing pipelines", name);
+                LH_LOG(Renderer, error, "Shader reload: '{}' invalid — keeping existing pipelines", name);
                 return;
             }
             const auto& spv = vk->GetSpirV();
@@ -136,12 +137,15 @@ namespace Luth
                 BoneMatrixBuffer::GetDescriptorSetLayout(),
                 m_Geometry.GetSet5Layout()
             };
-            // Subsystems handle their own shaders + pipeline rebuilds. Order ensures fullscreen.vert
+            // Subsystems handle their own shaders + pipeline rebuilds. Order ensures fullscreen.slang
             // reaches both PostProcess and EditorOverlays (PostProcess returns false for it; EditorOverlays
             // returns true). Debug shaders + IBL precompute remain RP residual.
             // Transparency runs OUTSIDE the || chain (overlays precedent): it must also see
-            // pbr.vert / pbr_skinned.vert (handled = true by Geometry) to invalidate its variants.
+            // pbr_vert.slang / pbr_skinned.slang (handled = true by Geometry) to invalidate its variants.
             const bool transparencyHandled = m_Transparency.OnShaderReloaded(name, spv);
+            // SlangParity gate runs OUTSIDE the || chain: it re-scans restir_gi_initial.slang, which
+            // RestirGi consumes first (short-circuiting the chain), and it rebuilds no pipeline of its own.
+            m_SlangParity.OnShaderReloaded(name, spv);
             const bool handled = m_Lighting.OnShaderReloaded(name, spv, geoLayouts)
                               || m_Geometry.OnShaderReloaded(name, spv, geoLayouts)
                               || m_GTAO.OnShaderReloaded(name, spv)
@@ -150,29 +154,28 @@ namespace Luth
                               || m_Rt.OnShaderReloaded(name, spv)
                               || m_Restir.OnShaderReloaded(name, spv)
                               || m_RestirGi.OnShaderReloaded(name, spv)
-                              || m_SlangParity.OnShaderReloaded(name, spv)
                               || m_PathTrace.OnShaderReloaded(name, spv)
                               || m_Reflections.OnShaderReloaded(name, spv)
                               || m_Denoise->OnShaderReloaded(name, spv)
                               || m_DenoiseGi->OnShaderReloaded(name, spv)
                               || m_DenoiseRefl->OnShaderReloaded(name, spv)
                               || m_DenoiseDiSpec->OnShaderReloaded(name, spv);
-            // PostProcess returns false for fullscreen.vert so EditorOverlays still gets to rebuild
+            // PostProcess returns false for fullscreen.slang so EditorOverlays still gets to rebuild
             // its outline/grid pipelines below.
             const bool ppHandled       = m_PostProcess.OnShaderReloaded(name, spv);
             const bool overlaysHandled = m_EditorOverlays.OnShaderReloaded(name, spv, geoLayouts);
             const bool debugHandled    = m_DebugDraw.OnShaderReloaded(name, spv);
             if (handled || ppHandled || overlaysHandled || debugHandled || transparencyHandled)
             {
-                if      (name == "debugBlit.frag")  m_System.GetFrameDebugger().blitFragSpv  = spv;
-                else if (name == "debugDepth.frag") m_System.GetFrameDebugger().depthFragSpv = spv;
-                LH_CORE_INFO("Pipelines rebuilt after shader reload: {}", name);
+                if      (name == "debugBlit.slang")  m_System.GetFrameDebugger().blitFragSpv  = spv;
+                else if (name == "debugDepth.slang") m_System.GetFrameDebugger().depthFragSpv = spv;
+                LH_LOG(Renderer, info, "Pipelines rebuilt after shader reload: {}", name);
                 return;
             }
 
             // Debug-shader-only path (no pipeline rebuild on RP side; FrameDebuggerContext rebuilds lazily).
-            if      (name == "debugBlit.frag")  m_System.GetFrameDebugger().blitFragSpv  = spv;
-            else if (name == "debugDepth.frag") m_System.GetFrameDebugger().depthFragSpv = spv;
+            if      (name == "debugBlit.slang")  m_System.GetFrameDebugger().blitFragSpv  = spv;
+            else if (name == "debugDepth.slang") m_System.GetFrameDebugger().depthFragSpv = spv;
             // IBL precompute shaders refresh in the library; ReloadSkybox() must run to re-bake.
         });
 
@@ -184,12 +187,13 @@ namespace Luth
         // Capacity covers worst-case current frame (5 cull + 4 shadow cascades +
         // geometry + selection + skybox + 3 bloom + grid + post-process + outline
         // + ImGui ≈ 19 passes) with headroom for future passes (GTAO etc.).
-        m_GPUTimers.Init(64);
+        m_GPUTimers.Init(256);   // headroom over the current ~70-pass RT graph; see ReadResults overflow warn
         RegisterNamedTextures();
     }
 
     void RenderPipeline::Shutdown()
     {
+        LH_PROFILE_FUNCTION();
         auto& s = m_System;
 
         m_ShaderWatcher.Stop();
@@ -247,6 +251,7 @@ namespace Luth
 
     void RenderPipeline::ExecuteMinimal()
     {
+        LH_PROFILE_FUNCTION();
         auto& s = m_System;
         RG::RenderGraph rg(m_System.GetFrameAllocator());
         AddImGuiPass(rg, RG::ResourceHandle{}); // invalid → ImGuiPass skips the optional Read
@@ -256,6 +261,7 @@ namespace Luth
 
     bool RenderPipeline::Execute(const RenderView& view, QueueRecorders recorders)
     {
+        LH_PROFILE_FUNCTION();
         VkCommandBuffer primaryCmd = recorders.gA;
         auto& s = m_System;
         m_CurrentView          = &view;
@@ -272,50 +278,72 @@ namespace Luth
         RG::BufferHandle hObjectBuf   = rg.ImportBuffer(objDesc, (void*)objectRegion.buffer,   RG::ResourceState::Undefined);
         RG::BufferHandle hIndirectBuf = rg.ImportBuffer(indDesc, (void*)indirectRegion.buffer, RG::ResourceState::Undefined);
 
-        // Frustum cull — 5 dispatches per view (camera + 4 cascades). Each view owns a
-        // disjoint range within the indirect region.
-        {
-            const u32 baseRegion = view.viewIndex * k_IndirectRegionsPerView;
-            Frustum camFrustum = CreateFrustumFromCamera(m_Global.GetCachedViewProj());
-            m_Geometry.AddCullPass(rg, hObjectBuf, hIndirectBuf, camFrustum.planes, baseRegion * k_IndirectRegionStride, "FrustumCull.Cam");
+        // Deform — per-frame compute skinning into each mesh's deformed buffer, as the FIRST graphics
+        // pass so raster geometry (gA) reads the current-frame deformation. Decoupled from needTlas:
+        // raster always needs it, even when no RT consumer builds a TLAS this frame.
+        m_Skinning.AddDeformPass(rg);
 
-            // CSM cascade cull — needed when ShadowPass runs (CSM mode OR volumetric on, since
-            // volumetric_inject_scatter samples cascades in both shadow modes).
-            const bool runCsmCascades = m_Global.GetShadowParams().castShadows
-                                     && ((m_Global.GetShadowParams().mode == ShadowingMode::RasterCSM)
-                                         || view.camera.enableVolumetricFog);
-            if (runCsmCascades)
+        // PathTrace replaces the entire real-time pipeline — its megakernel output feeds the post chain via
+        // hdrForPost below. These passes can't be dead-pass-culled in PT (GeometryPass is alive via its
+        // attachments; every RT/denoise/volumetric pass is alive via its external-resource writes — see
+        // CullDeadPasses), so PT must skip REGISTERING them. Only Deform + the lighting-set populate + TLAS +
+        // PathTrace + the post chain run in PT. ClusterBuild/LightAssign stay (cheap, keep lightDescSet valid).
+        // The TLAS-ready term makes ptEnabled imply ptActive below: a cold boot with PT pre-enabled renders
+        // one real-time frame (which builds the TLAS) before PT takes over — never a black frame / invalid
+        // geoOutput for the !ptActive overlays.
+        const bool ptEnabled = m_PathTrace.IsEnabled() && m_CurrentViewResources
+                            && m_Rt.GetTlas() != VK_NULL_HANDLE;
+
+        // Real-time geometry inputs — hoisted so the post chain + overlays can reference them; produced only
+        // on the real-time path (PT traces its own primary rays, so it needs none of these).
+        RG::ResourceHandle shadowHandles[k_ShadowCascadeCount]{};
+        RG::ResourceHandle prepassDepth{};
+        SlimGBufferOutput  slimGB{};
+        if (!ptEnabled)
+        {
+            // Frustum cull — 5 dispatches per view (camera + 4 cascades). Each view owns a
+            // disjoint range within the indirect region.
             {
-                for (u32 i = 0; i < k_ShadowCascadeCount; ++i)
+                const u32 baseRegion = view.viewIndex * k_IndirectRegionsPerView;
+                Frustum camFrustum = CreateFrustumFromCamera(m_Global.GetCachedViewProj());
+                m_Geometry.AddCullPass(rg, hObjectBuf, hIndirectBuf, camFrustum.planes, baseRegion * k_IndirectRegionStride, "FrustumCull.Cam");
+
+                // CSM cascade cull — needed when ShadowPass runs (CSM mode OR volumetric on, since
+                // volumetric_inject_scatter samples cascades in both shadow modes).
+                const bool runCsmCascades = m_Global.GetShadowParams().castShadows
+                                         && ((m_Global.GetShadowParams().mode == ShadowingMode::RasterCSM)
+                                             || view.camera.enableVolumetricFog);
+                if (runCsmCascades)
                 {
-                    Frustum cascadeFrustum = CreateFrustumFromCamera(m_Global.GetCascades().lightSpaceMatrix[i]);
-                    const u32 destOffset = (baseRegion + 1 + i) * k_IndirectRegionStride;
-                    const std::string name = "FrustumCull.C" + std::to_string(i);
-                    m_Geometry.AddCullPass(rg, hObjectBuf, hIndirectBuf, cascadeFrustum.planes, destOffset, name.c_str());
+                    for (u32 i = 0; i < k_ShadowCascadeCount; ++i)
+                    {
+                        Frustum cascadeFrustum = CreateFrustumFromCamera(m_Global.GetCascades().lightSpaceMatrix[i]);
+                        const u32 destOffset = (baseRegion + 1 + i) * k_IndirectRegionStride;
+                        const std::string name = "FrustumCull.C" + std::to_string(i);
+                        m_Geometry.AddCullPass(rg, hObjectBuf, hIndirectBuf, cascadeFrustum.planes, destOffset, name.c_str());
+                    }
                 }
             }
+
+            // Shadow pass renders cascade depth — needed for CSM mode AND for volumetric god-rays
+            // in either shadow mode (volumetric scatter samples shadowMap at Set 1 b5).
+            const bool runCsmShadowPasses = m_Global.GetShadowParams().castShadows
+                                         && ((m_Global.GetShadowParams().mode == ShadowingMode::RasterCSM)
+                                             || view.camera.enableVolumetricFog);
+            if (runCsmShadowPasses)
+            {
+                for (u32 i = 0; i < k_ShadowCascadeCount; ++i)
+                    shadowHandles[i] = m_Lighting.AddShadowPass(rg, hIndirectBuf, i);
+            }
+
+            // Z-prepass produces SceneDepth before forward shading. The render
+            // graph can schedule it in parallel with the shadow cascades.
+            prepassDepth = m_Geometry.AddDepthPrepass(rg, hIndirectBuf);
+
+            // Slim G-buffer — opaque normal/roughness/motion/matID. Reads prepass depth
+            // with EQUAL test; feeds TAA + downstream RT denoise + RT reflections.
+            slimGB = m_Geometry.AddSlimGBufferPass(rg, hIndirectBuf, prepassDepth);
         }
-
-        // Shadow pass renders cascade depth — needed for CSM mode AND for volumetric god-rays
-        // in either shadow mode (volumetric scatter samples shadowMap at Set 1 b5).
-        const bool runCsmShadowPasses = m_Global.GetShadowParams().castShadows
-                                     && ((m_Global.GetShadowParams().mode == ShadowingMode::RasterCSM)
-                                         || view.camera.enableVolumetricFog);
-        RG::ResourceHandle shadowHandles[k_ShadowCascadeCount]{};
-        if (runCsmShadowPasses)
-        {
-            for (u32 i = 0; i < k_ShadowCascadeCount; ++i)
-                shadowHandles[i] = m_Lighting.AddShadowPass(rg, hIndirectBuf, i);
-        }
-
-        // Z-prepass produces SceneDepth before forward shading. The render
-        // graph can schedule it in parallel with the shadow cascades.
-        RG::ResourceHandle prepassDepth = m_Geometry.AddDepthPrepass(rg, hIndirectBuf);
-
-        // Slim G-buffer — opaque normal/roughness/motion/matID. Reads prepass depth
-        // with EQUAL test; feeds TAA + downstream RT denoise + RT reflections.
-        // Live ShadeMode toggle consumes slimGB downstream (in the AddSlimVizPass call below).
-        SlimGBufferOutput slimGB = m_Geometry.AddSlimGBufferPass(rg, hIndirectBuf, prepassDepth);
 
         // Forward+ cluster AABB builder + light-to-cluster assignment. Both async-compute; the
         // assign pass consumes the build pass's AABB + grid handles directly (no re-import — see
@@ -343,7 +371,6 @@ namespace Luth
         // reflections / volumetric RT fog shadows. The RT sun-shadow trace below stays runRtShadows-only.
         const bool needTlas = runRtShadows || m_Restir.IsEnabled() || m_RestirGi.IsEnabled()
                             || m_PathTrace.IsEnabled() || m_Reflections.IsEnabled()
-                            || m_SlangParity.IsEnabled()
                             || (volumetricEnabled && m_Volumetric.IsRtShadowsEnabled());
         if (needTlas)
             m_Rt.AddTlasBuildPass(rg);
@@ -354,7 +381,7 @@ namespace Luth
         VolumetricSubsystem::InjectOutputs injectOut{};
         RG::ResourceHandle volInScatterHandle{};  // post-integrate scratch (viz mode 1 samples this)
         RG::ResourceHandle volResolvedHandle{};   // post-resolve (composite + viz sample)
-        if (volumetricEnabled && m_CurrentViewResources)
+        if (volumetricEnabled && m_CurrentViewResources && !ptEnabled)
         {
             const u32 frameAbs = static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex());
             Memory::GPUSubRegion fogVolumeRegion{};
@@ -383,7 +410,7 @@ namespace Luth
         // ReSTIR chain. When active, its HDR output (ptColor) feeds the post chain in place of the raster
         // sceneColor; every raster/RT-GI pass below produces handles nothing consumes, so the RG dead-pass
         // culls them. AsyncCompute, after the TLAS build (which the needTlas gate above keeps alive).
-        const bool usePathTrace = m_PathTrace.IsEnabled() && m_CurrentViewResources;
+        const bool usePathTrace = ptEnabled;   // m_PathTrace.IsEnabled() && m_CurrentViewResources
         RG::ResourceHandle ptColorHandle{};
         if (usePathTrace)
             ptColorHandle = m_PathTrace.AddPasses(rg);
@@ -396,7 +423,7 @@ namespace Luth
         // Threads prepassDepth + slimGB.normal so RG transitions them from DSA/COLOR_ATTACHMENT to
         // SHADER_READ_ONLY_OPTIMAL ahead of the raygen sample (descriptor declared that layout).
         RG::ResourceHandle rtShadowMaskHandle{};
-        if (runRtShadows)
+        if (runRtShadows && !ptEnabled)
             rtShadowMaskHandle = m_Rt.AddRtSunShadowsPass(rg, prepassDepth, slimGB.normal);
 
         // ReSTIR DI — shadowed direct lighting for point lights via per-pixel reservoir RIS + one
@@ -404,7 +431,9 @@ namespace Luth
         // slim normal, traces the same TLAS the sun-shadow pass uses. Returns an invalid handle when
         // disabled or before the TLAS exists — GeometryPass then skips the Read and pbr.frag's point
         // loop runs instead (the restirParams.x flag gates the consumption).
-        RtRestirSubsystem::Outputs restirOut = m_Restir.AddPasses(rg, prepassDepth, slimGB.normal, slimGB.motion, slimGB.roughness);
+        RtRestirSubsystem::Outputs restirOut = ptEnabled
+            ? RtRestirSubsystem::Outputs{}
+            : m_Restir.AddPasses(rg, prepassDepth, slimGB.normal, slimGB.motion, slimGB.roughness);
         RG::ResourceHandle restirDIHandle = restirOut.di;
 
         // Denoise the demodulated DI (SVGF; swappable to NRD/RELAX). Transparent filter — consumes the
@@ -417,19 +446,29 @@ namespace Luth
         // Denoise the demodulated ReSTIR-DI specular (#154; 4th SVGF, DenoiserChannel::DiSpecular). Surface-
         // motion reproject (direct point-light specular is surface-attached, not a reflection's virtual
         // image). svgfDiSpecDenoised feeds pbr.frag Set 3 b8; restirParams.z gates + scales the composite.
-        RG::ResourceHandle denoisedDiSpecHandle = m_DenoiseDiSpec->AddPasses(rg, DenoiseInputs{
-            restirOut.spec, prepassDepth, slimGB.normal, slimGB.motion,
-            slimGB.roughness, slimGB.materialID, {}, {} });
+        // Gated on the specular toggle: with it off pbr.frag zeroes restirParams.z and never samples b8, so
+        // the whole denoise chain would otherwise run dead (~0.5 ms). Invalid handle → GeometryPass skips b8.
+        RG::ResourceHandle denoisedDiSpecHandle{};
+        if (m_System.GetRestirSettings().specular)
+            denoisedDiSpecHandle = m_DenoiseDiSpec->AddPasses(rg, DenoiseInputs{
+                restirOut.spec, prepassDepth, slimGB.normal, slimGB.motion,
+                slimGB.roughness, slimGB.materialID, {}, {} });
+        // Half-res DI: AddPasses returns the half svgfDiHalf / svgfDiSpecHalf handles — bilaterally upscale
+        // each into the full svgfDenoised / svgfDiSpecDenoised that GeometryPass / pbr Set 3 b5/b8 consume.
+        if (m_System.GetRestirSettings().halfResolution)
+        {
+            if (denoisedDIHandle.IsValid())
+                denoisedDIHandle = m_Restir.AddUpscalePass(rg, denoisedDIHandle, prepassDepth, slimGB.normal, false);
+            if (denoisedDiSpecHandle.IsValid())
+                denoisedDiSpecHandle = m_Restir.AddUpscalePass(rg, denoisedDiSpecHandle, prepassDepth, slimGB.normal, true);
+        }
 
         // ReSTIR GI — 1-bounce indirect diffuse via per-pixel reservoir resampling. Returns the
         // demodulated GI image; restirParams.y gates the remodulation in pbr.frag. Invalid when
         // disabled / no TLAS.
-        RG::ResourceHandle giDIHandle = m_RestirGi.AddPasses(rg, prepassDepth, slimGB.normal, slimGB.motion);
-
-        // Slang Phase-0 spike A/B (#156, default-OFF): dispatches the GLSL + Slang variants of the
-        // hot-path shader + a diff reduce, after the TLAS build (needTlas gate includes it). Self-
-        // contained engine-owned outputs (SetHasSideEffect keeps it past the culler).
-        m_SlangParity.AddPass(rg);
+        RG::ResourceHandle giDIHandle = ptEnabled
+            ? RG::ResourceHandle{}
+            : m_RestirGi.AddPasses(rg, prepassDepth, slimGB.normal, slimGB.motion);
 
         // Denoise the demodulated GI (second SVGF instance, DenoiserChannel::Gi). Same transparent-
         // filter contract as DI: consumes the GI handle, returns the denoised handle GeometryPass reads
@@ -437,6 +476,10 @@ namespace Luth
         RG::ResourceHandle denoisedGiHandle = m_DenoiseGi->AddPasses(rg, DenoiseInputs{
             giDIHandle, prepassDepth, slimGB.normal, slimGB.motion,
             slimGB.roughness, slimGB.materialID, {}, {} });
+        // Half-res GI: AddPasses returns the half-res svgfGiHalf handle — bilaterally upscale it into the
+        // full-res svgfGiDenoised that GeometryPass / pbr Set 3 b6 consume. Full-res mode is a no-op.
+        if (denoisedGiHandle.IsValid() && m_System.GetRestirGiSettings().halfResolution)
+            denoisedGiHandle = m_RestirGi.AddUpscalePass(rg, denoisedGiHandle, prepassDepth, slimGB.normal);
 
         // RT specular reflections (rt-renderer D.1) — one GGX-VNDF ray/pixel from the slim G-buffer, then
         // a dedicated specular SVGF (3rd instance, DenoiserChannel::Reflections). The DenoiseInputs.motion
@@ -444,67 +487,86 @@ namespace Luth
         // internally via hit-distance virtual reprojection; hitDist rides reflRadiance's alpha).
         // denoisedReflHandle feeds GeometryPass (the pbr.frag Set 3 b7 composite lands in S4). AsyncCompute,
         // after the TLAS build (needTlas gate includes Reflections).
-        RG::ResourceHandle reflHandle = m_Reflections.AddPasses(rg, prepassDepth, slimGB.normal, slimGB.roughness);
+        RG::ResourceHandle reflHandle = ptEnabled
+            ? RG::ResourceHandle{}
+            : m_Reflections.AddPasses(rg, prepassDepth, slimGB.normal, slimGB.roughness);
         RG::ResourceHandle denoisedReflHandle = m_DenoiseRefl->AddPasses(rg, DenoiseInputs{
             reflHandle, prepassDepth, slimGB.normal, slimGB.roughness,
             slimGB.roughness, slimGB.materialID, {}, {} });
+        // Half-res reflections: AddPasses returns the half svgfSpecHalf handle — bilaterally upscale it into
+        // the full-res svgfSpecDenoised that pbr.frag Set 3 b7 consumes. Full-res mode is a no-op.
+        if (denoisedReflHandle.IsValid() && m_System.GetReflectionsSettings().halfResolution)
+            denoisedReflHandle = m_Reflections.AddUpscalePass(rg, denoisedReflHandle, prepassDepth, slimGB.normal);
 
-        // GTAO chain runs every frame so the Set 0 binding-4 sampler sees
-        // a valid SHADER_READ_ONLY layout (the `gtao.enabled` flag in the
-        // UBO is what disables the modulation inside pbr.frag). ~0.3-1 ms
-        // on a mid-range GPU at 1080p; can be gated later if a cheaper
-        // bypass path is worth the complexity.
-        RG::ResourceHandle gtaoLinearDepth = m_GTAO.AddPrefilterPass(rg, prepassDepth);
-        RG::ResourceHandle gtaoRawAO       = m_GTAO.AddMainPass(rg, gtaoLinearDepth);
-        RG::ResourceHandle gtaoFinalAO     = m_GTAO.AddDenoisePass(rg, gtaoRawAO, gtaoLinearDepth);
-
-        auto geoOutput                 = m_Geometry.AddGeometryPass(rg, shadowHandles, hIndirectBuf, prepassDepth, gtaoFinalAO, rtShadowMaskHandle, denoisedDIHandle, denoisedGiHandle, denoisedReflHandle, denoisedDiSpecHandle);
-        SelectionMaskOutput maskOutput = view.drawSelectionOutline
-                                         ? m_EditorOverlays.AddSelectionMaskPass(rg)
-                                         : SelectionMaskOutput{};
-        RG::ResourceHandle skyboxColor = m_Lighting.AddSkyboxPass(rg, geoOutput.color, geoOutput.depth);
-        // Volumetric composite — blends fog into sceneColor (alpha-blend equation) BEFORE bloom so
-        // bright in-scattered fog can bloom and the grid pass overlays unfogged grid lines.
-        // Skipped when the editor toggle is off — downstream uses skyboxColor unchanged.
-        RG::ResourceHandle fogColor    = (volumetricEnabled && m_CurrentViewResources)
-                                         ? m_Volumetric.AddCompositePass(rg, skyboxColor, prepassDepth, volResolvedHandle)
-                                         : skyboxColor;
-        // Transparent tier — after the fog composite so glass blends over the fogged background
-        // (its own fog is per-fragment at the glass depth, sampled from the resolved atlas inside
-        // pbr_transparent.frag). Skipped in PT mode: the raster chain is dead-pass-culled there.
-        RG::ResourceHandle transparentColor = fogColor;
-        if (!ptActive && m_CurrentViewResources)
+        // GTAO chain — skipped in PT (pbr.frag doesn't run) and when disabled. When skipped, gtaoFinal keeps
+        // its VKTexture-ctor SHADER_READ_ONLY layout, so pbr's Set 0 b4 sampler binding stays valid; the
+        // gtao.enabled UBO flag zeroes the modulation, so the stale content is ignored. ~0.3-1 ms at 1080p.
+        RG::ResourceHandle gtaoFinalAO{};
+        if (!ptEnabled && m_System.GetPostProcessSettings().gtao.enabled)
         {
-            const u32 frameAbsT = static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex());
-            m_Transparency.WritePerFrame(*m_CurrentViewResources, frameAbsT);
-            transparentColor = m_Transparency.AddPasses(rg, fogColor, geoOutput.entityID, geoOutput.depth,
-                volumetricEnabled ? volResolvedHandle : RG::ResourceHandle{}, hIndirectBuf);
+            RG::ResourceHandle gtaoLinearDepth = m_GTAO.AddPrefilterPass(rg, prepassDepth);
+            RG::ResourceHandle gtaoRawAO       = m_GTAO.AddMainPass(rg, gtaoLinearDepth);
+            gtaoFinalAO                        = m_GTAO.AddDenoisePass(rg, gtaoRawAO, gtaoLinearDepth);
         }
-        // TAA Resolve — Karis14 YCoCg-clip. Runs AFTER volumetric composite, BEFORE bloom + grid
-        // (HDR-domain TAA per Karis recipe). Bloom + grid + composite then consume the resolved
-        // color. Per-frame WriteTaaResolvePerFrame rebinds the parity-picked history-prev sampler;
-        // the resolve pass writes to the parity-picked history-curr (bound as color attachment).
-        const PostProcessSettings& pps = m_System.GetPostProcessSettings();
-        // PT does its own progressive AA via accumulation, so TAA is off in PT mode (both ping-pong on
-        // frameAbs parity — running them together would cross-contaminate the history).
-        const bool taaEnabled = pps.taaEnabled && m_CurrentViewResources && !ptActive;
-        if (m_CurrentViewResources)
+
+        // Real-time lit chain (geometry → skybox → fog composite → transparent → TAA). Skipped in PT — the
+        // megakernel output drives the post chain via hdrForPost below. geoOutput/maskOutput/taaColor hoisted
+        // for the overlays + post chain; default-invalid in PT (the overlays that read them are !ptActive too).
+        GeometryOutput      geoOutput{};
+        SelectionMaskOutput maskOutput{};
+        RG::ResourceHandle  taaColor{};
+        if (!ptEnabled)
         {
-            const u32 frameAbs = static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex());
+            geoOutput  = m_Geometry.AddGeometryPass(rg, shadowHandles, hIndirectBuf, prepassDepth, gtaoFinalAO, rtShadowMaskHandle, denoisedDIHandle, denoisedGiHandle, denoisedReflHandle, denoisedDiSpecHandle);
+            maskOutput = view.drawSelectionOutline
+                         ? m_EditorOverlays.AddSelectionMaskPass(rg)
+                         : SelectionMaskOutput{};
+            RG::ResourceHandle skyboxColor = m_Lighting.AddSkyboxPass(rg, geoOutput.color, geoOutput.depth);
+            // Volumetric composite — blends fog into sceneColor (alpha-blend) BEFORE bloom so bright
+            // in-scattered fog can bloom + the grid overlays unfogged lines. Off → uses skyboxColor unchanged.
+            RG::ResourceHandle fogColor = (volumetricEnabled && m_CurrentViewResources)
+                                          ? m_Volumetric.AddCompositePass(rg, skyboxColor, prepassDepth, volResolvedHandle)
+                                          : skyboxColor;
+            // Transparent tier — after the fog composite so glass blends over the fogged background (its own
+            // fog is per-fragment at the glass depth, sampled from the resolved atlas inside pbr_transparent.frag).
+            RG::ResourceHandle transparentColor = fogColor;
+            if (m_CurrentViewResources)
+            {
+                const u32 frameAbsT = static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex());
+                m_Transparency.WritePerFrame(*m_CurrentViewResources, frameAbsT);
+                transparentColor = m_Transparency.AddPasses(rg, fogColor, geoOutput.entityID, geoOutput.depth,
+                    volumetricEnabled ? volResolvedHandle : RG::ResourceHandle{}, hIndirectBuf);
+            }
+            // TAA Resolve — Karis14 YCoCg-clip, HDR-domain, after the fog composite + before bloom/grid.
+            // WriteTaaResolvePerFrame rebinds the parity-picked history-prev; the resolve writes history-curr.
+            const PostProcessSettings& pps = m_System.GetPostProcessSettings();
+            const bool taaEnabled = pps.taaEnabled && m_CurrentViewResources;
             if (taaEnabled)
-                m_PostProcess.WriteTaaResolvePerFrame(*m_CurrentViewResources, frameAbs);
-            // Per-frame rebind of bloom-extract + composite binding 0 so downstream consumes the actual
-            // HDR source: the PT display image when PT is active, else the TAA chain output (taaHistoryCurr)
-            // when TAA is on, else SceneColor. Without this the bindings statically reference SceneColor.
-            m_PostProcess.UpdateBloomCompositeInput(*m_CurrentViewResources, *view.targets, frameAbs);
+                m_PostProcess.WriteTaaResolvePerFrame(*m_CurrentViewResources,
+                    static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex()));
+            taaColor = taaEnabled
+                       ? m_PostProcess.AddTaaResolvePass(rg, transparentColor, slimGB.motion, prepassDepth)
+                       : transparentColor;
         }
-        RG::ResourceHandle taaColor    = taaEnabled
-                                         ? m_PostProcess.AddTaaResolvePass(rg, transparentColor, slimGB.motion, prepassDepth)
-                                         : transparentColor;
+        // Bloom/composite source rebind runs in BOTH paths: PT → the ptColor display image; else the TAA
+        // chain output (taaHistoryCurr) when TAA is on, else SceneColor. Without it the bindings statically
+        // reference SceneColor.
+        if (m_CurrentViewResources)
+            m_PostProcess.UpdateBloomCompositeInput(*m_CurrentViewResources, *view.targets,
+                static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex()));
         // HDR source for the post chain: the PT megakernel output replaces the raster sceneColor when PT
         // is active (the raster chain above is then dead-pass-culled). Grid is editor-overlay-only → off in PT.
         RG::ResourceHandle hdrForPost  = ptActive ? ptColorHandle : taaColor;
-        RG::ResourceHandle bloomResult = m_PostProcess.AddBloomPasses(rg, hdrForPost); // bloom reads PRE-grid color so grid lines don't bloom
+        // Resolve the active shade mode once (PT forces Lit). Hoisted here so the bloom gate and the
+        // slim-viz dispatch below share it.
+        const ShadeMode shadeMode = ptActive ? ShadeMode::Lit : m_System.GetShadeMode();
+        // Bloom — skipped at strength 0 (composite adds bloom x strength; AddCompositePass guards an
+        // invalid handle) and for every non-Lit mode: bloom is a radiance effect that smears over data
+        // views and clutters radiance debug. Reads PRE-grid color so grid lines don't bloom.
+        RG::ResourceHandle bloomResult = (m_System.GetPostProcessSettings().bloomStrength > 0.0f
+                                          && shadeMode == ShadeMode::Lit)
+                                         ? m_PostProcess.AddBloomPasses(rg, hdrForPost)
+                                         : RG::ResourceHandle{};
         RG::ResourceHandle gridColor   = (view.drawGrid && !ptActive)
                                          ? m_EditorOverlays.AddGridPass(rg, hdrForPost, geoOutput.depth)
                                          : hdrForPost;
@@ -515,7 +577,7 @@ namespace Luth
         // the frame-debugger panel exposes a slider for per-capture tuning; live viz uses a
         // sensible default matching the existing thumbnail UX. PT mode forces Lit (the debug-viz
         // blits read the culled G-buffer / cluster / reservoir state — meaningless over the PT image).
-        const ShadeMode shadeMode = ptActive ? ShadeMode::Lit : m_System.GetShadeMode();
+        // shadeMode was resolved above (hoisted for the bloom gate).
         if (shadeMode >= ShadeMode::SlimNormal && shadeMode <= ShadeMode::SlimMaterialID)
         {
             const u32 slimMode = static_cast<u32>(shadeMode) - static_cast<u32>(ShadeMode::SlimNormal);
@@ -552,14 +614,18 @@ namespace Luth
         // Capture render graph snapshot for Frame Debugger panel
         m_GraphSnapshot = CaptureSnapshot(rg);
 
-        // Read GPU timing from completed frames and fill snapshot
+        // Read GPU timing + pipeline stats from completed frames and fill snapshot. ReadStats must run
+        // BEFORE ReadResults — they share the frame counter that ReadResults advances.
         std::vector<float> gpuTimes;
+        std::vector<RG::GpuPipelineStats> gpuStats;
         u32 nonCulledCount = 0;
         for (auto& p : m_GraphSnapshot.passes)
             if (!p.culled) nonCulledCount++;
 
+        m_GPUTimers.ReadStats(nonCulledCount, gpuStats);
         m_GPUTimers.ReadResults(nonCulledCount, gpuTimes);
         float totalMs = 0.0f;
+        RG::GpuPipelineStats total{};
         u32 timerIdx = 0;
         for (auto& p : m_GraphSnapshot.passes)
         {
@@ -569,9 +635,21 @@ namespace Luth
                 p.gpuTimeMs = gpuTimes[timerIdx];
                 if (gpuTimes[timerIdx] > 0.0f) totalMs += gpuTimes[timerIdx];
             }
+            if (timerIdx < (u32)gpuStats.size() && gpuStats[timerIdx].valid)
+            {
+                p.stats = gpuStats[timerIdx];
+                total.inputVertices   += p.stats.inputVertices;
+                total.inputPrimitives += p.stats.inputPrimitives;
+                total.vsInvocations   += p.stats.vsInvocations;
+                total.clipInvocations += p.stats.clipInvocations;
+                total.clipPrimitives  += p.stats.clipPrimitives;
+                total.fsInvocations   += p.stats.fsInvocations;
+                total.valid = true;
+            }
             timerIdx++;
         }
         m_GraphSnapshot.totalGpuTimeMs = totalMs;
+        m_GraphSnapshot.totalStats = total;
 
         // Wire the archive sink for this capture. The sink copies each
         // tracked RT after the pass that writes it. Gate on the per-view
@@ -735,6 +813,7 @@ namespace Luth
 
     RG::RenderGraphSnapshot RenderPipeline::CaptureSnapshot(const RG::RenderGraph& rg)
     {
+        LH_PROFILE_FUNCTION();
         auto& s = m_System;
 
         RG::RenderGraphSnapshot snapshot;
@@ -798,6 +877,10 @@ namespace Luth
             snapshot.passes.push_back(std::move(ps));
         }
 
+        // Barrier inspector — fill from the solved graph when capture is on (off by default).
+        if (RG::RenderGraph::BarrierCapture())
+            rg.CaptureBarrierRecords(snapshot);
+
         // Compute geometry stats from the current DrawList (built before pass dispatch)
         u32 totalDraws = (u32)(m_System.GetDrawList().opaque.size() + m_System.GetDrawList().cutout.size() + m_System.GetDrawList().transparent.size());
         u32 totalIndices = 0;
@@ -845,22 +928,6 @@ namespace Luth
                 ps.shaderName = "skybox";
                 ps.drawCalls = 1; ps.indices = 0;
             }
-            else if (ps.name == "BloomExtract")
-            {
-                ps.depthTest = false; ps.depthWrite = false;
-                ps.blendEnabled = false;
-                ps.cullMode = VK_CULL_MODE_NONE;
-                ps.shaderName = "bloomExtract";
-                ps.drawCalls = 1; ps.indices = 0;
-            }
-            else if (ps.name == "BloomBlurH" || ps.name == "BloomBlurV")
-            {
-                ps.depthTest = false; ps.depthWrite = false;
-                ps.blendEnabled = false;
-                ps.cullMode = VK_CULL_MODE_NONE;
-                ps.shaderName = "bloomBlur";
-                ps.drawCalls = 1; ps.indices = 0;
-            }
             else if (ps.name == "PostProcess")
             {
                 ps.depthTest = false; ps.depthWrite = false;
@@ -891,8 +958,8 @@ namespace Luth
         if (m_System.GetSceneTargets().GetEntityIDBuffer())m_NamedTextures["EntityID"]     = m_System.GetSceneTargets().GetEntityIDBuffer();
         // Scene-view bloom textures — Frame Debugger is scene-view-only.
         if (auto it = m_ViewResources.find(&m_System.GetSceneTargets()); it != m_ViewResources.end()) {
-            if (it->second.bloomA) m_NamedTextures["BloomA"] = it->second.bloomA;
-            if (it->second.bloomB) m_NamedTextures["BloomB"] = it->second.bloomB;
+            for (u32 i = 0; i < ViewResources::kBloomMipCount; ++i)
+                if (it->second.bloomMip[i]) m_NamedTextures["BloomMip" + std::to_string(i)] = it->second.bloomMip[i];
             if (it->second.volDensity)          m_NamedTextures["VolDensity"]           = it->second.volDensity;
             if (it->second.volInScatter)        m_NamedTextures["VolInScatter"]         = it->second.volInScatter;
             if (it->second.volInScatterHistA)   m_NamedTextures["VolInScatterHistA"]   = it->second.volInScatterHistA;

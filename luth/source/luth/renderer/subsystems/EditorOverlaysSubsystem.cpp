@@ -20,6 +20,14 @@
 namespace Luth
 {
     namespace {
+        // GPU push block for the selection-mask pipelines — ObjectPushConstants plus the per-view TAA
+        // jitter the vertex shader subtracts to draw the mask un-jittered. Pass-local so the engine-wide
+        // ObjectPushConstants contract stays frozen. 80 + 8 = 88 B, within the 128 B push floor.
+        struct MaskPushConstants {
+            ObjectPushConstants base;
+            Vec2                jitter;
+        };
+
         BufferLayout MakeSkinnedVertexLayout() {
             return BufferLayout{
                 { ShaderDataType::Float3, "a_Position"    },
@@ -43,24 +51,25 @@ namespace Luth
 
     void EditorOverlaysSubsystem::Init(RenderPipeline& pipeline)
     {
+        LH_PROFILE_FUNCTION();
         m_Pipeline = &pipeline;
 
         auto loadSpv = [](const char* relPath) -> std::vector<u32> {
             auto sh = ShaderLibrary::LoadEngine(relPath);
             return sh ? sh->GetSpirV() : std::vector<u32>{};
         };
-        m_SelectionMaskVertSpv        = loadSpv("shaders/selectionMask.vert");
-        m_SelectionMaskFragSpv        = loadSpv("shaders/selectionMask.frag");
-        m_SelectionMaskSkinnedVertSpv = loadSpv("shaders/selectionMask_skinned.vert");
-        m_OutlineFragSpv              = loadSpv("shaders/outline.frag");
-        m_GridFragSpv                 = loadSpv("shaders/grid.frag");
-        m_FullscreenVertSpv           = loadSpv("shaders/fullscreen.vert");
+        m_SelectionMaskVertSpv        = loadSpv("shaders/selectionMask_vert.slang");
+        m_SelectionMaskFragSpv        = loadSpv("shaders/selectionMask.slang");
+        m_SelectionMaskSkinnedVertSpv = loadSpv("shaders/selectionMask_skinned.slang");
+        m_OutlineFragSpv              = loadSpv("shaders/outline.slang");
+        m_GridFragSpv                 = loadSpv("shaders/grid.slang");
+        m_FullscreenVertSpv           = loadSpv("shaders/fullscreen.slang");
 
         if (m_SelectionMaskVertSpv.empty() || m_SelectionMaskFragSpv.empty() ||
             m_SelectionMaskSkinnedVertSpv.empty() ||
             m_OutlineFragSpv.empty() || m_GridFragSpv.empty() || m_FullscreenVertSpv.empty())
         {
-            LH_CORE_ERROR("EditorOverlaysSubsystem: shader SPIR-V empty after asset load!");
+            LH_LOG(Renderer, error, "EditorOverlaysSubsystem: shader SPIR-V empty after asset load!");
             return;
         }
 
@@ -69,6 +78,7 @@ namespace Luth
 
     void EditorOverlaysSubsystem::CreateLayouts()
     {
+        LH_PROFILE_FUNCTION();
         VkDevice device = VulkanContext::Get().GetDevice();
 
         // Outline: 3 combined image samplers (mask, selection depth, scene depth).
@@ -139,6 +149,7 @@ namespace Luth
 
     void EditorOverlaysSubsystem::BuildPipelines(const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         BuildSelectionPipelines(geoLayouts);
         BuildOutlinePipeline();
         BuildGridPipeline();
@@ -146,6 +157,7 @@ namespace Luth
 
     void EditorOverlaysSubsystem::BuildSelectionPipelines(const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         // Selection mask uses Sets 0-4 (no Set 5 / no GPUObject SSBO — uses ObjectPushConstants).
         std::vector<VkDescriptorSetLayout> layouts(geoLayouts.begin(),
                                                    geoLayouts.begin() + std::min<size_t>(5, geoLayouts.size()));
@@ -153,7 +165,7 @@ namespace Luth
         VkPushConstantRange pcRange{};
         pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         pcRange.offset = 0;
-        pcRange.size = sizeof(ObjectPushConstants);
+        pcRange.size = sizeof(MaskPushConstants);
 
         auto [posBindings, posAttribs] = MakePositionOnlyWithFullStride();
 
@@ -164,7 +176,7 @@ namespace Luth
             cfg.depthFormat  = VK_FORMAT_D32_SFLOAT;
             cfg.depthTest    = true; cfg.depthWrite = true;
             cfg.blendEnabled = false;
-            cfg.cullMode     = VK_CULL_MODE_BACK_BIT;
+            cfg.cullMode     = VK_CULL_MODE_NONE;   // selection outline must cover back-facing silhouettes
             cfg.frontFace    = VK_FRONT_FACE_COUNTER_CLOCKWISE;
             cfg.bindingDescriptions   = posBindings;
             cfg.attributeDescriptions = posAttribs;
@@ -184,7 +196,7 @@ namespace Luth
             cfg.depthFormat  = VK_FORMAT_D32_SFLOAT;
             cfg.depthTest    = true; cfg.depthWrite = true;
             cfg.blendEnabled = false;
-            cfg.cullMode     = VK_CULL_MODE_BACK_BIT;
+            cfg.cullMode     = VK_CULL_MODE_NONE;   // selection outline must cover back-facing silhouettes
             cfg.frontFace    = VK_FRONT_FACE_COUNTER_CLOCKWISE;
             cfg.bindingDescriptions   = skinnedBindings;
             cfg.attributeDescriptions = skinnedAttribs;
@@ -196,6 +208,7 @@ namespace Luth
 
     void EditorOverlaysSubsystem::BuildOutlinePipeline()
     {
+        LH_PROFILE_FUNCTION();
         if (m_FullscreenVertSpv.empty() || m_OutlineFragSpv.empty() || m_OutlineDescSetLayout == VK_NULL_HANDLE) return;
 
         std::vector<VkDescriptorSetLayout> layouts = { m_OutlineDescSetLayout };
@@ -218,6 +231,7 @@ namespace Luth
 
     void EditorOverlaysSubsystem::BuildGridPipeline()
     {
+        LH_PROFILE_FUNCTION();
         if (m_FullscreenVertSpv.empty() || m_GridFragSpv.empty() || m_GridDescSetLayout == VK_NULL_HANDLE) return;
 
         std::vector<VkDescriptorSetLayout> layouts = { m_GridDescSetLayout };
@@ -225,7 +239,7 @@ namespace Luth
         VkPushConstantRange pcRange{};
         pcRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         pcRange.offset = 0;
-        pcRange.size = sizeof(float) * 16;
+        pcRange.size = sizeof(float) * 18;   // +vec2 un-jitter
 
         PipelineConfig cfg;
         cfg.colorFormats = { VK_FORMAT_R16G16B16A16_SFLOAT };
@@ -240,6 +254,7 @@ namespace Luth
 
     void EditorOverlaysSubsystem::Shutdown()
     {
+        LH_PROFILE_FUNCTION();
         VkDevice device = VulkanContext::Get().GetDevice();
         m_GridPipeline.reset();
         m_OutlinePipeline.reset();
@@ -254,27 +269,28 @@ namespace Luth
     bool EditorOverlaysSubsystem::OnShaderReloaded(const std::string& name, const std::vector<u32>& spv,
                                                     const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         auto deferGfx = [](std::unique_ptr<VKPipeline>& p) {
             if (auto* raw = p.release(); raw)
                 VulkanContext::Get().PushDeletion([raw]() { delete raw; });
         };
 
-        if      (name == "selectionMask.vert")         m_SelectionMaskVertSpv        = spv;
-        else if (name == "selectionMask.frag")         m_SelectionMaskFragSpv        = spv;
-        else if (name == "selectionMask_skinned.vert") m_SelectionMaskSkinnedVertSpv = spv;
-        else if (name == "outline.frag")               m_OutlineFragSpv              = spv;
-        else if (name == "grid.frag")                  m_GridFragSpv                 = spv;
-        else if (name == "fullscreen.vert")            m_FullscreenVertSpv           = spv;
+        if      (name == "selectionMask_vert.slang")         m_SelectionMaskVertSpv        = spv;
+        else if (name == "selectionMask.slang")         m_SelectionMaskFragSpv        = spv;
+        else if (name == "selectionMask_skinned.slang") m_SelectionMaskSkinnedVertSpv = spv;
+        else if (name == "outline.slang")               m_OutlineFragSpv              = spv;
+        else if (name == "grid.slang")                  m_GridFragSpv                 = spv;
+        else if (name == "fullscreen.slang")            m_FullscreenVertSpv           = spv;
         else return false;
 
-        if (name == "outline.frag" || name == "grid.frag" || name == "fullscreen.vert")
+        if (name == "outline.slang" || name == "grid.slang" || name == "fullscreen.slang")
         {
             deferGfx(m_OutlinePipeline);
             deferGfx(m_GridPipeline);
             BuildOutlinePipeline();
             BuildGridPipeline();
         }
-        if (name == "selectionMask.vert" || name == "selectionMask.frag" || name == "selectionMask_skinned.vert")
+        if (name == "selectionMask_vert.slang" || name == "selectionMask.slang" || name == "selectionMask_skinned.slang")
         {
             deferGfx(m_SelectionMaskPipeline);
             deferGfx(m_SelectionMaskSkinnedPipeline);
@@ -285,6 +301,7 @@ namespace Luth
 
     void EditorOverlaysSubsystem::WriteOutlineView(ViewResources& vr, FrameTargets& targets)
     {
+        LH_PROFILE_FUNCTION();
         if (vr.outlineDescSet == VK_NULL_HANDLE || m_OutlineSampler == VK_NULL_HANDLE) return;
 
         VkDevice device = VulkanContext::Get().GetDevice();
@@ -327,6 +344,7 @@ namespace Luth
 
     void EditorOverlaysSubsystem::WriteGridView(ViewResources& vr, FrameTargets& targets)
     {
+        LH_PROFILE_FUNCTION();
         if (vr.gridDescSet[0] == VK_NULL_HANDLE || m_GridDepthSampler == VK_NULL_HANDLE) return;
 
         VkDevice device = VulkanContext::Get().GetDevice();
@@ -355,6 +373,7 @@ namespace Luth
 
     void EditorOverlaysSubsystem::CollectSelectedHandles(const std::vector<Entity>& selected, std::unordered_set<entt::entity>& outHandles) const
     {
+        LH_PROFILE_FUNCTION();
         for (const auto& entity : selected)
         {
             if (!entity || !entity.IsValid()) continue;
@@ -370,6 +389,7 @@ namespace Luth
 
     SelectionMaskOutput EditorOverlaysSubsystem::AddSelectionMaskPass(RG::RenderGraph& rg)
     {
+        LH_PROFILE_FUNCTION();
         struct SelectionMaskPassData {
             RG::ResourceHandle maskTex;
             RG::ResourceHandle depthTex;
@@ -422,7 +442,7 @@ namespace Luth
                 ViewResources* vr = m_Pipeline->GetCurrentViewResources();
 
                 sys.GetFrameDebugger().BeginCapturePass(ctx.passIndex, "SelectionMaskPass", "SelectionMask", false,
-                    { "selectionMask", 0, VK_CULL_MODE_BACK_BIT, VK_POLYGON_MODE_FILL, false, true, true, false });
+                    { "selectionMask", 0, VK_CULL_MODE_NONE, VK_POLYGON_MODE_FILL, false, true, true, false });
 
                 if (!m_SelectionMaskPipeline) { sys.GetFrameDebugger().EndCapturePass(); return; }
 
@@ -490,9 +510,12 @@ namespace Luth
                         pc.materialIndex = 0;
                         pc.boneOffset    = dc.boneOffset;
 
+                        // Push the un-jittered-projection jitter alongside; the vertex shader subtracts it
+                        // so the mask silhouette (hence the outline) stays put under TAA.
+                        MaskPushConstants mpc{ pc, vr->currentJitter };
                         vkCmdPushConstants(cmd, activeLayout,
                             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                            0, sizeof(ObjectPushConstants), &pc);
+                            0, sizeof(MaskPushConstants), &mpc);
 
                         VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
                         VkDeviceSize offsets[] = { 0 };
@@ -510,7 +533,7 @@ namespace Luth
                             sys.GetFrameDebugger().CaptureDrawCall("SelectionMaskPass",
                                 dc.model->GetName() + "[" + std::to_string(dc.meshIndex) + "]",
                                 entName, dc.entityIndex, ib->GetCount(), pc,
-                                { "selectionMask", 0, VK_CULL_MODE_BACK_BIT, VK_POLYGON_MODE_FILL,
+                                { "selectionMask", 0, VK_CULL_MODE_NONE, VK_POLYGON_MODE_FILL,
                                   currentSkinned, true, true, false });
                         }
                     }
@@ -530,6 +553,7 @@ namespace Luth
     RG::ResourceHandle EditorOverlaysSubsystem::AddOutlinePass(
         RG::RenderGraph& rg, RG::ResourceHandle ldrOutput, SelectionMaskOutput maskOutput, RG::ResourceHandle sceneDepth)
     {
+        LH_PROFILE_FUNCTION();
         const auto* view = m_Pipeline->GetCurrentView();
         if (!m_OutlinePipeline || !view->targets->GetLDROutput()) return ldrOutput;
 
@@ -604,6 +628,7 @@ namespace Luth
 
     RG::ResourceHandle EditorOverlaysSubsystem::AddGridPass(RG::RenderGraph& rg, RG::ResourceHandle sceneColor, RG::ResourceHandle sceneDepth)
     {
+        LH_PROFILE_FUNCTION();
         if (!m_GridPipeline) return sceneColor;
 
         struct GridPassData {
@@ -652,6 +677,7 @@ namespace Luth
                     float fadeStart;
                     float fadeEnd;
                     float lineThickness;
+                    float jitter[2];   // per-view TAA jitter; frag subtracts it to un-jitter the grid VP
                 } gpc{};
                 gpc.axisXColor[0] = cp.gridAxisXColor.r; gpc.axisXColor[1] = cp.gridAxisXColor.g; gpc.axisXColor[2] = cp.gridAxisXColor.b; gpc.axisXColor[3] = cp.gridAxisXColor.a;
                 gpc.axisZColor[0] = cp.gridAxisZColor.r; gpc.axisZColor[1] = cp.gridAxisZColor.g; gpc.axisZColor[2] = cp.gridAxisZColor.b; gpc.axisZColor[3] = cp.gridAxisZColor.a;
@@ -660,6 +686,8 @@ namespace Luth
                 gpc.fadeStart     = cp.gridFadeStart;
                 gpc.fadeEnd       = cp.gridFadeEnd;
                 gpc.lineThickness = cp.gridLineThickness;
+                gpc.jitter[0]     = vr->currentJitter.x;
+                gpc.jitter[1]     = vr->currentJitter.y;
                 vkCmdPushConstants(cmd, m_GridPipeline->GetLayout(),
                     VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(gpc), &gpc);
 

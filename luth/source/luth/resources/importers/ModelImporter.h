@@ -20,6 +20,9 @@ namespace Luth
         bool ImportNormals    = true;
         bool ImportTangents   = false;
         bool OptimizeMesh     = true;
+        // Wind-deformable: route this model's STATIC meshes through the GPU deform seam (per-frame
+        // deform compute + refittable BLAS) so global wind bends them, RT-correct. Ignored for skinned.
+        bool MarkDeformable   = false;
         float ScaleFactor     = 1.0f;
 
         // Axis
@@ -41,6 +44,10 @@ namespace Luth
         // Scene-graph extras (static models): import source cameras / lights as entities.
         bool ImportCameras = true;
         bool ImportLights  = true;
+
+        // Stamp an inferred TextureRole into each resolved texture's .meta (Assimp semantic + filename
+        // suffix), so packed/non-standard layouts canonicalize at import. Never clobbers a user-set role.
+        bool AutoDetectTextureRoles = true;
 
         // Physics shape sourcing. None (default) → ShapeCache returns null for asset-backed colliders referencing
         // this model and warns once per UUID. Auto → ShapeCache builds JPH::ConvexHullShape / JPH::MeshShape on

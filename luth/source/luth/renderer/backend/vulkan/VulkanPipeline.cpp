@@ -1,4 +1,5 @@
 #include "luthpch.h"
+#include <chrono>
 #include "VulkanPipeline.h"
 #include "VulkanContext.h"
 #include "PipelineCache.h"
@@ -29,6 +30,8 @@ namespace Luth
 
     VkShaderModule VKPipeline::CreateShaderModule(const std::vector<u32>& code)
     {
+        LH_PROFILE_FUNCTION();
+
         VkShaderModuleCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         createInfo.codeSize = code.size() * sizeof(u32);
@@ -36,7 +39,7 @@ namespace Luth
 
         VkShaderModule shaderModule;
         if (vkCreateShaderModule(m_Device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS) {
-            LH_CORE_ERROR("Failed to create shader module!");
+            LH_LOG(Renderer, error, "Failed to create shader module!");
             return VK_NULL_HANDLE;
         }
         return shaderModule;
@@ -47,6 +50,8 @@ namespace Luth
                                     const std::vector<u32>& fragCode,
                                     const std::vector<VkDescriptorSetLayout>& layouts)
     {
+        LH_PROFILE_FUNCTION();
+
         VkShaderModule vertShader = CreateShaderModule(vertCode);
         VkShaderModule fragShader = CreateShaderModule(fragCode);
 
@@ -150,7 +155,7 @@ namespace Luth
         pipelineLayoutInfo.pPushConstantRanges = config.pushConstantRanges.data();
 
         if (vkCreatePipelineLayout(m_Device, &pipelineLayoutInfo, nullptr, &m_PipelineLayout) != VK_SUCCESS) {
-            LH_CORE_CRITICAL("Failed to create pipeline layout!");
+            LH_LOG(Renderer, critical, "Failed to create pipeline layout!");
         }
 
         VkGraphicsPipelineCreateInfo pipelineInfo{};
@@ -168,8 +173,11 @@ namespace Luth
         pipelineInfo.pDynamicState = &dynamicState;
         pipelineInfo.layout = m_PipelineLayout;
 
-        if (vkCreateGraphicsPipelines(m_Device, PipelineCache::Get(), 1, &pipelineInfo, nullptr, &m_Pipeline) != VK_SUCCESS) {
-            LH_CORE_CRITICAL("Failed to create graphics pipeline!");
+        const auto pcStart = std::chrono::high_resolution_clock::now();
+        VkResult pipeRes = vkCreateGraphicsPipelines(m_Device, PipelineCache::Get(), 1, &pipelineInfo, nullptr, &m_Pipeline);
+        PipelineCache::RecordCompile(std::chrono::duration<f64, std::milli>(std::chrono::high_resolution_clock::now() - pcStart).count());
+        if (pipeRes != VK_SUCCESS) {
+            LH_LOG(Renderer, critical, "Failed to create graphics pipeline!");
         }
 
         vkDestroyShaderModule(m_Device, vertShader, nullptr);

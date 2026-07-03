@@ -29,6 +29,10 @@ namespace Luth
         static inline ImU32 GizmoCamera       = IM_COL32(180, 180, 220, 180); // Light blue-grey
         static inline ImU32 GizmoAABB         = IM_COL32(160, 160, 160, 100); // Soft grey
         static inline ImU32 GizmoAABBSelected = IM_COL32(255, 160,   0, 200); // Orange for selected
+        static inline ImU32 GizmoBoneLine     = IM_COL32(  0, 255, 128, 200); // Green skeleton lines
+        static inline ImU32 GizmoBoneJoint    = IM_COL32(255, 255,   0, 255); // Yellow joints
+        static inline ImU32 GizmoFog          = IM_COL32(184, 140, 242, 140); // Purple — matches EntityFX hierarchy tint
+        static inline ImU32 GizmoWind         = IM_COL32(184, 140, 242, 204); // Purple — matches EntityFX hierarchy tint
 
         // Status colors
         static inline ImVec4 ErrorRed      = { 0.9f, 0.2f, 0.2f, 1.0f };
@@ -52,5 +56,14 @@ namespace Luth
         static inline ImU32 MemFrameLinear = IM_COL32( 60, 180, 160, 255); // Teal
         static inline ImU32 MemFrameTagged = IM_COL32(200, 120, 160, 255); // Pink
         static inline ImU32 MemGPU         = IM_COL32( 90,  90, 200, 255); // Deep Indigo
+
+        // Hierarchy entity-icon category tints (glyph only; entity names stay neutral)
+        static inline ImVec4 EntityMesh    = { 0.55f, 0.68f, 0.88f, 1.0f }; // calm blue
+        static inline ImVec4 EntityCamera  = { 0.78f, 0.80f, 0.84f, 1.0f }; // silver-grey
+        static inline ImVec4 EntityLight   = { 0.95f, 0.80f, 0.25f, 1.0f }; // yellow
+        static inline ImVec4 EntityBone    = { 0.30f, 0.85f, 0.45f, 1.0f }; // green (matches GizmoBoneLine)
+        static inline ImVec4 EntityAnim    = { 0.25f, 0.78f, 0.75f, 1.0f }; // teal
+        static inline ImVec4 EntityPhysics = { 0.95f, 0.55f, 0.20f, 1.0f }; // orange
+        static inline ImVec4 EntityFX      = { 0.72f, 0.55f, 0.95f, 1.0f }; // purple
     };
 }

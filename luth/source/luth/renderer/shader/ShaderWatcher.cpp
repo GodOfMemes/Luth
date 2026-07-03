@@ -11,7 +11,7 @@ namespace Luth
             if (status != FileWatcher::FileStatus::Modified) return;
 
             std::string ext = changedFile.extension().string();
-            if (ext != ".vert" && ext != ".frag" && ext != ".comp" && ext != ".slang") return;
+            if (ext != ".slang") return;
 
             std::string fileName = changedFile.filename().string();
             for (const auto& [name, shader] : ShaderLibrary::GetAll())
@@ -22,7 +22,7 @@ namespace Luth
                     return;
                 }
             }
-            LH_CORE_WARN("Shader watcher: changed file '{}' not registered in ShaderLibrary", fileName);
+            LH_LOG(Shaders, warn, "Shader watcher: changed file '{}' not registered in ShaderLibrary", fileName);
         });
         m_Watcher.Start(true);
     }
@@ -38,7 +38,7 @@ namespace Luth
             return;
         m_Watcher.AddWatch(projectShadersDir);
         m_ProjectDir = projectShadersDir;
-        LH_CORE_INFO("Shader hot-reload watching project dir: {}", projectShadersDir.string());
+        LH_LOG(Shaders, info, "Shader hot-reload watching project dir: {}", projectShadersDir.string());
     }
 
     void ShaderWatcher::RemoveProjectDir()
@@ -55,8 +55,9 @@ namespace Luth
         LH_PROFILE_FUNCTION();
         for (const auto& name : m_Pending)
         {
-            LH_CORE_INFO("Shader file changed — reloading '{}'", name);
+            LH_LOG(Shaders, info, "Shader file changed — reloading '{}'", name);
             ShaderLibrary::Reload(name);
+            LH_PROFILE_MESSAGE(("Shader reloaded: " + name).c_str());
         }
         m_Pending.clear();
     }

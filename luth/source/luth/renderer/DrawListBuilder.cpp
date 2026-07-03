@@ -13,6 +13,8 @@ namespace Luth
                                 const std::unordered_map<entt::entity, u32>& entityToSSBOIndex,
                                 DrawList& out)
     {
+        LH_PROFILE_FUNCTION();
+
         out.Clear();
 
         for (const MeshDrawSnapshot& meshSnap : snapshot.meshes)
@@ -53,6 +55,7 @@ namespace Luth
                         dc.materialSlot = slotIt->second;
                     mode     = material->GetRenderMode();
                     cullMode = material->GetCullMode();
+                    dc.fragShaderUUID = material->GetGraphShaderUUID();
                 }
             }
             dc.cullMode = cullMode;
@@ -62,6 +65,8 @@ namespace Luth
                 dc.isSkinned  = true;
                 dc.boneOffset = meshSnap.boneOffset;
             }
+            dc.isDeformable = meshSnap.isDeformable;
+            dc.isDeformed   = dc.isSkinned || dc.isDeformable;
 
             switch (mode)
             {

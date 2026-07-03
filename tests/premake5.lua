@@ -52,8 +52,7 @@ project "LuthTests"
       "Jolt",
       "Tracy",
       --"vulkan-1",
-      "shaderc_shared",
-      "slang-compiler"
+      --"slang-compiler"
       --"ws2_32",
       --"dbghelp"
    }

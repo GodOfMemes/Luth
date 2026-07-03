@@ -53,7 +53,7 @@ project "Runtime"
    }
 
    -- Stage the optional Aftermath DLL next to Luthien.exe so the runtime loads it by name (mirrors the
-   -- shaderc copy above). Only when AFTERMATH_SDK is set; the build is otherwise Aftermath-free.
+   -- Slang copies above). Only when AFTERMATH_SDK is set; the build is otherwise Aftermath-free.
    local aftermathSDK = os.getenv("AFTERMATH_SDK")
    if aftermathSDK then
       postbuildcommands { "{COPY} " .. aftermathSDK:gsub("\\", "/") .. "/lib/x64/GFSDK_Aftermath_Lib.x64.dll %{cfg.targetdir}" }
@@ -74,16 +74,16 @@ project "Runtime"
       "Jolt",
 
       --"vulkan-1",
-      "shaderc_shared",
-      "slang-compiler"
+      --"shaderc_shared"
+      --"Luthien",
+      --"vulkan-1"
    }
 
    filter "system:windows"
       links { "vulkan-1" }
       postbuildcommands
       {
-         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/shaderc_shared.dll %{cfg.targetdir}",
-         -- Slang in-process compiler (slang-spike, coexists with shaderc). slang-compiler.dll is the
+         -- Slang in-process compiler — the engine's only shader backend. slang-compiler.dll is the
          -- post-rename real compiler; it LoadLibrary's its siblings on demand, so stage all four.
          "{COPYFILE} " .. LibraryDir["vulkan"] .. "/slang-compiler.dll %{cfg.targetdir}",
          "{COPYFILE} " .. LibraryDir["vulkan"] .. "/slang-glslang.dll %{cfg.targetdir}",
@@ -92,15 +92,21 @@ project "Runtime"
       }
    filter "system:linux"
       links { "vulkan", "dl", "pthread" }
+      linkoptions
+      {
+         "-L" .. LibraryDir["vulkan"],
+         "-Wl,-rpath-link," .. LibraryDir["vulkan"],
+         "-l:libslang-compiler.so.0.2026.1.2",
+         "-Wl,-rpath,'$$ORIGIN'"
+      }
       postbuildcommands
       {
-         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libshaderc_shared.so %{cfg.targetdir}",
-         -- Slang in-process compiler (slang-spike, coexists with shaderc). slang-compiler.so is the
+         -- Slang in-process compiler — the engine's only shader backend. libslang-compiler.so is the
          -- post-rename real compiler; it LoadLibrary's its siblings on demand, so stage all four.
-         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libslang-compiler.so %{cfg.targetdir}",
-         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libslang-glslang.so %{cfg.targetdir}",
-         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libslang-glsl-module.so %{cfg.targetdir}",
-         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libslang-rt.so %{cfg.targetdir}"
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libslang-compiler.so.0.2026.1.2 %{cfg.targetdir}",
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libslang-glslang-2026.1.2.so %{cfg.targetdir}",
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libslang-glsl-module-2026.1.2.so %{cfg.targetdir}",
+         "{COPYFILE} " .. LibraryDir["vulkan"] .. "/libslang-rt.so.0.2026.1.2 %{cfg.targetdir}"
       }
    filter {}
 

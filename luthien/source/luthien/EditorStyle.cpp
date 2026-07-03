@@ -49,7 +49,6 @@ namespace Luth::EditorStyle
         j["font"] = {
             { "mainFont",           f.MainFontName },
             { "mainSize",           f.MainFontSize },
-            { "mergeMainWithSolid", f.MergeMainWithSolid },
             { "iconSize",           f.IconFontSize },
         };
 
@@ -100,10 +99,9 @@ namespace Luth::EditorStyle
         if (auto it = j.find("font"); it != j.end() && it->is_object()) {
             sf.Font.MainFontName       = it->value("mainFont", std::string{});
             sf.Font.MainFontSize       = it->value("mainSize", 15.0f);
-            sf.Font.MergeMainWithSolid = it->value("mergeMainWithSolid", false);
             sf.Font.IconFontSize       = it->value("iconSize", 14.0f);
         } else {
-            LH_CORE_WARN("Style JSON missing 'font' block for '{}'", sf.Preset.Name);
+            LH_LOG(Editor, warn, "Style JSON missing 'font' block for '{}'", sf.Preset.Name);
             return std::nullopt;
         }
 
@@ -142,7 +140,7 @@ namespace Luth::EditorStyle
             for (auto& [key, val] : it->items()) {
                 auto m = nameMap.find(key);
                 if (m == nameMap.end()) {
-                    LH_CORE_WARN("Unknown ImGui color '{}' in style '{}'", key, sf.Preset.Name);
+                    LH_LOG(Editor, warn, "Unknown ImGui color '{}' in style '{}'", key, sf.Preset.Name);
                     continue;
                 }
                 p.Colors[m->second] = JsonToVec4(val);
@@ -155,14 +153,14 @@ namespace Luth::EditorStyle
     std::optional<StyleFile> LoadFromFile(const fs::path& path)
     {
         if (!fs::exists(path)) {
-            LH_CORE_WARN("Style file not found: {}", path.string());
+            LH_LOG(Editor, warn, "Style file not found: {}", path.string());
             return std::nullopt;
         }
         try {
             std::ifstream file(path);
             return Deserialise(json::parse(file));
         } catch (const std::exception& e) {
-            LH_CORE_ERROR("Failed to load style '{}': {}", path.string(), e.what());
+            LH_LOG(Editor, error, "Failed to load style '{}': {}", path.string(), e.what());
             return std::nullopt;
         }
     }
@@ -174,32 +172,31 @@ namespace Luth::EditorStyle
                 fs::create_directories(path.parent_path());
             std::ofstream file(path);
             file << Serialise(preset, font).dump(4);
-            LH_CORE_INFO("Saved style '{}' to '{}'", preset.Name, path.string());
+            LH_LOG(Editor, info, "Saved style '{}' to '{}'", preset.Name, path.string());
             return true;
         } catch (const std::exception& e) {
-            LH_CORE_ERROR("Failed to save style '{}': {}", path.string(), e.what());
+            LH_LOG(Editor, error, "Failed to save style '{}': {}", path.string(), e.what());
             return false;
         }
     }
 
     // ── Font Loading ──
 
-    static ImFont* LoadIconFont(const char* filename, float size, bool mergeMode)
+    static ImFont* LoadIconFont(const char* filename, float size, bool mergeMode, const ImWchar* ranges)
     {
         std::string path = (FileSystem::EngineAssetsPath("fonts") / filename).string();
         if (!fs::exists(path)) {
-            LH_CORE_WARN("Icon font not found: {}", path);
+            LH_LOG(Editor, warn, "Icon font not found: {}", path);
             return nullptr;
         }
 
         ImFontConfig config;
         config.MergeMode = mergeMode;
         config.PixelSnapH = mergeMode;
-        static const ImWchar iconRanges[] = { ICON_MIN_FA, ICON_MAX_FA, 0 };
 
-        ImFont* font = ImGui::GetIO().Fonts->AddFontFromFileTTF(path.c_str(), size, &config, iconRanges);
+        ImFont* font = ImGui::GetIO().Fonts->AddFontFromFileTTF(path.c_str(), size, &config, ranges);
         if (!font) {
-            LH_CORE_WARN("Failed to load icon font: {}", path);
+            LH_LOG(Editor, warn, "Failed to load icon font: {}", path);
         }
         return font;
     }
@@ -208,36 +205,41 @@ namespace Luth::EditorStyle
     {
         ImGuiIO& io = ImGui::GetIO();
 
-        std::string mainPath = (FileSystem::EngineAssetsPath("fonts") / config.MainFontName).string();
-        if (fs::exists(mainPath)) {
-            ImFontConfig fontCfg;
-            fontCfg.OversampleH = 3;
-            fontCfg.OversampleV = 2;
-            fontCfg.PixelSnapH  = true;
-            Editor::MainFontRef() = io.Fonts->AddFontFromFileTTF(mainPath.c_str(), config.MainFontSize, &fontCfg);
-        }
-        else {
-            LH_CORE_WARN("Main font not found: {}", mainPath);
+        // Phosphor weights are independent fonts with their own codepoints, so each
+        // gets its own range. Both fit the BMP private-use area (16-bit ImWchar).
+        static const ImWchar kRangeRegular[] = { ICON_MIN_PH,  ICON_MAX_PH,  0 };
+        static const ImWchar kRangeFill[]    = { ICON_MIN_PHF, ICON_MAX_PHF, 0 };
+
+        const std::string mainPath = (FileSystem::EngineAssetsPath("fonts") / config.MainFontName).string();
+        const bool haveMain = fs::exists(mainPath);
+        if (!haveMain) {
+            LH_LOG(Editor, warn, "Main font not found: {}", mainPath);
         }
 
-        if (config.MergeMainWithSolid) {
-            // Custom/Rider: merge FA-Solid into main font, then add default + standalone FA-Regular
-            Editor::FASolidRef() = LoadIconFont("fa-solid-900.ttf", config.IconFontSize, true);
-            io.Fonts->AddFontDefault();
-            Editor::FARegularRef() = LoadIconFont("fa-regular-400.ttf", config.IconFontSize, false);
-        }
-        else {
-            // Bubblegum/Matrix: add default after main, standalone icon fonts
-            io.Fonts->AddFontDefault();
-            Editor::FARegularRef() = LoadIconFont("fa-regular-400.ttf", config.IconFontSize, false);
-            Editor::FASolidRef() = LoadIconFont("fa-solid-900.ttf", config.IconFontSize, false);
-        }
+        auto addMainText = [&]() -> ImFont* {
+            if (!haveMain) return io.Fonts->AddFontDefault();
+            ImFontConfig cfg;
+            cfg.OversampleH = 3;
+            cfg.OversampleV = 2;
+            cfg.PixelSnapH  = true;
+            return io.Fonts->AddFontFromFileTTF(mainPath.c_str(), config.MainFontSize, &cfg);
+        };
 
-        // invariant: large 64-px bakes for ProjectPanel grid icons. Bilinear
-        // downscale to small cells stays clean; upscale from the default 16-px
-        // bake would not. Both Solid and Regular needed (empty folders use Regular).
-        Editor::FASolidLargeRef()   = LoadIconFont("fa-solid-900.ttf",   64.0f, false);
-        Editor::FARegularLargeRef() = LoadIconFont("fa-regular-400.ttf", 64.0f, false);
+        // Each weight is merged into its own copy of the main text font, so a
+        // PushFont(GetIcon*) site still renders accompanying labels (e.g. panel
+        // titles) as text rather than icon fallback glyphs. Regular doubles as the
+        // default font; inline `ICON_x " label"` therefore works without a push.
+        Editor::MainFontRef()    = addMainText();
+        Editor::IconRegularRef() = Editor::GetMainFont();
+        LoadIconFont("Phosphor.ttf", config.IconFontSize, true, kRangeRegular);
+
+        Editor::IconFillRef() = addMainText();
+        LoadIconFont("Phosphor-Fill.ttf", config.IconFontSize, true, kRangeFill);
+
+        // Icon-only 64-px bakes for the ProjectPanel grid (no text rendered there);
+        // bilinear minify stays crisp where an upscaled 16-px bake would not.
+        Editor::IconRegularLargeRef() = LoadIconFont("Phosphor.ttf",      64.0f, false, kRangeRegular);
+        Editor::IconFillLargeRef()    = LoadIconFont("Phosphor-Fill.ttf", 64.0f, false, kRangeFill);
     }
 
     // ── Style Application ──

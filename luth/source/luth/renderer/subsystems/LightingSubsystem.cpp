@@ -24,6 +24,7 @@ namespace Luth
 {
     void LightingSubsystem::Init(RenderPipeline& pipeline, const fs::path& hdrPath)
     {
+        LH_PROFILE_FUNCTION();
         m_Pipeline = &pipeline;
         VkDevice device = VulkanContext::Get().GetDevice();
 
@@ -31,13 +32,13 @@ namespace Luth
             auto sh = ShaderLibrary::LoadEngine(relPath);
             return sh ? sh->GetSpirV() : std::vector<u32>{};
         };
-        m_ShadowVertSpv        = loadSpv("shaders/shadowDepth.vert");
-        m_ShadowFragSpv        = loadSpv("shaders/shadowDepth.frag");
-        m_ShadowSkinnedVertSpv = loadSpv("shaders/shadowDepth_skinned.vert");
+        m_ShadowVertSpv        = loadSpv("shaders/shadowDepth_vert.slang");
+        m_ShadowFragSpv        = loadSpv("shaders/shadowDepth.slang");
+        m_ShadowSkinnedVertSpv = loadSpv("shaders/shadowDepth_skinned.slang");
 
         if (m_ShadowVertSpv.empty() || m_ShadowFragSpv.empty() || m_ShadowSkinnedVertSpv.empty())
         {
-            LH_CORE_ERROR("LightingSubsystem: shadow shader SPIR-V empty after asset load!");
+            LH_LOG(Renderer, error, "LightingSubsystem: shadow shader SPIR-V empty after asset load!");
             return;
         }
 
@@ -77,10 +78,10 @@ namespace Luth
             // Push constant: invProjection + viewportSize + _pad + nearZ + farZ + uvec2 tiles = 96 B.
             VkPushConstantRange pcRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 96 };
 
-            m_ClusterBuildSpv = loadSpv("shaders/cluster_build.comp");
+            m_ClusterBuildSpv = loadSpv("shaders/cluster_build.slang");
             if (m_ClusterBuildSpv.empty())
             {
-                LH_CORE_ERROR("LightingSubsystem: failed to load cluster_build.comp!");
+                LH_LOG(Renderer, error, "LightingSubsystem: failed to load cluster_build.slang!");
                 return;
             }
             m_ClusterBuildPipeline = std::make_unique<VKComputePipeline>(
@@ -120,13 +121,13 @@ namespace Luth
             layoutCI.pBindings    = bindings;
             vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &m_LightAssignSetLayout);
 
-            // Push constant: mat4 view + u32 pointLightCount + u32 maxLightsPerCluster + u32 _pad[2] = 80 B.
+            // Push constant: mat4 view + u32 pointLightCount + u32 spotLightCount + u32 maxLightsPerCluster + u32 _pad = 80 B.
             VkPushConstantRange pcRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 80 };
 
-            m_LightAssignSpv = loadSpv("shaders/light_assign.comp");
+            m_LightAssignSpv = loadSpv("shaders/light_assign.slang");
             if (m_LightAssignSpv.empty())
             {
-                LH_CORE_ERROR("LightingSubsystem: failed to load light_assign.comp!");
+                LH_LOG(Renderer, error, "LightingSubsystem: failed to load light_assign.slang!");
                 return;
             }
             m_LightAssignPipeline = std::make_unique<VKComputePipeline>(
@@ -158,8 +159,8 @@ namespace Luth
             slayoutCI.pBindings    = &sbinding;
             vkCreateDescriptorSetLayout(device, &slayoutCI, nullptr, &m_ClusterVizDescSetLayout);
 
-            m_FullscreenVertSpv = loadSpv("shaders/fullscreen.vert");
-            m_ClusterVizFragSpv = loadSpv("shaders/cluster_viz.frag");
+            m_FullscreenVertSpv = loadSpv("shaders/fullscreen.slang");
+            m_ClusterVizFragSpv = loadSpv("shaders/cluster_viz.slang");
             if (!m_FullscreenVertSpv.empty() && !m_ClusterVizFragSpv.empty())
             {
                 std::vector<VkDescriptorSetLayout> layouts = { m_ClusterVizDescSetLayout, m_LightSetLayout };
@@ -180,12 +181,14 @@ namespace Luth
 
     void LightingSubsystem::BuildPipelines(const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         BuildShadowPipelines(geoLayouts);
         BuildSkyboxPipeline(geoLayouts);
     }
 
     void LightingSubsystem::Shutdown()
     {
+        LH_PROFILE_FUNCTION();
         VkDevice device = VulkanContext::Get().GetDevice();
 
         m_SkyboxPipeline.reset();
@@ -238,6 +241,7 @@ namespace Luth
 
     void LightingSubsystem::ReloadSkybox(const fs::path& hdrPath, const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         VkDevice device = VulkanContext::Get().GetDevice();
         vkDeviceWaitIdle(device);
 
@@ -248,12 +252,13 @@ namespace Luth
         m_SkyboxPipeline.reset();
         BuildSkyboxPipeline(geoLayouts);
 
-        LH_CORE_INFO("Skybox reloaded from '{}'", hdrPath.string());
+        LH_LOG(Renderer, info, "Skybox reloaded from '{}'", hdrPath.string());
     }
 
     bool LightingSubsystem::OnShaderReloaded(const std::string& name, const std::vector<u32>& spv,
                                              const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         auto deferGfx = [](std::unique_ptr<VKPipeline>& p) {
             if (auto* raw = p.release(); raw)
                 VulkanContext::Get().PushDeletion([raw]() { delete raw; });
@@ -263,7 +268,7 @@ namespace Luth
                 VulkanContext::Get().PushDeletion([raw]() { delete raw; });
         };
 
-        if (name == "cluster_build.comp" && m_ClusterBuildSetLayout)
+        if (name == "cluster_build.slang" && m_ClusterBuildSetLayout)
         {
             m_ClusterBuildSpv = spv;
             deferComp(m_ClusterBuildPipeline);
@@ -273,7 +278,7 @@ namespace Luth
                 std::vector<VkPushConstantRange>{ pc });
             return true;
         }
-        if (name == "light_assign.comp" && m_LightAssignSetLayout)
+        if (name == "light_assign.slang" && m_LightAssignSetLayout)
         {
             m_LightAssignSpv = spv;
             deferComp(m_LightAssignPipeline);
@@ -283,9 +288,9 @@ namespace Luth
                 std::vector<VkPushConstantRange>{ pc });
             return true;
         }
-        if ((name == "cluster_viz.frag" || name == "fullscreen.vert") && m_ClusterVizDescSetLayout)
+        if ((name == "cluster_viz.slang" || name == "fullscreen.slang") && m_ClusterVizDescSetLayout)
         {
-            if (name == "cluster_viz.frag") m_ClusterVizFragSpv = spv;
+            if (name == "cluster_viz.slang") m_ClusterVizFragSpv = spv;
             else                            m_FullscreenVertSpv = spv;
             deferGfx(m_ClusterVizPipeline);
             if (!m_FullscreenVertSpv.empty() && !m_ClusterVizFragSpv.empty())
@@ -305,14 +310,14 @@ namespace Luth
             return true;
         }
 
-        if (name == "shadowDepth.vert")           m_ShadowVertSpv        = spv;
-        else if (name == "shadowDepth.frag")      m_ShadowFragSpv        = spv;
-        else if (name == "shadowDepth_skinned.vert") m_ShadowSkinnedVertSpv = spv;
-        else if (name == "skybox.vert")           m_SkyboxVertSpv        = spv;
-        else if (name == "skybox.frag")           m_SkyboxFragSpv        = spv;
+        if (name == "shadowDepth_vert.slang")           m_ShadowVertSpv        = spv;
+        else if (name == "shadowDepth.slang")      m_ShadowFragSpv        = spv;
+        else if (name == "shadowDepth_skinned.slang") m_ShadowSkinnedVertSpv = spv;
+        else if (name == "skybox_vert.slang")           m_SkyboxVertSpv        = spv;
+        else if (name == "skybox.slang")           m_SkyboxFragSpv        = spv;
         else return false;
 
-        if (name == "skybox.vert" || name == "skybox.frag")
+        if (name == "skybox_vert.slang" || name == "skybox.slang")
         {
             deferGfx(m_SkyboxPipeline);
             BuildSkyboxPipeline(geoLayouts);
@@ -336,6 +341,7 @@ namespace Luth
 
     void LightingSubsystem::WriteShadowView(ViewResources& vr)
     {
+        LH_PROFILE_FUNCTION();
         if (!m_ShadowMap || vr.lightDescSet[0] == VK_NULL_HANDLE) return;
 
         auto vkShadowTex = std::static_pointer_cast<VKTexture>(m_ShadowMap);
@@ -486,6 +492,7 @@ namespace Luth
     // m_LastLightSSBORegion is cached for AddLightAssignPass's b0 binding.
     Memory::GPUSubRegion LightingSubsystem::UploadLightSSBO(const GatheredLights& lights)
     {
+        LH_PROFILE_FUNCTION();
         Memory::GPUSubRegion region{};
         auto* jobCtx = JobSystem::GetCurrentJobContext();
         if (!jobCtx) return region;
@@ -493,20 +500,23 @@ namespace Luth
         jobCtx->GpuCache.CurrentTag = frameAbs;
 
         auto& heap = Memory::GPUTaggedPageAllocator::Get();
-        const u64 ssboSize = sizeof(LightSSBOHeader) + lights.points.size() * sizeof(PointLightData);
+        const u64 pointBytes = lights.points.size() * sizeof(PointLightData);
+        const u64 spotBytes  = lights.spots.size()  * sizeof(SpotLightData);
+        const u64 ssboSize   = sizeof(LightSSBOHeader) + pointBytes + spotBytes;
         region = heap.Allocate(jobCtx->GpuCache, ssboSize, 16);
         if (!region.buffer) return {};
 
-        // Header at offset 0; flexible PointLightData[] follows at offset 48 (std430 alignment).
+        // Header at offset 0; points[] at offset 48; spots[] right after points (std430 alignment).
         auto* header = static_cast<LightSSBOHeader*>(region.mappedPtr);
         header->dirLight        = lights.dirLight;
         header->pointLightCount = static_cast<u32>(lights.points.size());
-        header->_pad[0] = header->_pad[1] = header->_pad[2] = 0;
+        header->spotLightCount  = static_cast<u32>(lights.spots.size());
+        header->_pad[0] = header->_pad[1] = 0;
+        auto* base = static_cast<u8*>(region.mappedPtr) + sizeof(LightSSBOHeader);
         if (!lights.points.empty())
-        {
-            auto* dst = reinterpret_cast<PointLightData*>(static_cast<u8*>(region.mappedPtr) + sizeof(LightSSBOHeader));
-            std::memcpy(dst, lights.points.data(), lights.points.size() * sizeof(PointLightData));
-        }
+            std::memcpy(base, lights.points.data(), pointBytes);
+        if (!lights.spots.empty())
+            std::memcpy(base + pointBytes, lights.spots.data(), spotBytes);
         heap.FlushRegion(region);
         m_LastLightSSBORegion = region;
         return region;
@@ -516,6 +526,7 @@ namespace Luth
                                              const Memory::GPUSubRegion& clusterGridRegion,
                                              const Memory::GPUSubRegion& lightIndexRegion)
     {
+        LH_PROFILE_FUNCTION();
         const u32 frameAbs = static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex());
         const u32 slot     = frameAbs % MAX_FRAMES_IN_FLIGHT;
 
@@ -545,6 +556,7 @@ namespace Luth
     // ---- Internal: shadow map + Set 3 layout/pool/set ----
     void LightingSubsystem::CreateShadowResources(VkDevice device)
     {
+        LH_PROFILE_FUNCTION();
         // Shadow map: k_ShadowResolution^2, D32_Float, k_ShadowCascadeCount-layer 2D array.
         m_ShadowMap = std::make_shared<VKTexture>(
             k_ShadowResolution, k_ShadowResolution, TextureFormat::D32_Float,
@@ -690,6 +702,7 @@ namespace Luth
     // ---- Internal: IBL precompute (irradiance + prefiltered + BRDF LUT + skybox VB/SPVs) ----
     void LightingSubsystem::LoadIBL(const fs::path& hdrPath)
     {
+        LH_PROFILE_FUNCTION();
         IBLResult ibl = IBL::Precompute(hdrPath);
         m_IrradianceMap  = ibl.irradianceMap;
         m_PrefilteredMap = ibl.prefilteredMap;
@@ -704,6 +717,7 @@ namespace Luth
     // ---- Internal: build shadow + skybox pipelines ----
     void LightingSubsystem::BuildShadowPipelines(const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         // 4-byte VERTEX push constant carries cascadeIndex.
         VkPushConstantRange shadowCascadePC{};
         shadowCascadePC.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
@@ -733,21 +747,10 @@ namespace Luth
 
         if (!m_ShadowSkinnedVertSpv.empty())
         {
-            BufferLayout skinned = {
-                { ShaderDataType::Float3, "a_Position"    },
-                { ShaderDataType::Float3, "a_Normal"      },
-                { ShaderDataType::Float2, "a_TexCoord0"   },
-                { ShaderDataType::Float2, "a_TexCoord1"   },
-                { ShaderDataType::Float3, "a_Tangent"     },
-                { ShaderDataType::Int4,   "a_BoneIDs"     },
-                { ShaderDataType::Float4, "a_BoneWeights" }
-            };
-            auto skinnedBindings = skinned.GetBindingDescriptions();
-            auto skinnedAttribs  = skinned.GetAttributeDescriptions();
-
+            // Empty vertex input — deformable VS fetch the deformed buffer by gl_VertexIndex.
             PipelineConfig skinnedConfig = shadowConfig;
-            skinnedConfig.bindingDescriptions   = skinnedBindings;
-            skinnedConfig.attributeDescriptions = skinnedAttribs;
+            skinnedConfig.bindingDescriptions.clear();
+            skinnedConfig.attributeDescriptions.clear();
 
             m_ShadowSkinnedPipeline = std::make_unique<VKPipeline>(
                 skinnedConfig, m_ShadowSkinnedVertSpv, m_ShadowFragSpv, geoLayouts);
@@ -756,6 +759,7 @@ namespace Luth
 
     void LightingSubsystem::BuildSkyboxPipeline(const std::vector<VkDescriptorSetLayout>& geoLayouts)
     {
+        LH_PROFILE_FUNCTION();
         if (m_SkyboxVertSpv.empty() || m_SkyboxFragSpv.empty()) return;
 
         BufferLayout skyboxLayout = { { ShaderDataType::Float3, "a_Position" } };
@@ -780,6 +784,7 @@ namespace Luth
     RG::ResourceHandle LightingSubsystem::AddShadowPass(
         RG::RenderGraph& rg, RG::BufferHandle indirectBufferHandle, u32 cascadeIndex)
     {
+        LH_PROFILE_FUNCTION();
         struct ShadowPassData {
             RG::ResourceHandle shadowTex;
             RG::BufferHandle   indirectBuf;
@@ -828,7 +833,7 @@ namespace Luth
                 sys.GetFrameDebugger().BeginCapturePass(ctx.passIndex, passName, resName, true,
                     { "shadowDepth", 0, VK_CULL_MODE_FRONT_BIT, VK_POLYGON_MODE_FILL, false, true, true, false });
 
-                if (!m_ShadowPipeline) { LH_CORE_ERROR("Shadow pipeline is null!"); sys.GetFrameDebugger().EndCapturePass(); return; }
+                if (!m_ShadowPipeline) { LH_LOG(Renderer, error, "Shadow pipeline is null!"); sys.GetFrameDebugger().EndCapturePass(); return; }
 
                 // Bind all 6 descriptor sets (Set 5 = GPUObjectData SSBO, owned by Geometry).
                 const u32 slot = static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex()) % MAX_FRAMES_IN_FLIGHT;
@@ -870,10 +875,12 @@ namespace Luth
                         auto vb = std::static_pointer_cast<VKVertexBuffer>(mesh->GetVertexBuffer());
                         auto ib = std::static_pointer_cast<VKIndexBuffer>(mesh->GetIndexBuffer());
                         if (!vb || !ib) continue;
+                        // Deformed draws need the empty-input pipeline; skip if absent — static binds no VB.
+                        if (dc.isDeformed && !m_ShadowSkinnedPipeline) continue;
 
-                        if (dc.isSkinned != currentSkinned)
+                        if (dc.isDeformed != currentSkinned)
                         {
-                            currentSkinned = dc.isSkinned;
+                            currentSkinned = dc.isDeformed;
                             if (currentSkinned && m_ShadowSkinnedPipeline)
                             {
                                 m_ShadowSkinnedPipeline->Bind(cmd);
@@ -892,9 +899,13 @@ namespace Luth
                             }
                         }
 
-                        VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
-                        VkDeviceSize offsets[] = { 0 };
-                        vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                        // Deformable draws bind no VB — the VS fetches the deformed buffer by gl_VertexIndex.
+                        if (!dc.isDeformed)
+                        {
+                            VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
+                            VkDeviceSize offsets[] = { 0 };
+                            vkCmdBindVertexBuffers(cmd, 0, 1, vbuf, offsets);
+                        }
                         vkCmdBindIndexBuffer(cmd, ib->GetVulkanBuffer(), 0, VK_INDEX_TYPE_UINT32);
 
                         // Per-view region layout: [camera | C0 | C1 | C2 | C3]. View N starts at
@@ -936,6 +947,7 @@ namespace Luth
     RG::ResourceHandle LightingSubsystem::AddSkyboxPass(
         RG::RenderGraph& rg, RG::ResourceHandle sceneColor, RG::ResourceHandle sceneDepth)
     {
+        LH_PROFILE_FUNCTION();
         struct SkyboxPassData {
             RG::ResourceHandle colorTex;
             RG::ResourceHandle depthTex;
@@ -1006,6 +1018,7 @@ namespace Luth
     // without re-importing (see arch/rendering-pipeline.md re-import hazard).
     LightingSubsystem::ClusterBuildOutputs LightingSubsystem::AddClusterBuildPass(RG::RenderGraph& rg)
     {
+        LH_PROFILE_FUNCTION();
         ClusterBuildOutputs out{};
         if (!m_ClusterBuildPipeline) return out;
 
@@ -1132,6 +1145,7 @@ namespace Luth
     LightingSubsystem::LightAssignOutputs LightingSubsystem::AddLightAssignPass(RG::RenderGraph& rg,
                                                                                 ClusterBuildOutputs cb)
     {
+        LH_PROFILE_FUNCTION();
         LightAssignOutputs out{};
         if (!m_LightAssignPipeline || !m_LastLightSSBORegion.buffer) return out;
 
@@ -1195,10 +1209,14 @@ namespace Luth
 
         auto* pipeline = m_LightAssignPipeline.get();
         FrameDebugger* debugger = &m_Pipeline->GetSystem().GetFrameDebugger();
-        // Snapshot point-light count at graph-build time — LightingSystem::GetLights() is final by now.
+        // Snapshot light counts at graph-build time — LightingSystem::GetLights() is final by now.
         u32 capturedPointCount = 0;
+        u32 capturedSpotCount  = 0;
         if (auto* lightingSys = SystemRegistry::GetSystem<LightingSystem>())
+        {
             capturedPointCount = static_cast<u32>(lightingSys->GetLights().points.size());
+            capturedSpotCount  = static_cast<u32>(lightingSys->GetLights().spots.size());
+        }
 
         rg.AddComputePass<LightAssignData>("LightAssign", RG::QueueFamily::AsyncCompute,
             [&](LightAssignData& d, RG::RenderPassBuilder& builder)
@@ -1207,7 +1225,7 @@ namespace Luth
                 d.grid  = builder.WriteBuffer(cb.grid);
                 d.index = builder.WriteBuffer(out.index);
             },
-            [this, pipeline, debugger, capturedPointCount](LightAssignData&, RG::RenderPassContext& ctx)
+            [this, pipeline, debugger, capturedPointCount, capturedSpotCount](LightAssignData&, RG::RenderPassContext& ctx)
             {
                 VkCommandBuffer cmd = ctx.commandBuffer;
                 if (debugger)
@@ -1231,11 +1249,13 @@ namespace Luth
                 struct LightAssignPC {
                     Mat4 view;
                     u32  pointLightCount;
+                    u32  spotLightCount;
                     u32  maxLightsPerCluster;
-                    u32  _pad0, _pad1;
+                    u32  _pad0;
                 } pc{};
                 pc.view                = view->camera.view;
                 pc.pointLightCount     = capturedPointCount;
+                pc.spotLightCount      = capturedSpotCount;
                 pc.maxLightsPerCluster = k_MaxLightsPerCluster;
                 vkCmdPushConstants(cmd, pipeline->GetLayout(),
                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(LightAssignPC), &pc);
@@ -1258,6 +1278,7 @@ namespace Luth
     // AllocateViewResources after FrameTargets exists.
     void LightingSubsystem::WriteClusterVizView(ViewResources& vr, FrameTargets& targets)
     {
+        LH_PROFILE_FUNCTION();
         if (vr.clusterVizDescSet == VK_NULL_HANDLE || m_ClusterVizDepthSampler == VK_NULL_HANDLE) return;
 
         auto vkScnDepth = std::static_pointer_cast<VKTexture>(targets.GetSceneDepth());
@@ -1284,6 +1305,7 @@ namespace Luth
                                                             RG::ResourceHandle ldrInput,
                                                             RG::ResourceHandle sceneDepth)
     {
+        LH_PROFILE_FUNCTION();
         if (!m_ClusterVizPipeline) return ldrInput;
 
         struct ClusterVizData {

@@ -129,6 +129,8 @@ namespace Luth
 
     void VKTexture::CreateImage(const void* data)
     {
+        LH_PROFILE_FUNCTION();
+
         const bool isDepth = IsDepthFormat(m_Format);
         VkFormat vkFmt = ToVkFormat(m_Format);
 
@@ -141,7 +143,7 @@ namespace Luth
                         && (formatProps.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
             if (!canBlit)
             {
-                LH_CORE_WARN("VKTexture: Format does not support blit, falling back to mipLevels=1");
+                LH_LOG(Renderer, warn, "VKTexture: Format does not support blit, falling back to mipLevels=1");
                 m_MipLevels = 1;
             }
         }
@@ -266,6 +268,8 @@ namespace Luth
 
     void VKTexture::CreateViewAndSampler()
     {
+        LH_PROFILE_FUNCTION();
+
         const bool isDepth = IsDepthFormat(m_Format);
         const bool isCubemap = (m_ArrayLayers == 6) && (m_CreateFlags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT);
         const bool isVolume = (m_Depth > 1);
@@ -364,6 +368,8 @@ namespace Luth
 
     VkImageView VKTexture::CreateLayerView(u32 layer) const
     {
+        LH_PROFILE_FUNCTION();
+
         const bool isDepth = IsDepthFormat(m_Format);
         VkFormat vkFmt = ToVkFormat(m_Format);
 
@@ -385,6 +391,8 @@ namespace Luth
 
     VkImageView VKTexture::CreateMipView(u32 mipLevel, bool forStorage) const
     {
+        LH_PROFILE_FUNCTION();
+
         VkFormat vkFmt = ToVkFormat(m_Format);
         bool isCubemap = (m_ArrayLayers == 6) && (m_CreateFlags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT);
 
