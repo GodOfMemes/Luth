@@ -37,11 +37,9 @@ namespace Luth
     {
         m_RootEntities.clear();
 
-        // Destroy every entity individually. This keeps the registry's
-        // pool / sparse-set structures intact (non-zero bucket count)
-        // so that subsequent view<>() calls don't hit EnTT's fast_mod
-        // "power of two" assertion.  registry.clear() can reset bucket
-        // counts to 0 in some EnTT versions, which is unsafe.
+        // Destroy every entity individually. Keeps the registry's pool / sparse-set structures intact
+        // (non-zero bucket count) so subsequent view<>() calls don't hit EnTT's fast_mod "power of two"
+        // assertion. registry.clear() can reset bucket counts to 0 in some EnTT versions, which is unsafe.
         std::vector<entt::entity> all;
         auto view = m_Registry.view<entt::entity>();
         view.each([&all](entt::entity e) { all.push_back(e); });
@@ -111,7 +109,9 @@ namespace Luth
                 nodeEntities[i] = e;
 
                 auto& t = e.GetComponent<Transform>();
-                if (n.ParentIndex == skipRoot) {
+                // Guard skipRoot >= 0: with no root skipped (-1), a genuine root's ParentIndex (-1) must NOT
+                // match, or nodes[skipRoot] indexes nodes[-1]. Only fold when an actual root is being skipped.
+                if (skipRoot >= 0 && n.ParentIndex == skipRoot) {
                     // Fold the skipped root's local transform in so the child keeps its world pose.
                     const auto& r = nodes[skipRoot];
                     Mat4 rootM  = Math::Translate(Mat4(1.0f), r.Translation) * Math::ToMat4(r.Rotation) * Math::Scale(Mat4(1.0f), r.Scale);
@@ -136,10 +136,11 @@ namespace Luth
                 if (n.MeshIndices.size() == 1) {
                     attachMesh(e, n.MeshIndices[0]);
                 } else {
+                    const auto& meshInfos = model->GetCachedModelInfo().Meshes;
                     for (u32 mi : n.MeshIndices) {
-                        Entity child = CreateEntity(model->GetCachedModelInfo().Meshes[mi].Name);
+                        Entity child = CreateEntity(mi < meshInfos.size() ? meshInfos[mi].Name : "Mesh");
                         child.SetParent(e);
-                        attachMesh(child, mi);
+                        attachMesh(child, mi);   // attachMesh bounds-checks meshIdx internally
                     }
                 }
 
@@ -196,7 +197,7 @@ namespace Luth
             std::vector<Entity> boneEntities(boneCount);
             for (u32 i = 0; i < boneCount; i++) {
                 Entity boneEntity = CreateEntity(skeleton.Bones[i].Name);
-                Registry().emplace<Bone>((entt::entity)boneEntity);   // empty marker → emplace, not AddComponent
+                Registry().emplace<Bone>((entt::entity)boneEntity);   // empty marker -> emplace, not AddComponent
                 boneEntities[i] = boneEntity;
                 i32 parentIdx = skeleton.Bones[i].ParentIndex;
                 boneEntity.SetParent((parentIdx >= 0 && parentIdx < (i32)boneCount)
@@ -230,7 +231,6 @@ namespace Luth
         else
             RemoveFromRoots(entity);
 
-        // Finally destroy the entity itself
         std::string name = entity.GetName();
         m_Registry.destroy(entity);
         LH_LOG(Scene, trace, "Destroyed entity: {0}", name);
@@ -248,7 +248,6 @@ namespace Luth
         Entity duplicate = CreateEntity(newName);
 
         // Copy all components except hierarchy-related ones
-        //original.CopyComponentIfExists<Tag>(duplicate);
         original.CopyComponentIfExists<Transform>(duplicate);
         original.CopyComponentIfExists<Camera>(duplicate);
         original.CopyComponentIfExists<MeshRenderer>(duplicate);
@@ -258,19 +257,18 @@ namespace Luth
         original.CopyComponentIfExists<SpotLight>(duplicate);
         original.CopyComponentIfExists<Collider>(duplicate);
         original.CopyComponentIfExists<RigidBody>(duplicate);
-        // PhysicsBodyRuntime is intentionally not copied — PhysicsSystem's on_construct signal will
+        // PhysicsBodyRuntime is intentionally not copied; PhysicsSystem's on_construct signal will
         // create a fresh body for the duplicate when its (Collider + RigidBody) pair completes.
 
-        // Resolve final parent. Recursive-children case (skipParentAddition)
-        // hands off to the caller, which assigns Parent on the next line.
+        // Resolve final parent. Recursive-children case (skipParentAddition) hands off to the caller,
+        // which assigns Parent on the next line.
         Entity newParent = {};
         if (!skipParentAddition && original.HasComponent<Parent>()) {
             Entity p = original.GetComponent<Parent>().Value;
             if (p.IsValid()) newParent = p;
         }
 
-        // Strip from roots before any reparenting so the entity ends up in
-        // exactly one place (root list OR parent's Children, never both).
+        // Strip from roots before any reparenting so the entity ends up in exactly one place (root list OR parent's Children, never both).
         if (skipParentAddition || newParent.IsValid())
             RemoveFromRoots(duplicate);
 
@@ -305,13 +303,12 @@ namespace Luth
     {
         if (entity == target) return;
 
-        // 1. Ensure they share the same parent (reparent if necessary)
+        // Reparent if needed so entity and target share the same parent
         if (entity.GetParent() != target.GetParent())
         {
             entity.SetParent(target.GetParent());
         }
 
-        // 2. Get the list to modify
         std::vector<Entity>* list = nullptr;
         if (entity.HasParent())
         {
@@ -322,7 +319,6 @@ namespace Luth
             list = &m_RootEntities;
         }
 
-        // 3. Move in list
         auto itEntity = std::find(list->begin(), list->end(), entity);
         if (itEntity != list->end())
         {
@@ -363,7 +359,6 @@ namespace Luth
     {
         if (!entity.IsValid()) return "";
 
-        // Get the parent of the entity
         Entity parent;
         if (entity.HasComponent<Parent>()) {
             parent = entity.GetComponent<Parent>().Value;
@@ -398,7 +393,6 @@ namespace Luth
 
         std::regex siblingPattern(R"(^(.*?)\s\((\d+)\)$)");
         for (Entity sibling : siblings) {
-            // Skip the entity itself
             if (sibling == entity)
                 continue;
 
@@ -419,11 +413,9 @@ namespace Luth
             }
         }
 
-        // Determine the new number
         int maxNumber = numbers.empty() ? -1 : *std::max_element(numbers.begin(), numbers.end());
         int newNumber = maxNumber + 1;
 
-        // Generate the new name
         return base + " (" + std::to_string(newNumber) + ")";
     }
 

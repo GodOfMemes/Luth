@@ -15,12 +15,12 @@ namespace Luth
     class RenderPipeline;
     struct ViewResources;
 
-    // ReSTIR GI (Ouyang 2021) — spatiotemporal reservoir resampling for 1-bounce indirect diffuse.
-    // S0 owns 2 compute pipelines (initial 1-bounce sample + demodulated shade) + the pass-local Set 2
-    // layout. The Set 2 layout matches the DI subsystem's 7 bindings forward-compat for the later
-    // temporal/spatial stages; S0 only uses b0/b1/b2/b3. GI reservoir ping-pong + spatial-output buffer
-    // + GI image are per-view (allocated in ViewResources). rayQuery-in-compute reads the TLAS via
-    // Set 0 binding 6. see arch/rendering-pipeline.md
+    // ReSTIR GI (Ouyang 2021): spatiotemporal reservoir resampling for 1-bounce indirect diffuse.
+    // Owns 4 compute pipelines (initial 1-bounce sample, temporal, spatial + final visibility,
+    // demodulated shade) + the pass-local Set 2 layout (same 7-binding shape as the DI subsystem).
+    // Single scratch reservoir + spatial/history buffer + GI image are per-view (ViewResources);
+    // temporal history is the previous frame's SPATIAL output. rayQuery-in-compute (initial +
+    // spatial) reads the TLAS via Set 0 binding 6. see arch/rendering-pipeline.md
     class RtRestirGiSubsystem
     {
     public:
@@ -29,18 +29,14 @@ namespace Luth
 
         bool OnShaderReloaded(const std::string& name, const std::vector<u32>& spv);
 
-        // Stable per-view Set 2 writes: b0 depth, b1 slimNormal, b3 GI image, b5 motion, b6 spatial.
-        // b2/b4 (curr/prev reservoirs) swap each frame — written by WriteReservoirBindings, not here.
+        // Stable per-view Set 2 writes: b0 depth, b1 slimNormal, b2 scratch reservoir, b3 GI image,
+        // b4 history (= the spatial buffer), b5 motion, b6 spatial output (same buffer as b4).
         void WriteView(ViewResources& vr, FrameTargets& targets);
 
-        // Per-frame reservoir ping-pong: curr→b2, prev→b4 in the active slot, parity-selected by
-        // frameAbs & 1u. b2/b4 are UPDATE_AFTER_BIND so the rewrite is race-safe against in-flight
-        // slots. Must run before AddPasses each frame.
-        void WriteReservoirBindings(ViewResources& vr);
-
-        // Initial 1-bounce path sample, then demodulated shade. Returns the GI image handle (demodulated
-        // indirect-diffuse irradiance) consumed by GeometryPass. No-op handle when disabled / no TLAS.
-        // S0 has no temporal/spatial passes; slimMotion is accepted for API parity (unused until S1).
+        // Initial 1-bounce path sample, temporal + spatial reuse (spatial ends with the final-visibility
+        // trace), then demodulated shade. Returns the GI image handle (demodulated indirect-diffuse
+        // irradiance) consumed by GeometryPass. No-op handle when disabled / no TLAS. slimMotion feeds
+        // temporal reprojection.
         RG::ResourceHandle AddPasses(RG::RenderGraph& rg, RG::ResourceHandle sceneDepth,
                                      RG::ResourceHandle slimNormal, RG::ResourceHandle slimMotion);
 
@@ -56,14 +52,14 @@ namespace Luth
 
         // Debug-viz (ShadeMode::RestirGiReservoir): a fullscreen graphics pass heat-mapping the spatial
         // reservoir's M (confidence) + age (staleness) over LDR. Its own 1-set layout (b0 depth sampler,
-        // b1 spatial-reservoir SSBO — the buffer is CONCURRENT, so the graphics-queue read is sync-safe).
+        // b1 spatial-reservoir SSBO (the buffer is CONCURRENT, so the graphics-queue read is sync-safe)).
         VkDescriptorSetLayout GetReservoirVizLayout() const { return m_ReservoirVizSetLayout; }
         void WriteReservoirVizView(ViewResources& vr, FrameTargets& targets);
         RG::ResourceHandle AddReservoirVizPass(RG::RenderGraph& rg, RG::ResourceHandle ldrInput,
                                                RG::ResourceHandle sceneDepth);
 
-        // Per-view persistent reservoir buffer tag — Garlic large-tagged, freed only on resize. Reserved
-        // high range DISJOINT from DI's 0xFFFF0000 — both subsystems mint into the same heap.
+        // Per-view persistent reservoir buffer tag: Garlic large-tagged, freed only on resize. Reserved
+        // high range DISJOINT from DI's 0xFFFF0000; both subsystems mint into the same heap.
         u32 NextReservoirTag() { return m_NextTag++; }
 
         // Backed by RestirGiSettings::enabled on the RenderingSystem (the editor toggles the setting).
@@ -79,7 +75,7 @@ namespace Luth
         std::unique_ptr<VKComputePipeline> m_TemporalPipeline;
         std::unique_ptr<VKComputePipeline> m_SpatialPipeline;
         std::unique_ptr<VKComputePipeline> m_ShadePipeline;
-        std::unique_ptr<VKComputePipeline> m_UpscalePipeline;   // half-res GI bilateral upscale → full
+        std::unique_ptr<VKComputePipeline> m_UpscalePipeline;   // half-res GI bilateral upscale to full
 
         VkSampler             m_Sampler          = VK_NULL_HANDLE;
         VkDescriptorSetLayout m_SetLayout        = VK_NULL_HANDLE;   // Set 2 (pass-local)

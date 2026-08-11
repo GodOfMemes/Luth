@@ -4,15 +4,23 @@
 // Resource-agnostic: bindings (raster set 1/2 vs RT set 4/3) + the ITexFetch impls live in
 // material_bindings_{raster,rt}.slang so one decode serves both set layouts. see arch/rendering-pipeline.md
 
-// 80 B std430 — field-identical to C++ Material.h GPUMaterialData (MaterialLayoutGuard cross-checks).
+// 176 B std430, field-identical to C++ Material.h GPUMaterialData (MaterialLayoutGuard cross-checks).
 public struct GPUMaterialData
 {
     public float4 color;
     public uint   diffuseIndex, normalIndex, metalRoughIndex, occlusionIndex;
-    public uint   emissiveIndex, alphaIndex, specularIndex, thicknessIndex;  // alpha/spec/thickness reserved — unsampled
+    public uint   emissiveIndex, subsurfaceIndex, heightIndex, thicknessIndex;  // subsurface = SSS scatter mask; height feeds parallax; thickness scales the factor
     public float  metalness, roughness, alphaCutoff;
     public uint   flags;          // bits 0-7 = HAS_* per map; bits 16-23 = per-map UV index (2 bits each)
     public float4 emissive;       // rgb = factor (linear), a = HDR strength
+    public uint   decalIndex;     // decal RGBA (rgb color, a coverage); sampled by GraphDecal
+    public float  clearcoat, clearcoatRoughness;    // coat weight [0,1]; coat roughness (decode clamps [0.04,1])
+    public float  anisotropy, anisotropyRotation;   // [-1,1] mesh-tangent aligned; rotation turns [0,1] (x2pi)
+    public float  ior, transmission, thickness;     // dielectric IOR (>=1); transmission [0,1]; glTF thicknessFactor (raster Beer-Lambert proxy)
+    public float4 attenuation;                       // rgb = attenuationColor (linear), a = attenuationDistance (0 = off)
+    public float4 sheen;                             // rgb = sheenColor (linear, 0 = no sheen), a = sheenRoughness (perceptual)
+    public float4 subsurface;                        // rgb = subsurfaceColor (linear diffusion albedo A, 0 = no SSS), a = subsurfaceRadius (mfp, world units)
+    public float4 surfaceExt;                        // x = specular (dielectric F0 weight [0,1]); y = subsurfaceThickness (SSS thin-shell depth [0,1]); zw reserved
 }
 
 public static const uint FLAG_HAS_NORMAL     = (1u << 0);
@@ -20,6 +28,8 @@ public static const uint FLAG_HAS_METALROUGH = (1u << 1);
 public static const uint FLAG_HAS_OCCLUSION  = (1u << 2);
 public static const uint FLAG_HAS_DIFFUSE    = (1u << 3);
 public static const uint FLAG_HAS_EMISSIVE   = (1u << 4);
+public static const uint FLAG_HAS_SUBSURFACE = (1u << 5);
+public static const uint FLAG_HAS_THICKNESS  = (1u << 7);
 public static const uint UV_SHIFT_DIFFUSE    = 16u;
 public static const uint UV_SHIFT_NORMAL     = 18u;
 public static const uint UV_SHIFT_METALROUGH = 20u;
@@ -35,19 +45,35 @@ public float2 SelectUV(uint flags, uint shift, float2 uv0, float2 uv1)
 public static const uint GRAPH_VARIANT_SHIFT = 8u;
 public uint GraphVariant(uint flags) { return (flags >> GRAPH_VARIANT_SHIFT) & 0xFFu; }
 
-// Per-material graph-param stride (float4 slots/material). invariant: matches C++ Material.h MAT_GRAPH_STRIDE
-// — the fetch policy's paramBase = materialIndex * MAT_GRAPH_STRIDE indexes gMatParams, so drift cross-corrupts.
+// Per-material graph-param stride (float4 slots/material). invariant: matches C++ Material.h MAT_GRAPH_STRIDE;
+// the fetch policy's paramBase = materialIndex * MAT_GRAPH_STRIDE indexes gMatParams, so drift cross-corrupts.
 public static const uint MAT_GRAPH_STRIDE = 16u;
 
-// Bounded surface (Filament model, no escape hatch) — derivative/screen-space ops excluded by construction.
+// Per-material declared-texture stride (uint bindless indices/material). invariant: matches C++ MAT_TEX_STRIDE;
+// texBase = materialIndex * MAT_TEX_STRIDE indexes gMatTexParams. Lifts the fixed-8-map ceiling: a declared
+// TextureSample samples gTextures[gMatTexParams[texBase + slot]] via fetch.TexIndex.
+public static const uint MAT_TEX_STRIDE = 16u;
+
+// Bounded surface (Filament model, no escape hatch); derivative/screen-space ops excluded by construction.
 public struct MaterialInputs
 {
-    public float4 baseColor;   // straight alpha (color.a × diffuse.a); RT ignores .a
+    public float4 baseColor;   // straight alpha (color.a x diffuse.a); RT ignores .a
     public float3 normal;      // tangent-space normal, [-1,1], identity (0,0,1); caller applies the TBN + facing
     public float  metallic;
-    public float  roughness;   // clamped [0.04, 1] — zero roughness → NaN in GGX
+    public float  roughness;   // clamped [0.04, 1]; zero roughness -> NaN in GGX
+    public float  specular;    // dielectric F0 weight [0,1] (scales the IOR-derived base reflectance; metals unaffected)
     public float  occlusion;   // baked AO map term (screen-space AO is the caller's business)
     public float3 emissive;
+    public float  clearcoat, clearcoatRoughness;   // coat weight [0,1]; coat roughness clamped [0.04,1]
+    public float  anisotropy, anisotropyRotation;  // [-1,1] mesh-tangent aligned; rotation turns [0,1]
+    public float  transmission, ior, thickness;    // dielectric transmission [0,1]; IOR [1,4]; glass thickness (world units, raster path-length)
+    public float3 attenuationColor;                // Beer-Lambert interior tint (linear)
+    public float  attenuationDistance;             // distance at which transmittance == attenuationColor (0 = off)
+    public float3 sheenColor;                      // production-sheen reflectance (linear, 0 = no sheen)
+    public float  sheenRoughness;                  // sheen lobe roughness (perceptual; eval clamps [0.04,1])
+    public float3 subsurfaceColor;                 // SSS diffusion surface albedo A (linear, per-RGB; 0 = no SSS -> fast path)
+    public float  subsurfaceRadius;                // SSS mean-free-path (world units; the diffusion-profile width)
+    public float  subsurfaceThickness;             // SSS thin-shell back-scatter depth [0,1] (thin -> more translucent glow)
 }
 
 // The two-tier seam: raster auto-mips (derivatives), RT samples LOD 0 (no derivatives at a ray hit).
@@ -57,9 +83,25 @@ public interface ITexFetch
     // Per-material graph constant, paramBase-relative slot. Stock decode never calls it; generated
     // EvalGraph bodies read their canonical const slots through it (gMatParams, bound per tier).
     float4 Param(uint slot);
+    // Per-material declared-texture bindless index, texBase-relative slot. Generated EvalGraph bodies feed it
+    // to Sample for graph-declared textures (beyond the fixed 8 map fields); stock decode never calls it.
+    uint TexIndex(uint slot);
+    // Per-tier surface context for graph input nodes (WorldPos/ViewDir/Time/Fresnel). Stock decode never
+    // calls these; decode sites that can host graphs fill them (__init zeroes cover every stock site).
+    float3 WorldPos();
+    float3 ViewDir();   // toward the camera (RT: -rayDir)
+    float  Time();
+    float  NdotV();     // vertex/smooth normal (pre-normal-map) . ViewDir; graphed normals never feed back
+    float3 WorldNormal();   // world-space smooth normal, pre-perturb; Triplanar blend weights
+    // Tangent-space view dir (toward camera); parallax marches in this frame. Filled per tier from the
+    // local TBN at each graph-hosting decode site; __init straight-on (0,0,1) = zero parallax.
+    float3 TangentViewDir();
+    // Explicit-LOD sample. The parallax raymarch taps the height map at a fixed LOD in BOTH tiers: raster
+    // .Sample's implicit gradient is undefined under the divergent march loop, and RT has none at a hit.
+    float4 SampleLod(uint index, float2 uv, float lod);
 }
 
-// Channel decode — bit-identical between tiers modulo the Sample-vs-SampleLevel inside F. Leaves .normal
+// Channel decode: bit-identical between tiers modulo the Sample-vs-SampleLevel inside F. Leaves .normal
 // at identity (0,0,1); the caller applies the normal map / graph tangent normal through the TBN + facing.
 public MaterialInputs EvalMaterialChannels<F : ITexFetch>(GPUMaterialData m, float2 uv0, float2 uv1, F fetch)
 {
@@ -69,7 +111,7 @@ public MaterialInputs EvalMaterialChannels<F : ITexFetch>(GPUMaterialData m, flo
     if ((m.flags & FLAG_HAS_DIFFUSE) != 0u)
         mi.baseColor *= fetch.Sample(m.diffuseIndex, SelectUV(m.flags, UV_SHIFT_DIFFUSE, uv0, uv1));
 
-    // CONTRACT: emissive radiance = factor(linear) × strength, modulated by the emissive texture (UV0 —
+    // CONTRACT: emissive radiance = factor(linear) x strength, modulated by the emissive texture (UV0,
     // emissive has no UV-set bit). Identical on both tiers. see arch/rendering-pipeline.md
     mi.emissive = m.emissive.rgb * m.emissive.a;
     if ((m.flags & FLAG_HAS_EMISSIVE) != 0u)
@@ -85,31 +127,77 @@ public MaterialInputs EvalMaterialChannels<F : ITexFetch>(GPUMaterialData m, flo
         mi.metallic  = mr.b;
     }
     mi.roughness = clamp(mi.roughness, 0.04, 1.0);
+    mi.specular  = clamp(m.surfaceExt.x, 0.0, 1.0);   // dielectric F0 weight; the F0 lerp targets albedo at metallic=1, so metals ignore it
 
     mi.occlusion = 1.0;
     if ((m.flags & FLAG_HAS_OCCLUSION) != 0u)
         mi.occlusion = fetch.Sample(m.occlusionIndex, SelectUV(m.flags, UV_SHIFT_OCCLUSION, uv0, uv1)).r;
 
+    // Shading-model factors: constant channels today (no maps in v1), clamped identically on both tiers.
+    mi.clearcoat          = m.clearcoat;
+    mi.clearcoatRoughness = clamp(m.clearcoatRoughness, 0.04, 1.0);
+    mi.anisotropy         = clamp(m.anisotropy, -1.0, 1.0);
+    mi.anisotropyRotation = m.anisotropyRotation;
+
+    // CONTRACT: transmission/ior/thickness/attenuation feed the dielectric lobe (brdf.slang) and the PT
+    // Beer-Lambert medium (path_trace.slang): sigma_a = -ln(max(attenuationColor,1e-5)) / attenuationDistance;
+    // attenuationDistance <= 0 disables interior absorption. Filled identically on both tiers. see arch/rendering-pipeline.md
+    mi.transmission        = clamp(m.transmission, 0.0, 1.0);
+    mi.ior                 = clamp(m.ior, 1.0, 4.0);
+    mi.thickness           = max(m.thickness, 0.0);        // glass volume (world units); raster Beer-Lambert path length
+    mi.subsurfaceThickness = max(m.surfaceExt.y, 0.0);     // SSS thin-shell depth; separate quantity, but shares the thickness map below
+    if ((m.flags & FLAG_HAS_THICKNESS) != 0u)
+    {
+        float tMap = fetch.Sample(m.thicknessIndex, uv0).r;   // UV0, like emissive (no UV-set bit); one map scales both thicknesses
+        mi.thickness           *= tMap;
+        mi.subsurfaceThickness *= tMap;
+    }
+    mi.attenuationColor    = clamp(m.attenuation.rgb, 0.0, 1.0);
+    mi.attenuationDistance = m.attenuation.a;
+
+    // Sheen: color clamped [0,1] (reflectance), roughness clamped [0.04,1] (coat-style). At sheenColor == 0
+    // the BRDF fast path is taken, so a sheen-free material shades bit-identically. see arch/rendering-pipeline.md
+    mi.sheenColor      = clamp(m.sheen.rgb, 0.0, 1.0);
+    mi.sheenRoughness  = clamp(m.sheen.a, 0.04, 1.0);
+
+    // Subsurface: diffusion surface albedo A + scatter radius (mfp), the color modulated by the scatter
+    // mask (UV0, like emissive) BEFORE the fold. Folding (1-metallic)(1-transmission) hard-disables SSS on
+    // metals + glass identically in every consumer (raster==RT); 0 = BRDF fast path. see arch/rendering-pipeline.md
+    mi.subsurfaceColor = clamp(m.subsurface.rgb, 0.0, 1.0);
+    if ((m.flags & FLAG_HAS_SUBSURFACE) != 0u)
+        mi.subsurfaceColor *= fetch.Sample(m.subsurfaceIndex, uv0).rgb;
+    mi.subsurfaceColor = mi.subsurfaceColor * (1.0 - mi.metallic) * (1.0 - mi.transmission);
+    mi.subsurfaceRadius = max(m.subsurface.a, 0.0);
+
     mi.normal = float3(0.0, 0.0, 1.0);
     return mi;
 }
 
-// Tangent-space normal → world via the surface basis (explicit column combo, layout-independent).
+// Tangent-space normal -> world via the surface basis (explicit column combo, layout-independent).
 // Identity (0,0,1) returns N exactly, so a flat/unperturbed tangent normal is a no-op.
 public float3 ApplyTangentNormal(float3 tn, float3 T, float3 B, float3 N)
 {
     return normalize(T * tn.x + B * tn.y + N * tn.z);
 }
 
+// Decode a tangent-space normal from a sampled texel: XY from the stored RG, Z reconstructed. Makes BC5
+// (RG only, B samples 0) and RGB normal maps decode identically -- valid for any unit-length map.
+public float3 DecodeTangentNormal(float3 sampled)
+{
+    float2 xy = sampled.xy * 2.0 - 1.0;
+    float z = sqrt(saturate(1.0 - dot(xy, xy)));
+    return float3(xy, z);
+}
+
 // Normal-map perturb (decode + basis); caller guards HAS_NORMAL + tangent.
 public float3 ApplyNormalMap<F : ITexFetch>(GPUMaterialData m, float2 uv0, float2 uv1,
                                             float3 T, float3 B, float3 N, F fetch)
 {
-    float3 tn = fetch.Sample(m.normalIndex, SelectUV(m.flags, UV_SHIFT_NORMAL, uv0, uv1)).rgb * 2.0 - 1.0;
+    float3 tn = DecodeTangentNormal(fetch.Sample(m.normalIndex, SelectUV(m.flags, UV_SHIFT_NORMAL, uv0, uv1)).rgb);
     return ApplyTangentNormal(tn, T, B, N);
 }
 
-// Affine remap with (inMin, inMax, outMin, outMax) packed in p — a Remap graph node lowers to this over a
+// Affine remap with (inMin, inMax, outMin, outMax) packed in p: a Remap graph node lowers to this over a
 // per-material param, so editing its range is data, not a recompile. Degenerate range collapses to 0 scale.
 public float4 RemapApply(float4 v, float4 p)
 {
@@ -119,42 +207,64 @@ public float4 RemapApply(float4 v, float4 p)
     return v * scale + float4(bias);
 }
 
-// ── RT geometry-table deref ──────────────────────────────────────────────────────────────────────
-// TLAS visibility masks — mirror TlasBuilder.cpp's instance masks. Shadow-class rays cull to SOLID (glass
+// ---- RT geometry-table deref ----
+// TLAS visibility masks mirror TlasBuilder.cpp's instance masks. Shadow-class rays cull to SOLID (glass
 // never blocks light); world-class rays trace ALL and commit glass as a surface. see arch/rendering-pipeline.md
 public static const uint GT_VIS_SOLID = 0x01u;
 public static const uint GT_VIS_ALL   = 0x03u;
 
-// Raw BDA pointers (buffer_reference2 equiv). Mirrors TlasBuilder's GPUGeometryEntry — 24 B, static_assert'd C++-side.
+// Raw BDA pointers (buffer_reference2 equiv). Mirrors TlasBuilder's GPUGeometryEntry: 24 B, static_assert'd C++-side.
 public struct GtGeomEntry
 {
     public float* vbuf;
     public uint*  ibuf;
     public uint   materialSlot;
-    public uint   vertexStride;   // bytes
+    public uint   vertexStride;   // bytes; bit 31 = emissive-area-light flag (masked before the >>2 stride use)
 }
 
-// Surface geometry at a rayQuery COMMITTED hit — pre-normal-map (the wrapper perturbs ns afterward).
+// Bit 31 of vertexStride flags an emissive AREA LIGHT (set by TlasBuilder when the feature + ReSTIR DI are
+// on). ReSTIR DI owns such an emitter's direct lighting, so restir_gi_initial drops its on-hit emission seed.
+public bool GtIsEmissiveLight(GtGeomEntry ge) { return (ge.vertexStride & 0x80000000u) != 0u; }
+
+// Surface geometry at a rayQuery COMMITTED hit, pre-normal-map (the wrapper perturbs ns afterward).
 public struct HitGeometry
 {
     public float3 ng;          // geometric (face) normal, faced against the ray
     public float3 ns;          // smooth shading normal (inverse-transpose), pre-perturb
     public float3 T;           // world tangent, Gram-Schmidt vs ns (valid iff hasTangent)
+    public float  tSign;       // bitangent handedness sign (Vertex tangent.w); constant per triangle
     public float2 uv0, uv1;
+    public float3 color;       // per-vertex color (linear RGB), barycentric; multiplied into baseColor
     public uint   materialSlot;
     public bool   hasTangent;
 }
 
-// Resolved RT hit surface — same field shape the GLSL FetchHitSurface returned, so RT consumers port 1:1.
+// Resolved RT hit surface: same field shape the GLSL FetchHitSurface returned, so RT consumers port 1:1.
+// The tangent (T/tSign/hasTangent, from HitGeometry) rides along for the anisotropic base lobe; clear-coat/
+// anisotropy factors carry from the decode so the PathTrace reference shades them raster==RT.
 public struct HitSurface
 {
     public float3 ns, ng;
     public float3 baseColor;
     public float3 emission;
     public float  metalness, roughness, ao;
+    public float  specular;   // dielectric F0 weight [0,1] (base reflectance; the F0 lerp targets albedo at metallic=1)
+    public float3 T;          // world tangent, Gram-Schmidt vs pre-perturb ns (valid iff hasTangent)
+    public float  tSign;      // bitangent handedness
+    public bool   hasTangent;
+    public float  clearcoat, clearcoatRoughness, anisotropy, anisotropyRotation;
+    public float  transmission, ior;   // glass thickness unused at RT hits (medium absorption uses the geometric ray length)
+    public float3 attenuationColor;
+    public float  attenuationDistance;
+    public float3 sheenColor;
+    public float  sheenRoughness;
+    public float3 subsurfaceColor;
+    public float  subsurfaceRadius;
+    public float  subsurfaceThickness;   // SSS thin-shell back-scatter depth [0,1]
+    public bool   frontFace;   // ray hit the outward (entering) side; from the un-faced geometric normal
 }
 
-// Slang has no inverse() (HLSL lineage) — cofactor 3x3; feeds only the inverse-transpose normal matrix.
+// Slang has no inverse() (HLSL lineage); cofactor 3x3, feeds only the inverse-transpose normal matrix.
 float3x3 Inverse3x3(float3x3 m)
 {
     float3 a = float3(m[0][0], m[1][0], m[2][0]);
@@ -167,21 +277,21 @@ float3x3 Inverse3x3(float3x3 m)
     return float3x3(r0 * invDet, r1 * invDet, r2 * invDet);
 }
 
-// Geometry half of the old FetchHitSurface — positions/normals/tangent/UVs from the barycentric BDA fetch.
+// Geometry half of the old FetchHitSurface: positions/normals/tangent/UVs from the barycentric BDA fetch.
 public HitGeometry GatherHitGeometry(GtGeomEntry* geomTable, uint customIndex, uint primIndex,
                                      float2 bary, float3x4 o2w, float3 rayDir)
 {
     HitGeometry g;
     GtGeomEntry ge = geomTable[customIndex];
     g.materialSlot = ge.materialSlot;
-    uint sF = ge.vertexStride >> 2u;     // stride in floats (52→13, 84→21)
+    uint sF = (ge.vertexStride & 0x7FFFFFFFu) >> 2u;   // mask bit 31 (emissive-light flag); floats (72->18, 104->26)
     uint i0 = ge.ibuf[primIndex * 3u + 0u];
     uint i1 = ge.ibuf[primIndex * 3u + 1u];
     uint i2 = ge.ibuf[primIndex * 3u + 2u];
 
     float3 wgt = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
 
-    // Geometric (face) normal — cross of world-space edges, faced against the ray.
+    // Geometric (face) normal: cross of world-space edges, faced against the ray.
     float3 p0 = float3(ge.vbuf[i0*sF + 0u], ge.vbuf[i0*sF + 1u], ge.vbuf[i0*sF + 2u]);
     float3 p1 = float3(ge.vbuf[i1*sF + 0u], ge.vbuf[i1*sF + 1u], ge.vbuf[i1*sF + 2u]);
     float3 p2 = float3(ge.vbuf[i2*sF + 0u], ge.vbuf[i2*sF + 1u], ge.vbuf[i2*sF + 2u]);
@@ -191,7 +301,7 @@ public HitGeometry GatherHitGeometry(GtGeomEntry* geomTable, uint customIndex, u
     g.ng = normalize(cross(wp1 - wp0, wp2 - wp0));
     if (dot(g.ng, rayDir) > 0.0) g.ng = -g.ng;
 
-    // Smooth shading normal — barycentric vertex normals (floats 3-5), inverse-transpose object→world.
+    // Smooth shading normal: barycentric vertex normals (floats 3-5), inverse-transpose object->world.
     float3 vn0 = float3(ge.vbuf[i0*sF + 3u], ge.vbuf[i0*sF + 4u], ge.vbuf[i0*sF + 5u]);
     float3 vn1 = float3(ge.vbuf[i1*sF + 3u], ge.vbuf[i1*sF + 4u], ge.vbuf[i1*sF + 5u]);
     float3 vn2 = float3(ge.vbuf[i2*sF + 3u], ge.vbuf[i2*sF + 4u], ge.vbuf[i2*sF + 5u]);
@@ -200,13 +310,14 @@ public HitGeometry GatherHitGeometry(GtGeomEntry* geomTable, uint customIndex, u
     g.ns = mul(nrmM, nsObj);
     g.ns = (dot(g.ns, g.ns) > 1.0e-12) ? normalize(g.ns) : g.ng;
 
-    // Object-space vertex tangent (floats 10-12) → world, Gram-Schmidt vs ns. Tangentless meshes skip
+    // Object-space vertex tangent (floats 10-12) -> world, Gram-Schmidt vs ns. Tangentless meshes skip
     // the normal map (guard) so they can't poison accumulation.
     float3 vt0 = float3(ge.vbuf[i0*sF + 10u], ge.vbuf[i0*sF + 11u], ge.vbuf[i0*sF + 12u]);
     float3 vt1 = float3(ge.vbuf[i1*sF + 10u], ge.vbuf[i1*sF + 11u], ge.vbuf[i1*sF + 12u]);
     float3 vt2 = float3(ge.vbuf[i2*sF + 10u], ge.vbuf[i2*sF + 11u], ge.vbuf[i2*sF + 12u]);
     float3 tanObj = wgt.x * vt0 + wgt.y * vt1 + wgt.z * vt2;
     g.hasTangent = dot(tanObj, tanObj) > 1.0e-12;
+    g.tSign = ge.vbuf[i0*sF + 13u];   // handedness sign, constant per triangle -> single-vertex read
     float3 Tw = normalize(mul((float3x3)o2w, tanObj));
     g.T = normalize(Tw - dot(Tw, g.ns) * g.ns);
 
@@ -217,10 +328,17 @@ public HitGeometry GatherHitGeometry(GtGeomEntry* geomTable, uint customIndex, u
     g.uv1 = wgt.x * float2(ge.vbuf[i0*sF + 8u], ge.vbuf[i0*sF + 9u])
           + wgt.y * float2(ge.vbuf[i1*sF + 8u], ge.vbuf[i1*sF + 9u])
           + wgt.z * float2(ge.vbuf[i2*sF + 8u], ge.vbuf[i2*sF + 9u]);
+
+    // Per-vertex color (floats 14-16), barycentric; alpha (float 17) unused since RT baseColor is RGB.
+    // Color sits at float 14 in both the 18-float Vertex and 26-float SkinnedVertex layouts (shared prefix).
+    float3 vc0 = float3(ge.vbuf[i0*sF + 14u], ge.vbuf[i0*sF + 15u], ge.vbuf[i0*sF + 16u]);
+    float3 vc1 = float3(ge.vbuf[i1*sF + 14u], ge.vbuf[i1*sF + 15u], ge.vbuf[i1*sF + 16u]);
+    float3 vc2 = float3(ge.vbuf[i2*sF + 14u], ge.vbuf[i2*sF + 15u], ge.vbuf[i2*sF + 16u]);
+    g.color = wgt.x * vc0 + wgt.y * vc1 + wgt.z * vc2;
     return g;
 }
 
-// Barycentric UV for the cutout alpha test (TexCoord0@6 / TexCoord1@8) — the slice the candidate loop needs.
+// Barycentric UV for the cutout alpha test (TexCoord0@6 / TexCoord1@8): the slice the candidate loop needs.
 public float2 AlphaTestUV(GtGeomEntry* geomTable, uint customIndex, uint primIndex, float2 bary, uint uvSet)
 {
     GtGeomEntry ge = geomTable[customIndex];

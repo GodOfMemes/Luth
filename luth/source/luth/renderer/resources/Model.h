@@ -23,15 +23,19 @@ namespace Luth
         Vec3 Normal;
         Vec2 TexCoord0;
         Vec2 TexCoord1;
-        Vec3 Tangent;
+        Vec4 Tangent = Vec4(0.0f, 0.0f, 0.0f, 1.0f);   // xyz tangent, w = bitangent handedness sign (+/-1)
+        Vec4 Color   = Vec4(1.0f);                     // linear RGBA vertex color, white = neutral
     };
 
     struct SkinnedVertex {
+        // Geometry prefix stays byte-identical to Vertex so the deform/skin seam and the RT geometry table
+        // read one interleaved layout; the bone attributes follow it.
         Vec3  Position;
         Vec3  Normal;
         Vec2  TexCoord0;
         Vec2  TexCoord1;
-        Vec3  Tangent;
+        Vec4  Tangent = Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+        Vec4  Color   = Vec4(1.0f);
         IVec4 BoneIDs    = IVec4(-1);
         Vec4  BoneWeights = Vec4(0.0f);
     };
@@ -82,8 +86,8 @@ namespace Luth
         std::vector<AnimationInfo> Animations;
     };
 
-    // V4 scene-graph import (static models only; skinned models reconstruct hierarchy from the
-    // skeleton instead). Nodes are topological (parent before child); transforms are LOCAL — the
+    // Scene-graph import (static models only; skinned models reconstruct hierarchy from the
+    // skeleton instead). Nodes are topological (parent before child); transforms are LOCAL; the
     // instantiated entity tree composes world transforms. MeshIndices reference the Model's meshes;
     // CameraIndex/LightIndex address the Cameras/Lights arrays (-1 = none).
     struct ModelNode {
@@ -117,7 +121,7 @@ namespace Luth
     class Model : public Asset
     {
     public:
-        struct CreateParams; // Forward decl
+        struct CreateParams;
 
         virtual AssetType GetType() const override { return AssetType::Model; }
         
@@ -144,14 +148,14 @@ namespace Luth
         bool IsSkinned() const { return m_IsSkinned; }
         void SetIsSkinned(bool value) { m_IsSkinned = value; }
 
-        // Skeleton & Animation. Clips are first-class assets — lookup via
-        // AssetManager::GetAsset<AnimationClip>(uuid) using indices into the UUID list.
+        // Skeleton & Animation. Clips are first-class assets; lookup via AssetManager::GetAsset<AnimationClip>(uuid)
+        // using indices into the UUID list.
         const Skeleton& GetSkeleton() const { return m_Skeleton; }
         Skeleton& GetSkeleton() { return m_Skeleton; }
         const std::vector<UUID>& GetAnimationClipUUIDs() const { return m_AnimationClipUUIDs; }
         std::vector<UUID>& GetAnimationClipUUIDs() { return m_AnimationClipUUIDs; }
 
-        // V4 scene graph (static models). Empty for skinned models — gate reads via HasNodeTree().
+        // Scene graph (static models). Empty for skinned models; gate reads via HasNodeTree().
         void SetSceneGraph(std::vector<ModelNode> nodes, std::vector<ModelCamera> cameras,
             std::vector<ModelLight> lights) {
             m_Nodes = std::move(nodes); m_Cameras = std::move(cameras); m_Lights = std::move(lights);

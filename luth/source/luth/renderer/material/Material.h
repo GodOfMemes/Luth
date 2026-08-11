@@ -25,10 +25,13 @@ namespace Luth
         Normal      = 2,
         Metalness   = 3,
         Roughness   = 4,
-        Specular    = 5,
+        Specular    = 5,   // legacy spec-gloss (baked to metal-rough at import, unsampled); kept for .mat back-compat
         Occlusion   = 6,
         Emissive    = 7,
-        Thickness   = 8
+        Thickness   = 8,
+        Height      = 9,   // parallax-occlusion displacement -> GPUMaterialData::heightIndex
+        Decal       = 10,  // UV-space decal RGBA -> GPUMaterialData::decalIndex
+        Subsurface  = 11   // SSS scatter mask (modulates subsurfaceColor) -> GPUMaterialData::subsurfaceIndex
     };
 
     struct MapInfo {
@@ -42,29 +45,28 @@ namespace Luth
         u32 bindlessIndex = 0; 
     };
 
-    // GPU-friendly Material Data Structure (Std140/Std430)
-    // This matches the shader struct.
+    // GPU-friendly material data (std430); must match the shader-side struct.
     //
     // flags layout (u32):
     //   bits 0-7   : HAS_* per map (NORMAL=0, METALROUGH=1, OCCLUSION=2, DIFFUSE=3,
-    //                EMISSIVE=4, ALPHA=5, SPECULAR=6, THICKNESS=7)
+    //                EMISSIVE=4, SUBSURFACE=5, HEIGHT=6, THICKNESS=7)
     //   bits 8-15  : node-graph eval variant (0 = stock decode; RT megakernel dispatch)
-    //   bits 16-23 : UV index per map (2 bits each — DIFFUSE@16, NORMAL@18,
+    //   bits 16-23 : UV index per map (2 bits each: DIFFUSE@16, NORMAL@18,
     //                METALROUGH@20, OCCLUSION@22)
     //   bits 24-31 : reserved
     struct GPUMaterialData
     {
         Vec4 color = { 1.0f, 1.0f, 1.0f, 1.0f };
 
-        // Texture Indices (Bindless — slot 0 = reserved null/white)
+        // Texture Indices (Bindless; slot 0 = reserved null/white)
         u32 diffuseIndex = 0;
         u32 normalIndex = 0;
         u32 metalRoughIndex = 0;
         u32 occlusionIndex = 0;
         u32 emissiveIndex = 0;
-        u32 alphaIndex = 0;      // reserved — written by UpdateGPUData, unsampled by any shader
-        u32 specularIndex = 0;   // (no dedicated-opacity / spec-gloss / thickness-SSS path yet)
-        u32 thicknessIndex = 0;
+        u32 subsurfaceIndex = 0; // SSS scatter-mask map (repurposed the dead alpha slot); modulates subsurfaceColor
+        u32 heightIndex = 0;     // parallax displacement map (repurposed the dead specular slot); sampled by GraphParallax
+        u32 thicknessIndex = 0;  // translucency thickness map (R); scales the thickness factor
 
         // Factors
         f32 metalness = 0.0f;
@@ -75,15 +77,52 @@ namespace Luth
         // Emissive: rgb = factor (linear), a = HDR strength. Emission = rgb * a, modulated by the
         // emissive texture when FLAG_HAS_EMISSIVE is set. Byte 64, std430 vec4-aligned (no padding).
         Vec4 emissive = { 0.0f, 0.0f, 0.0f, 1.0f };
-    };
-    // std430 layout must stay byte-identical to material.slang's GPUMaterialData — MaterialLayoutGuard
-    // cross-checks the field offsets at init; a desync silently corrupts every material index > 0.
-    static_assert(sizeof(GPUMaterialData) == 80, "GPUMaterialData std430 layout must stay 80 B");
 
-    // Per-material graph-constant stride (float4 slots/material). invariant: matches material.slang MAT_GRAPH_STRIDE
-    // — shader paramBase = materialIndex * MAT_GRAPH_STRIDE indexes gMatParams; drift cross-corrupts. Bounds value nodes.
+        // Decal RGBA (rgb color, a coverage); sampled by GraphDecal. decalIndex@80.
+        u32 decalIndex = 0;
+
+        // Shading-model factors (all default-inert). clearcoat@84 weight [0,1]; clearcoatRoughness@88
+        // perceptual (decode clamps [0.04,1]); anisotropy@92 [-1,1] (mesh-tangent aligned); anisotropyRotation@96
+        // turns [0,1] (x2pi in shader).
+        f32 clearcoat = 0.0f;
+        f32 clearcoatRoughness = 0.0f;
+        f32 anisotropy = 0.0f;
+        f32 anisotropyRotation = 0.0f;
+
+        // Dielectric transmission (glTF KHR_materials_transmission + _volume). ior@100 (>=1); transmission@104
+        // [0,1]; thickness@108 (glTF thicknessFactor, raster Beer-Lambert path-length proxy); attenuation@112
+        // vec4 (rgb = attenuationColor linear, a = attenuationDistance, 0 = off).
+        f32  ior = 1.5f;
+        f32  transmission = 0.0f;
+        f32  thickness = 0.0f;
+        Vec4 attenuation = { 1.0f, 1.0f, 1.0f, 0.0f };
+
+        // Sheen (Estevez-Kulla production cloth). sheen@128 vec4: rgb = sheenColor (linear, 0 = no sheen,
+        // takes the BRDF fast path), a = sheenRoughness (perceptual; eval clamps [0.04,1]).
+        Vec4 sheen = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+        // Subsurface (SSS). subsurface@144 vec4: rgb = subsurfaceColor (linear diffusion albedo A, 0 = no
+        // SSS -> BRDF fast path), a = subsurfaceRadius (mean-free-path, world units).
+        Vec4 subsurface = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+        // Extended surface scalars. surfaceExt@160 vec4: x = specular (dielectric F0 weight [0,1], default 1
+        // = identity; scales the IOR-derived base reflectance), y = subsurfaceThickness (SSS thin-shell depth
+        // [0,1], split off the glass thickness above), zw reserved. Struct rounds to 176.
+        Vec4 surfaceExt = { 1.0f, 0.0f, 0.0f, 0.0f };
+    };
+    // std430 layout must stay byte-identical to material.slang's GPUMaterialData; MaterialLayoutGuard
+    // cross-checks the field offsets at init; a desync silently corrupts every material index > 0.
+    static_assert(sizeof(GPUMaterialData) == 176, "GPUMaterialData std430 layout must stay 176 B");
+
+    // Per-material graph-constant stride (float4 slots/material). invariant: matches material.slang MAT_GRAPH_STRIDE;
+    // shader paramBase = materialIndex * MAT_GRAPH_STRIDE indexes gMatParams; drift cross-corrupts. Bounds value nodes.
     inline constexpr u32 MAT_GRAPH_STRIDE = 16;
-    static_assert(sizeof(Vec4) == 16, "gMatParams is StructuredBuffer<float4> — Vec4 must be 16 B std430");
+    static_assert(sizeof(Vec4) == 16, "gMatParams is StructuredBuffer<float4> - Vec4 must be 16 B std430");
+
+    // Per-material declared-texture stride (u32 bindless indices/material). invariant: matches material.slang
+    // MAT_TEX_STRIDE; the fetch policy's texBase = materialIndex * MAT_TEX_STRIDE indexes gMatTexParams. Bounds
+    // declared textures (overflow renders stock, mirroring the value-node cap).
+    inline constexpr u32 MAT_TEX_STRIDE = 16;
 
     class Material : public Asset
     {
@@ -107,7 +146,7 @@ namespace Luth
         void SetGraphShaderUUID(const UUID& uuid) { m_GraphShaderUUID = uuid; }
 
         // Generated Lambert-over-graph fragment for the editor thumbnail/inspector preview (PreviewFetch
-        // tier — self-contained UBO). Invalid = the preview falls back to the stock Lambert shader.
+        // tier, self-contained UBO). Invalid = the preview falls back to the stock Lambert shader.
         UUID GetGraphPreviewShaderUUID() const { return m_GraphPreviewShaderUUID; }
         void SetGraphPreviewShaderUUID(const UUID& uuid) { m_GraphPreviewShaderUUID = uuid; }
 
@@ -123,10 +162,15 @@ namespace Luth
         void SetGraph(MaterialGraph graph) { m_Graph = std::move(graph); }
         bool HasGraph() const { return !m_Graph.Empty(); }
 
-        // Cached graph constants in canonical codegen order — the float4 the generated EvalGraph reads via
+        // Cached graph constants in canonical codegen order: the float4 the generated EvalGraph reads via
         // fetch.Param(k). Rebuilt off-frame on edit, memcpy'd into gMatParams each frame; empty for non-graph.
         const std::vector<Vec4>& GetGraphParams() const { return m_GraphParams; }
         void SetGraphParams(std::vector<Vec4> params) { m_GraphParams = std::move(params); }
+
+        // Declared-texture property ids in canonical codegen order (structure-derived, set at codegen); resolved
+        // per frame to bindless indices in m_GraphTexParams, memcpy'd into gMatTexParams. Empty for non-graph.
+        void SetGraphTexSlots(std::vector<u32> slots) { m_GraphTexSlots = std::move(slots); }
+        const std::vector<u32>& GetGraphTexParams() const { return m_GraphTexParams; }
 
         // Map management
         void AddTexture(const MapInfo& texture) { m_Maps.push_back(texture); }
@@ -224,21 +268,63 @@ namespace Luth
 
         const std::vector<uint8_t>& GetUniformStorage() const { return m_UniformStorage; }
         
-        // Albedo color (direct access — bypasses uniform storage)
+        // Albedo color (direct access; bypasses uniform storage)
         Vec4 GetColor() const { return m_GPUData.color; }
         void SetColor(const Vec4& color) { m_GPUData.color = color; }
 
-        // Emissive (direct access — same pattern as color). rgb = linear factor, a = HDR strength.
+        // Emissive (direct access; same pattern as color). rgb = linear factor, a = HDR strength.
         Vec3 GetEmissiveColor() const { return Vec3(m_GPUData.emissive); }
         void SetEmissiveColor(const Vec3& c) { m_GPUData.emissive = Vec4(c, m_GPUData.emissive.a); }
         f32  GetEmissiveStrength() const { return m_GPUData.emissive.a; }
         void SetEmissiveStrength(f32 s) { m_GPUData.emissive.a = s; }
 
-        // Metalness / roughness (direct access — like color/emissive; the u_* uniform channel is dead).
+        // Metalness / roughness (direct access, like color/emissive; the u_* uniform channel is dead).
         f32  GetMetalness() const { return m_GPUData.metalness; }
         void SetMetalness(f32 m) { m_GPUData.metalness = m; }
         f32  GetRoughness() const { return m_GPUData.roughness; }
         void SetRoughness(f32 r) { m_GPUData.roughness = r; }
+
+        // Clear-coat / anisotropy shading-model factors (direct GPUData fields, like metalness/roughness).
+        f32  GetClearcoat() const { return m_GPUData.clearcoat; }
+        void SetClearcoat(f32 c) { m_GPUData.clearcoat = c; }
+        f32  GetClearcoatRoughness() const { return m_GPUData.clearcoatRoughness; }
+        void SetClearcoatRoughness(f32 r) { m_GPUData.clearcoatRoughness = r; }
+        f32  GetAnisotropy() const { return m_GPUData.anisotropy; }
+        void SetAnisotropy(f32 a) { m_GPUData.anisotropy = a; }
+        f32  GetAnisotropyRotation() const { return m_GPUData.anisotropyRotation; }
+        void SetAnisotropyRotation(f32 r) { m_GPUData.anisotropyRotation = r; }
+
+        // Dielectric transmission factors (direct GPUData fields). attenuationColor = attenuation.rgb.
+        f32  GetIor() const { return m_GPUData.ior; }
+        void SetIor(f32 v) { m_GPUData.ior = v; }
+        f32  GetTransmission() const { return m_GPUData.transmission; }
+        void SetTransmission(f32 v) { m_GPUData.transmission = v; }
+        f32  GetThickness() const { return m_GPUData.thickness; }
+        void SetThickness(f32 v) { m_GPUData.thickness = v; }
+        Vec3 GetAttenuationColor() const { return Vec3(m_GPUData.attenuation); }
+        void SetAttenuationColor(const Vec3& c) { m_GPUData.attenuation.x = c.x; m_GPUData.attenuation.y = c.y; m_GPUData.attenuation.z = c.z; }
+        f32  GetAttenuationDistance() const { return m_GPUData.attenuation.w; }
+        void SetAttenuationDistance(f32 d) { m_GPUData.attenuation.w = d; }
+
+        // Sheen cloth factors (direct GPUData fields). sheenColor = sheen.rgb, sheenRoughness = sheen.a.
+        Vec3 GetSheenColor() const { return Vec3(m_GPUData.sheen); }
+        void SetSheenColor(const Vec3& c) { m_GPUData.sheen.x = c.x; m_GPUData.sheen.y = c.y; m_GPUData.sheen.z = c.z; }
+        f32  GetSheenRoughness() const { return m_GPUData.sheen.w; }
+        void SetSheenRoughness(f32 r) { m_GPUData.sheen.w = r; }
+
+        // Subsurface (SSS) factors (direct GPUData fields). subsurfaceColor = subsurface.rgb, subsurfaceRadius = subsurface.a,
+        // subsurfaceThickness = surfaceExt.y (thin-shell back-scatter depth, split from the glass thickness factor).
+        Vec3 GetSubsurfaceColor() const { return Vec3(m_GPUData.subsurface); }
+        void SetSubsurfaceColor(const Vec3& c) { m_GPUData.subsurface.x = c.x; m_GPUData.subsurface.y = c.y; m_GPUData.subsurface.z = c.z; }
+        f32  GetSubsurfaceRadius() const { return m_GPUData.subsurface.w; }
+        void SetSubsurfaceRadius(f32 r) { m_GPUData.subsurface.w = r; }
+        f32  GetSubsurfaceThickness() const { return m_GPUData.surfaceExt.y; }
+        void SetSubsurfaceThickness(f32 t) { m_GPUData.surfaceExt.y = t; }
+
+        // Dielectric specular F0 weight [0,1] (direct GPUData field; surfaceExt.x). Scales the IOR-derived base
+        // reflectance; 1 = physical default (no attenuation), metals unaffected (the F0 lerp targets albedo).
+        f32  GetSpecular() const { return m_GPUData.surfaceExt.x; }
+        void SetSpecular(f32 s) { m_GPUData.surfaceExt.x = s; }
 
         // GPU Data Access
         const GPUMaterialData& GetGPUData() const { return m_GPUData; }
@@ -268,13 +354,14 @@ namespace Luth
         MaterialGraph m_Graph;                      // authoring source; empty = plain material
         u32 m_GraphVariant = 0;                     // RT eval-variant (0 = stock); packed into flags 8-15
         std::vector<Vec4> m_GraphParams;            // codegen-ordered graph constants (gMatParams upload source)
+        std::vector<u32>  m_GraphTexSlots;          // canonical slot -> declared-texture property id (structure-derived)
+        std::vector<u32>  m_GraphTexParams;         // per-frame resolved bindless indices (gMatTexParams upload source)
         std::vector<uint8_t> m_UniformStorage;
         // Temporary storage for deserialization if shader is not loaded yet
         nlohmann::json m_CachedUniformJSON;
 
         std::vector<MapInfo> m_Maps;
-        
-        // Cached GPU Data
+
         GPUMaterialData m_GPUData;
 
         RenderMode m_RenderMode = RenderMode::Opaque;

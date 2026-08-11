@@ -17,17 +17,21 @@
 #include "luth/renderer/backend/vulkan/UploadContext.h"
 #include "luth/core/time/Time.h"
 
+#include <emmintrin.h> // _mm_pause (main-thread wait spin)
+
 namespace Luth
 {
     std::unordered_map<UUID, std::shared_ptr<Asset>, UUIDHash> AssetManager::s_Assets;
     std::unordered_set<UUID, UUIDHash> AssetManager::s_LoadingAssets;
+    std::unordered_set<UUID, UUIDHash> AssetManager::s_ImportingAssets;
     std::unordered_map<AssetType, std::unique_ptr<AssetImporter>> AssetManager::s_Importers;
     std::mutex AssetManager::s_AssetMutex;
     std::mutex AssetManager::s_UploadMutex;
+    std::mutex AssetManager::s_ImportMutex;
     std::vector<AssetManager::PendingUpload> AssetManager::s_UploadQueue;
 
     static float s_GCTimer = 0.0f;
-    static const float k_GCInterval = 2.0f; // Run GC every 2 seconds
+    static const float k_GCInterval = 2.0f; // seconds
 
     void AssetManager::Init()
     {
@@ -43,6 +47,7 @@ namespace Luth
     {
         s_Assets.clear();
         s_LoadingAssets.clear();
+        s_ImportingAssets.clear();
         s_Importers.clear();
         s_UploadQueue.clear();
     }
@@ -52,7 +57,6 @@ namespace Luth
         LH_PROFILE_FUNCTION();
         std::lock_guard<std::mutex> lock(s_AssetMutex);
 
-        // Check if already loaded or currently loading
         if (s_Assets.find(handle) != s_Assets.end()) return;
         if (s_LoadingAssets.find(handle) != s_LoadingAssets.end()) return;
 
@@ -67,8 +71,7 @@ namespace Luth
         s_LoadingAssets.insert(handle);
         
         LoadRequest* req = new LoadRequest{ handle, info.Path, info.Type };
-        
-        // Dispatch to JobSystem
+
         JobSystem::Execute(LoadJob, req, nullptr, "AssetLoad");
     }
 
@@ -76,39 +79,29 @@ namespace Luth
     {
         LH_PROFILE_FUNCTION();
 
-        // Check cache first
         if (auto asset = GetAsset<Asset>(handle)) return asset;
 
         const auto& info = AssetDatabase::GetMetadata(handle);
         if (info.Path.empty()) return nullptr;
 
-        // 1. Check/Create Artifact
+        // Ensure the artifact exists (self-import if missing), serialized against any in-flight import
+        // of the same UUID so a background ImportDirty and this blocking load never write it twice.
         fs::path artifactPath = AssetDatabase::GetArtifactPath(handle);
-        bool artifactReady = fs::exists(artifactPath);
+        EnsureImported(handle, /*forceReimport*/ false, /*blockIfBusy*/ true);
+        if (!fs::exists(artifactPath)) return nullptr;
 
-        if (!artifactReady)
-        {
-            if (s_Importers.find(info.Type) != s_Importers.end())
-            {
-                artifactReady = s_Importers[info.Type]->Import(info.Path, artifactPath);
-            }
-        }
-
-        if (!artifactReady) return nullptr;
-
-        // 2. Load Data from Artifact. A present-but-incompatible artifact (an older schema after a
-        // format-version bump) fails to deserialize — regenerate it once from source so a schema bump
-        // self-heals instead of silently failing every load until the artifact cache is wiped.
+        // A present-but-incompatible artifact (an older schema after a format-version bump) fails to
+        // deserialize; force one regeneration so a schema bump self-heals instead of failing every load.
         auto data = DeserializeArtifact(info.Type, artifactPath);
-        if (!data && s_Importers.find(info.Type) != s_Importers.end())
+        if (!data)
         {
             LH_LOG(Assets, warn, "AssetManager: artifact incompatible (schema bump?) -- reimporting {0}", info.Path.string());
-            if (s_Importers[info.Type]->Import(info.Path, artifactPath))
-                data = DeserializeArtifact(info.Type, artifactPath);
+            EnsureImported(handle, /*forceReimport*/ true, /*blockIfBusy*/ true);
+            data = DeserializeArtifact(info.Type, artifactPath);
         }
         if (!data) return nullptr;
 
-        // 3. Create Asset (Main Thread)
+        // Create the asset (main thread).
         auto newAsset = FinalizeAsset(info.Type, data.get(), info.Path);
 
         if (newAsset) { 
@@ -122,19 +115,83 @@ namespace Luth
     void AssetManager::Import(UUID handle)
     {
         LH_PROFILE_FUNCTION();
+        // Forced, blocking reimport (editor "Apply", IngestFile). Routed through the guard so it
+        // serializes against any concurrent background import of the same UUID.
+        EnsureImported(handle, /*forceReimport*/ true, /*blockIfBusy*/ true);
+    }
+
+    // ---- Import serialization ----
+
+    bool AssetManager::TryBeginImport(UUID handle)
+    {
+        std::lock_guard<std::mutex> lock(s_ImportMutex);
+        return s_ImportingAssets.insert(handle).second; // true if we newly claimed it
+    }
+
+    void AssetManager::EndImport(UUID handle)
+    {
+        std::lock_guard<std::mutex> lock(s_ImportMutex);
+        s_ImportingAssets.erase(handle);
+    }
+
+    bool AssetManager::IsImporting(UUID handle)
+    {
+        std::lock_guard<std::mutex> lock(s_ImportMutex);
+        return s_ImportingAssets.find(handle) != s_ImportingAssets.end();
+    }
+
+    void AssetManager::WaitWhileImporting(UUID handle)
+    {
+        // V1: never poll while holding s_ImportMutex. Worker fibers yield so the owning import fiber can
+        // run; the main thread (V2-isolated, no JobContext, YieldFiber is a no-op there) busy-spins.
+        const bool onWorker = (JobSystem::GetCurrentJobContext() != nullptr);
+        while (IsImporting(handle))
+        {
+            if (onWorker) JobSystem::YieldFiber();
+            else          _mm_pause();
+        }
+    }
+
+    void AssetManager::EnsureImported(UUID handle, bool forceReimport, bool blockIfBusy)
+    {
+        // Acquire the per-UUID import token, or wait for the in-flight owner. Invariant: holding the
+        // token means we are the sole importer AND it is actively running, so a waiter blocks on one
+        // asset (this handle), never on the whole dispatch queue.
+        while (!TryBeginImport(handle))
+        {
+            if (!blockIfBusy) return;                    // fire-and-forget: the owner is running it
+            WaitWhileImporting(handle);
+            if (!forceReimport && fs::exists(AssetDatabase::GetArtifactPath(handle)))
+                return;                                  // owner produced it; nothing left to do
+            // else: owner failed to produce it, or we must force -> loop to claim the token ourselves
+        }
+
+        // RAII release: the token must clear on every exit, including an importer throw (caught below).
+        struct ReleaseGuard { UUID h; ~ReleaseGuard() { EndImport(h); } } releaseGuard{ handle };
 
         const auto& info = AssetDatabase::GetMetadata(handle);
         if (info.Path.empty()) return;
 
         fs::path artifactPath = AssetDatabase::GetArtifactPath(handle);
-        
-        if (s_Importers.find(info.Type) != s_Importers.end())
+        if (!forceReimport && fs::exists(artifactPath)) return; // a racing reader already produced it
+
+        auto it = s_Importers.find(info.Type);
+        if (it == s_Importers.end()) return;             // Font/Scene etc. have no importer
+
+        // Catch importer exceptions here: a throw must not unwind across the fiber's asm context-switch
+        // boundary (FiberEntryPoint has no catch), which would terminate the process.
+        try
         {
-            LH_LOG(Assets, debug, "Importing Asset: {0}", info.Path.string());
-            if (!s_Importers[info.Type]->Import(info.Path, artifactPath))
-            {
+            if (!it->second->Import(info.Path, artifactPath))
                 LH_LOG(Assets, error, "Failed to import asset: {0}", info.Path.string());
-            }
+        }
+        catch (const std::exception& e)
+        {
+            LH_LOG(Assets, error, "Importer threw for {0}: {1}", info.Path.string(), e.what());
+        }
+        catch (...)
+        {
+            LH_LOG(Assets, error, "Importer threw (unknown) for {0}", info.Path.string());
         }
     }
 
@@ -193,19 +250,35 @@ namespace Luth
         const auto& dirtyAssets = AssetDatabase::GetDirtyAssets();
         if (dirtyAssets.empty()) return;
 
-        std::vector<UUID> assetsToImport = dirtyAssets;
-        LH_LOG(Assets, info, "Importing {} assets...", assetsToImport.size());
-
-        JobSystem::Counter importCounter(0);
-        JobSystem::Dispatch((u32)assetsToImport.size(), 1, [](JobSystem::JobArgs args) {
-            LH_PROFILE_SCOPE("AssetImport");
-            std::vector<UUID>* assets = (std::vector<UUID>*)args.data;
-            AssetManager::Import((*assets)[args.jobIndex]);
-        }, &assetsToImport, &importCounter, "AssetImport");
-        JobSystem::WaitForCounter(&importCounter);
+        // Fire-and-forget: one job per dirty asset, no WaitForCounter -- the main thread never blocks on
+        // the import storm (cold Bistro = hundreds of texture bakes). The token is claimed inside the job
+        // when it starts (not here), so a main-thread reader for a still-queued asset wins TryBeginImport
+        // and imports that one inline instead of stalling on the whole queue. IsImporting skips assets
+        // already actively importing (LoadProject dispatches, then the next frame sees the same
+        // still-uncleared dirty set before ClearDirtyAssets runs).
+        u32 dispatched = 0;
+        for (UUID handle : dirtyAssets)
+        {
+            if (IsImporting(handle)) continue;
+            ImportRequest* req = new ImportRequest{ handle };
+            JobSystem::Execute(ImportJob, req, nullptr, "AssetImport", JobSystem::Priority::Low);
+            ++dispatched;
+        }
+        if (dispatched > 0)
+            LH_LOG(Assets, info, "Importing {} assets (async)...", dispatched);
     }
 
-    // ── Shared helpers ──
+    void AssetManager::ImportJob(JobSystem::JobArgs args)
+    {
+        LH_PROFILE_FUNCTION();
+        ImportRequest* req = (ImportRequest*)args.data;
+        // Dirty => artifact absent, so no force; non-blocking, so if another entry point already owns
+        // this import we bail rather than wait (it is being produced).
+        EnsureImported(req->Handle, /*forceReimport*/ false, /*blockIfBusy*/ false);
+        delete req;
+    }
+
+    // ---- Shared helpers ----
 
     std::unique_ptr<AssetData> AssetManager::DeserializeArtifact(AssetType type, const fs::path& artifactPath)
     {
@@ -242,6 +315,10 @@ namespace Luth
         LH_PROFILE_FUNCTION();
         if (type == AssetType::Texture) {
             auto* d = static_cast<TextureAssetData*>(data);
+            // Pre-baked BCn uploads the stored mip chain directly; uncompressed keeps the blit-mip path.
+            if (GetTextureFormatInfo(d->Format).compressed)
+                return Texture::Create(d->Width, d->Height, d->Format, d->Pixels.data(),
+                                       (u64)d->Pixels.size(), d->MipLevels, d->Settings);
             return Texture::Create(d->Width, d->Height, d->Format, d->Pixels.data(), d->Settings);
         }
         else if (type == AssetType::Model) {
@@ -275,7 +352,7 @@ namespace Luth
         return nullptr;
     }
 
-    // ── Async loading ──
+    // ---- Async loading ----
 
     void AssetManager::LoadJob(JobSystem::JobArgs args)
     {
@@ -283,30 +360,25 @@ namespace Luth
 
         LoadRequest* req = (LoadRequest*)args.data;
         LH_PROFILE_TAG("Asset", req->Path.string().c_str());
-        
+
+        // Ensure the artifact exists (self-import if missing), serialized against any in-flight import
+        // of the same UUID. Worker fiber -> waits by yielding, never becomes a second writer.
         fs::path artifactPath = AssetDatabase::GetArtifactPath(req->Handle);
-        bool artifactReady = fs::exists(artifactPath);
+        EnsureImported(req->Handle, /*forceReimport*/ false, /*blockIfBusy*/ true);
 
-        // 1. Import if missing
-        if (!artifactReady)
-        {
-            if (s_Importers.find(req->Type) != s_Importers.end())
-            {
-                auto& importer = s_Importers[req->Type];
-                artifactReady = importer->Import(req->Path, artifactPath);
-            }
-            else
-            {
-                // Font and Scene types are handled directly — not an error
-                if (req->Type != AssetType::Font && req->Type != AssetType::Scene)
-                    LH_LOG(Assets, error, "AssetManager: No importer for type {0}", (int)req->Type);
-            }
-        }
-
-        // 2. Load from Artifact
+        // Load from the artifact.
         std::unique_ptr<AssetData> data = nullptr;
-        if (artifactReady)
+        if (fs::exists(artifactPath))
             data = DeserializeArtifact(req->Type, artifactPath);
+
+        // Schema-bump self-heal (mirrors LoadImmediate): a present-but-incompatible artifact fails to
+        // deserialize; force one reimport so async/material-referenced assets migrate instead of vanishing.
+        if (!data && fs::exists(artifactPath))
+        {
+            LH_LOG(Assets, warn, "AssetManager: artifact incompatible (schema bump?) -- reimporting {0}", req->Path.string());
+            EnsureImported(req->Handle, /*forceReimport*/ true, /*blockIfBusy*/ true);
+            data = DeserializeArtifact(req->Type, artifactPath);
+        }
 
         // Push to upload queue regardless of success to clear the loading flag on main thread
         {
@@ -329,7 +401,7 @@ namespace Luth
             s_GCTimer = 0.0f;
         }
 
-        // Idle frames must still tick — upload fences retire 1-2 frames after the ctor pushed.
+        // Idle frames must still tick; upload fences retire 1-2 frames after the ctor pushed.
         UploadContext::Get().DrainPendingBinds();
 
         std::lock_guard<std::mutex> lock(s_UploadMutex);
@@ -354,8 +426,7 @@ namespace Luth
                     }
                 }
 
-                // Model-specific: trigger async load for the model's animation clips
-                // so AnimationSystem can sample them on the next frame.
+                // Model-specific: async-load the model's animation clips so AnimationSystem can sample them next frame.
                 if (upload.Type == AssetType::Model && newAsset)
                 {
                     auto* model = static_cast<Model*>(newAsset.get());
@@ -369,8 +440,7 @@ namespace Luth
 
             {
                 std::lock_guard<std::mutex> assetLock(s_AssetMutex);
-                
-                // Clear loading flag
+
                 s_LoadingAssets.erase(upload.Handle);
 
                 if (newAsset) {

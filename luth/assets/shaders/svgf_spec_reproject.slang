@@ -1,7 +1,7 @@
-// SVGF temporal accumulation — SPECULAR variant (rt-renderer D.1). Like svgf_reproject but the
+// SVGF temporal accumulation, SPECULAR variant. Like svgf_reproject but the
 // reprojection is HIT-DISTANCE-DRIVEN: a reflection's screen motion differs from the surface's, so
 // reproject by the slim motion vector ghosts mirrors. Instead reconstruct the receiver from depth,
-// mirror-reflect the view to the virtual reflected hit (worldPos + reflect(-V,N)·hitDist), and reproject
+// mirror-reflect the view to the virtual reflected hit (worldPos + reflect(-V,N)*hitDist), and reproject
 // THAT through prevViewProjection. The 1-spp radiance + hitDist arrive packed in u_SpecIn (rgb, a); hitDist
 // rides the geom history's spare channel; roughness loosens the gate. see arch/rendering-pipeline.md
 //
@@ -12,7 +12,7 @@ import svgf_common;
 [[vk::binding(0, 1)]] Sampler2D u_SpecIn;      // current 1-spp radiance (rgb) + hitDist (a)
 [[vk::binding(1, 1)]] Sampler2D u_CurrDepth;
 [[vk::binding(2, 1)]] Sampler2D u_CurrNormal;  // slim oct normal
-[[vk::binding(3, 1)]] Sampler2D u_CurrRough;   // slim roughness (R8) — disocclusion tuning
+[[vk::binding(3, 1)]] Sampler2D u_CurrRough;   // slim roughness (R8), disocclusion tuning
 [[vk::binding(4, 1)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> u_ColorHistPrev;
 [[vk::binding(5, 1)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> u_MomentsPrev;
 [[vk::binding(6, 1)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> u_GeomPrev;   // prev (linearZ, octN.x, octN.y, hitDist)
@@ -30,6 +30,8 @@ struct PC
     int   gbufferScale;
     int   dispatchW;
     int   dispatchH;
+    float antiFireflySigma; // 3x3 neighbourhood mean + k*sigma clamp on the incoming sample; 0 = off
+    float confidenceScale;  // layout parity with svgf_reproject; UNUSED here (input alpha is hitDist)
 };
 [[vk::push_constant]] PC pc;
 
@@ -68,8 +70,28 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     }
 
-    float3 di     = clamp(spec.rgb, 0.0, 65504.0);
-    float  curLum = min(SvgfLuminance(di), 255.0);
+    float3 di = clamp(spec.rgb, 0.0, 65504.0);
+
+    // In-loop anti-firefly (RT Gems ch. 25, spatial form): clamp the incoming radiance's luminance to
+    // its own frame's 3x3 short-mean + k*sigma before the EMA (center excluded). rgb only: the input
+    // alpha is hitDist, not signal.
+    if (pc.antiFireflySigma > 0.0)
+    {
+        float m1 = 0.0, m2 = 0.0;
+        for (int yy = -1; yy <= 1; ++yy)
+        for (int xx = -1; xx <= 1; ++xx)
+        {
+            if (xx == 0 && yy == 0) continue;
+            int2  q = clamp(pixel + int2(xx, yy), int2(0), size - int2(1));
+            float l = min(SvgfLuminance(u_SpecIn.Load(int3(q, 0)).rgb), 65504.0);
+            m1 += l; m2 += l * l;
+        }
+        m1 *= 1.0 / 8.0; m2 *= 1.0 / 8.0;
+        float cap = m1 + pc.antiFireflySigma * sqrt(max(m2 - m1 * m1, 0.0)) + 1.0e-3;
+        float lum = SvgfLuminance(di);
+        if (lum > cap) di *= cap / lum;
+    }
+    float curLum = min(SvgfLuminance(di), 255.0);
 
     // Hit-distance virtual reprojection.
     float2 uv       = (float2(pixel) + 0.5) / float2(size);
@@ -91,7 +113,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float2 pMom   = float2(0.0);
     float  pHist  = 0.0;
     float  sumw   = 0.0;
-    // Rougher reflections are blurry → hitDist-insensitive, so loosen the reflected-depth gate.
+    // Rougher reflections are blurry -> hitDist-insensitive, so loosen the reflected-depth gate.
     float hitTol = pc.depthThreshold * (1.0 + rough * 4.0);
     bool inBounds = all(prevUV >= float2(0.0)) && all(prevUV <= float2(1.0));
     if (inBounds)

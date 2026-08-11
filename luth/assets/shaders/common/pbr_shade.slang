@@ -23,7 +23,7 @@ struct GTAOUBO
 [[vk::binding(5, 3)]] Sampler2D diIrradiance;    // demodulated DI diffuse irradiance
 [[vk::binding(6, 3)]] Sampler2D giIrradiance;    // demodulated GI indirect-diffuse irradiance
 [[vk::binding(7, 3)]] Sampler2D reflRadiance;    // demodulated RT reflection radiance
-[[vk::binding(8, 3)]] Sampler2D diSpecular;      // demodulated ReSTIR-DI specular (#154)
+[[vk::binding(8, 3)]] Sampler2D diSpecular;      // demodulated ReSTIR-DI specular
 
 // pbr.vert delivers v_TBN as a mat3 at locations 3-5; read its columns as separate T/B/N (layout-safe).
 // Members are public so the per-material entry shaders (pbr.slang / generated pbr_graph_*) can read them.
@@ -39,6 +39,7 @@ public struct VIn
     [[vk::location(7)]] public nointerpolation uint materialIndex;
     [[vk::location(8)]] public nointerpolation uint shadeMode;
     [[vk::location(9)]] public nointerpolation uint entityID;
+    [[vk::location(10)]] public float4 color;   // per-vertex color (linear RGBA), multiplied into albedo
 };
 public struct FOut
 {
@@ -46,14 +47,26 @@ public struct FOut
     [[vk::location(1)]] public uint   entityID : SV_Target1;
 };
 
-// RT sun-shadow visibility — samples the per-view R8 mask at screen UV (no cascade selection in RT mode).
+// Karis mobile EnvBRDFApprox with F0 = 1 (rho = A + B): remodulates the ReSTIR DI-spec signal that
+// restir_shade.slang demodulated by the same scalar; keep the two in lockstep.
+float DiSpecRho(float NoV, float rough)
+{
+    float4 c0 = float4(-1.0, -0.0275, -0.572, 0.022);
+    float4 c1 = float4(1.0, 0.0425, 1.04, -0.04);
+    float4 r  = rough * c0 + c1;
+    float  a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+    float2 ab = float2(-1.04, 1.04) * a004 + r.zw;
+    return ab.x + ab.y;
+}
+
+// RT sun-shadow visibility: samples the per-view R8 mask at screen UV (no cascade selection in RT mode).
 ShadowResult ComputeShadowRT(float2 uv)
 {
     ShadowResult r; r.cascade = -1;
     r.shadow = (ubo.shadowBias.x < 0.0) ? 1.0 : sunShadowMask.Sample(uv).r;
     return r;
 }
-// Dispatch: rtShadowParams.x > 0.5 → RT mask sample; else cascade PCF.
+// Dispatch: rtShadowParams.x > 0.5 -> RT mask sample; else cascade PCF.
 ShadowResult ComputeShadow(float3 worldPos, float3 N, float2 uv)
 {
     if (ubo.rtShadowParams.x > 0.5) return ComputeShadowRT(uv);
@@ -68,6 +81,10 @@ public FOut PbrShadeSurface(MaterialInputs mi, GPUMaterialData m, VIn i, bool fr
     FOut o;
     o.entityID = i.entityID;   // always written for picking
     RasterFetch rf;
+
+    // Vertex color modulates the decoded base color (RGBA), so cutout + shade-modes + alpha all see it.
+    // Meshes without a color channel import as neutral white, making this a no-op there.
+    mi.baseColor *= i.color;
 
     // Cutout discard (Cutout: alphaCutoff > 0; Opaque: 0).
     if (mi.baseColor.a < m.alphaCutoff) discard;
@@ -86,13 +103,15 @@ public FOut PbrShadeSurface(MaterialInputs mi, GPUMaterialData m, VIn i, bool fr
     float  metallic  = mi.metallic;
     float  roughness = mi.roughness;
 
-    // Tokuyoshi 2019 geometric specular AA — screen-space normal curvature lifted into roughness.
+    // Tokuyoshi 2019 geometric specular AA: screen-space normal curvature lifted into roughness (base + coat).
+    float ccRough = mi.clearcoatRoughness;
     if (ubo.specAaParams.x != 0.0)
     {
         float3 dNdu = ddx(N); float3 dNdv = ddy(N);
         float  sigma2   = ubo.specAaParams.y * ubo.specAaParams.y;
         float  variance = sigma2 * (dot(dNdu, dNdu) + dot(dNdv, dNdv));
         roughness = clamp(sqrt(roughness * roughness + variance), 0.04, 1.0);
+        if (mi.clearcoat > 0.0) ccRough = clamp(sqrt(ccRough * ccRough + variance), 0.04, 1.0);
     }
 
     // Shade-mode overrides.
@@ -109,7 +128,7 @@ public FOut PbrShadeSurface(MaterialInputs mi, GPUMaterialData m, VIn i, bool fr
     if (i.shadeMode == 14u) { o.color = float4(metallic.xxx, 1.0);    return o; }   // Metallic
     if (i.shadeMode == 15u) { o.color = float4(mi.occlusion.xxx, 1.0);return o; }   // Occlusion (material AO)
 
-    // Raw screen-space signals — sampled where the lit shading reads them, gated on the feature
+    // Raw screen-space signals, sampled where the lit shading reads them, gated on the feature
     // (the picker greys these when off). Ambient Occlusion (17) reuses the gtao.visualize path below.
     float2 dbgUv = fragCoord.xy / ubo.viewportSize;
     // Raw signals always claim their mode: show the sampled buffer when the feature is on, else a
@@ -118,7 +137,7 @@ public FOut PbrShadeSurface(MaterialInputs mi, GPUMaterialData m, VIn i, bool fr
     if (i.shadeMode == 19u) { o.color = ubo.restirParams.x > 0.5 ? float4(diIrradiance.Sample(dbgUv).rgb, 1.0) : float4(1.0, 0.0, 1.0, 1.0); return o; }  // DI Raw
     if (i.shadeMode == 20u) { o.color = ubo.reflParams.x  > 0.5 ? float4(reflRadiance.Sample(dbgUv).rgb, 1.0) : float4(1.0, 0.0, 1.0, 1.0); return o; }  // RT Reflection Raw
 
-    // Material-baked AO × screen-space GTAO (half-res R8).
+    // Material-baked AO x screen-space GTAO (half-res R8).
     float ao = mi.occlusion;
     if (gtao.enabled != 0)
         ao *= gtaoTex.Sample(fragCoord.xy * gtao.invFullResolution).r;
@@ -127,12 +146,18 @@ public FOut PbrShadeSurface(MaterialInputs mi, GPUMaterialData m, VIn i, bool fr
     float3 Lo = float3(0.0);
     float2 screenUv = fragCoord.xy / ubo.viewportSize;
 
+    // Shared BRDF surface (base + clear-coat + anisotropy); T/B from the interpolated tangent frame.
+    SurfaceBRDF surf = MakeSurfaceBRDF(N, i.T, i.B, true, albedo.rgb, metallic, roughness, mi.specular,
+                                       mi.clearcoat, ccRough, mi.anisotropy, mi.anisotropyRotation,
+                                       mi.transmission, mi.ior, true, mi.sheenColor, mi.sheenRoughness,
+                                       mi.subsurfaceColor, mi.subsurfaceRadius, mi.subsurfaceThickness);
+
     // Directional light + shadow (cascade PCF or RT mask).
     ShadowResult sr = ComputeShadow(i.worldPos, N, screenUv);
     {
         DirectionalLightData dl = LoadDirLight();
         float3 dirRadiance = dl.color * dl.intensity;
-        Lo += EvalBRDFTimesNdotL(normalize(-dl.direction), dirRadiance, V, N, albedo.rgb, metallic, roughness) * sr.shadow;
+        Lo += EvalSurfBRDFTimesNdotL(normalize(-dl.direction), dirRadiance, V, surf) * sr.shadow;
     }
 
     // Punctual lights: demodulated ReSTIR DI image (points only), else the Forward+ cluster loop. Remodulate
@@ -141,26 +166,28 @@ public FOut PbrShadeSurface(MaterialInputs mi, GPUMaterialData m, VIn i, bool fr
     if (ubo.restirParams.x > 0.5)
     {
         Lo += diIrradiance.Sample(screenUv).rgb * (albedo.rgb * (1.0 - metallic) / GI_PI);
-        Lo += EvalClusteredLights(fragCoord, i.worldPos, V, N, albedo.rgb, metallic, roughness, true);
+        Lo += EvalClusteredLights(fragCoord, i.worldPos, V, surf, true);
     }
     else
-        Lo += EvalClusteredLights(fragCoord, i.worldPos, V, N, albedo.rgb, metallic, roughness, false);
+        Lo += EvalClusteredLights(fragCoord, i.worldPos, V, surf, false);
 
-    // ReSTIR GI — demodulated indirect diffuse, added on top (independent of the DI gate).
+    // ReSTIR GI: demodulated indirect diffuse, added on top (independent of the DI gate).
     if (ubo.restirParams.y > 0.5)
         Lo += giIrradiance.Sample(screenUv).rgb * (albedo.rgb * (1.0 - metallic) / GI_PI);
 
-    // ReSTIR-DI specular (#154) — demodulated F0-free lobe, remodulated by F0.
+    // ReSTIR-DI specular: demodulated F0-free lobe, remodulated by DiSpecRho (restir_shade divided it
+    // out so the denoiser never sees the roughness/view response) and the per-pixel F0.
     if (ubo.restirParams.z > 0.0)
     {
-        float3 F0 = lerp(float3(0.04), albedo.rgb, metallic);
-        Lo += diSpecular.Sample(screenUv).rgb * F0 * ubo.restirParams.z;
+        float3 F0  = lerp(float3(surf.dielectricF0), albedo.rgb, metallic);
+        float  NoV = max(dot(N, V), 1.0e-4);
+        Lo += diSpecular.Sample(screenUv).rgb * (DiSpecRho(NoV, roughness) * ubo.restirParams.z) * F0;
     }
 
-    IblResult ibl = EvalIblAmbient(N, V, albedo.rgb, metallic, roughness, ao, ubo.iblIntensity);
+    IblResult ibl = EvalIblAmbient(surf, V, ao, ubo.iblIntensity);
     float3 color = ibl.ambient + Lo;
 
-    // RT specular reflection (D.1) — supersedes IBL specular above the roughness cutoff. reflRad is a
+    // RT specular reflection supersedes IBL specular above the roughness cutoff. reflRad is a
     // traced scene reflection (decoupled from iblIntensity); subtract the iblSpecular it replaces.
     if (ubo.reflParams.x > 0.5)
     {

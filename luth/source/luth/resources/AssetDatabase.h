@@ -32,7 +32,7 @@ namespace Luth
         static void InitEngine(const std::filesystem::path& engineAssetsRoot);
 
         // Scan a project's assets directory and register everything found. Safe to call multiple
-        // times (project switching) — UnloadProject is the matching teardown.
+        // times (project switching); UnloadProject is the matching teardown.
         static void LoadProject(const std::filesystem::path& projectAssetsRoot);
 
         // Clear project-specific assets while keeping the engine built-ins intact. Used during
@@ -47,6 +47,10 @@ namespace Luth
         static std::filesystem::path GetArtifactPath(UUID uuid);
         static bool Exists(UUID uuid);
 
+        // Snapshot of registered source paths of a given asset type, taken under s_Mutex (the registry accessor is otherwise
+        // unsynchronized). Backs the importer's project-wide texture index.
+        static std::vector<std::filesystem::path> GetPathsOfType(AssetType type);
+
         // Registry Management
         static void RegisterAsset(const std::filesystem::path& path, UUID uuid, AssetType type);
         static void UnregisterAsset(UUID uuid);
@@ -60,7 +64,11 @@ namespace Luth
         // also discovers and copies adjacent textures so the import lands self-contained.
         static void IngestFile(const std::filesystem::path& sourcePath, const std::filesystem::path& destDir);
 
-        // Hot reload — file system watching
+        // Fire-and-forget IngestFile on a worker: the copy (hundreds of MB for a model + textures) and
+        // the import (Assimp + texture bakes) must not block the app loop. Used by the drag-drop handler.
+        static void IngestFileAsync(const std::filesystem::path& sourcePath, const std::filesystem::path& destDir);
+
+        // Hot reload: file system watching
         using ChangeCallback = std::function<void()>;
         static void StartWatching();
         static void StopWatching();
@@ -68,7 +76,7 @@ namespace Luth
         static void AddChangeCallback(ChangeCallback cb);
 
         // Editor self-write hint: the next file-change event for this asset is the editor saving its
-        // own in-memory state — skip the reimport (which would evict the live instance being edited).
+        // own in-memory state; skip the reimport (which would evict the live instance being edited).
         static void SuppressNextReimport(const UUID& uuid);
 
     private:
@@ -76,7 +84,7 @@ namespace Luth
         static void SaveLibraryState_Unlocked();
         static u64 CalculateAssetHash(const fs::path& source, const fs::path& meta);
 
-        // _Unlocked variants — caller must hold s_Mutex
+        // _Unlocked variants: caller must hold s_Mutex
         static UUID GetUUID_Unlocked(const fs::path& path);
         static void RegisterAsset_Unlocked(const fs::path& path, UUID uuid, AssetType type);
         static void UnregisterAsset_Unlocked(UUID uuid);
@@ -93,7 +101,7 @@ namespace Luth
         static std::mutex s_PendingMutex;
         static std::vector<ChangeCallback> s_ChangeCallbacks;
 
-        // Self-write suppression (see SuppressNextReimport) — consumed in ProcessPendingChanges.
+        // Self-write suppression (see SuppressNextReimport); consumed in ProcessPendingChanges.
         static std::unordered_set<UUID, UUIDHash> s_SelfWrites;
         static std::mutex s_SelfWriteMutex;
         static bool ConsumeSelfWrite(const UUID& uuid);

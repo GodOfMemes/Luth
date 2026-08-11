@@ -1,6 +1,6 @@
-// Slim G-buffer fragment — oct normal (RG16F) + roughness (R8) + NDC motion (RG16F) + material ID (R16U).
+// Slim G-buffer fragment: oct normal (RG16F) + roughness (R8) + NDC motion (RG16F) + material ID (R16U).
 // Cutout alpha-tests the holes so RT shadow/reflection recon + GTAO sample the surface behind, not the card.
-// Reuses the bounded material decode (material_bindings_raster) — no local GPUMaterialData duplicate.
+// Reuses the bounded material decode (material_bindings_raster); no local GPUMaterialData duplicate.
 // see arch/rendering-pipeline.md
 import globals;
 import material;
@@ -26,7 +26,7 @@ struct FOut
     [[vk::location(3)]] uint   materialID : SV_Target3;   // R16U
 };
 
-// Karis 2014 octahedral encode → [0,1] for RG16F.
+// Karis 2014 octahedral encode -> [0,1] for RG16F.
 float2 OctEncode(float3 n)
 {
     n /= (abs(n.x) + abs(n.y) + abs(n.z));
@@ -51,7 +51,7 @@ FOut main(FIn i, bool frontFacing : SV_IsFrontFace)
     float3 N;
     if ((m.flags & FLAG_HAS_NORMAL) != 0u)
     {
-        float3 tn = rf.Sample(m.normalIndex, SelectUV(m.flags, UV_SHIFT_NORMAL, i.uv0, i.uv1)).rgb * 2.0 - 1.0;
+        float3 tn = DecodeTangentNormal(rf.Sample(m.normalIndex, SelectUV(m.flags, UV_SHIFT_NORMAL, i.uv0, i.uv1)).rgb);
         N = ApplyTangentNormal(tn, i.T, i.B, i.N);
     }
     else
@@ -67,7 +67,7 @@ FOut main(FIn i, bool frontFacing : SV_IsFrontFace)
         roughness = rf.Sample(m.metalRoughIndex, SelectUV(m.flags, UV_SHIFT_METALROUGH, i.uv0, i.uv1)).g;
     o.roughness = clamp(roughness, 0.04, 1.0);
 
-    // Motion in NDC — source-side de-jittered so the attachment carries pure scene displacement.
+    // Motion in NDC: source-side de-jittered so the attachment carries pure scene displacement.
     float2 jitterCurr = ubo.taaParams.zw  * 2.0 / ubo.viewportSize;
     float2 jitterPrev = ubo.prevJitter.xy * 2.0 / ubo.viewportSize;
     float2 currNDC = i.currClip.xy / i.currClip.w;

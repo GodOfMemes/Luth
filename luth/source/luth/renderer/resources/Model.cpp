@@ -47,7 +47,8 @@ namespace Luth
                     { ShaderDataType::Float3, "a_Normal"      },
                     { ShaderDataType::Float2, "a_TexCoord0"   },
                     { ShaderDataType::Float2, "a_TexCoord1"   },
-                    { ShaderDataType::Float3, "a_Tangent"     },
+                    { ShaderDataType::Float4, "a_Tangent"     },
+                    { ShaderDataType::Float4, "a_Color"       },
                     { ShaderDataType::Int4,   "a_BoneIDs"     },
                     { ShaderDataType::Float4, "a_BoneWeights" }
                 });
@@ -62,7 +63,8 @@ namespace Luth
                     { ShaderDataType::Float3, "a_Normal"    },
                     { ShaderDataType::Float2, "a_TexCoord0" },
                     { ShaderDataType::Float2, "a_TexCoord1" },
-                    { ShaderDataType::Float3, "a_Tangent"   }
+                    { ShaderDataType::Float4, "a_Tangent"   },
+                    { ShaderDataType::Float4, "a_Color"     }
                 });
             }
 
@@ -72,10 +74,10 @@ namespace Luth
                 : static_cast<u32>(data.Vertices.size());
             auto mesh = Mesh::Create(vb, ib, vertCount, data.IsSkinned);
 
-            // Per-mesh BLAS — rigid built once over the source VB; deformable (skinned OR static
+            // Per-mesh BLAS: rigid built once over the source VB; deformable (skinned OR static
             // wind-deformable) built over the deformed buffer (filled per-frame by the deform compute)
             // with ALLOW_UPDATE so each frame's MODE_UPDATE refit is cheap. Built unconditionally on
-            // Vulkan backends; factory returns null on non-Vulkan backends (graceful — TLAS skips it).
+            // Vulkan backends; factory returns null on non-Vulkan backends (TLAS skips it).
             if (data.IsSkinned || data.IsDeformable)
                 mesh->SetBlas(VKAccelerationStructure::CreateDeformableBLAS(*mesh));
             else
@@ -95,7 +97,7 @@ namespace Luth
             Mat4 local = Math::Translate(Mat4(1.0f), n.Translation)
                        * Math::ToMat4(n.Rotation)
                        * Math::Scale(Mat4(1.0f), n.Scale);
-            // Nodes are topological — a parent's world matrix is finalized before its children read it.
+            // Nodes are topologically ordered: a parent's world matrix is finalized before its children read it.
             world[i] = (n.ParentIndex >= 0) ? world[n.ParentIndex] * local : local;
         }
         return world;
@@ -108,7 +110,6 @@ namespace Luth
         info.TotalMeshCount = (u32)m_Meshes.size();
         info.MaterialCount = (u32)m_Materials.size();
 
-        // Calculate totals
         for (const auto& meshData : m_MeshesData) {
             u32 vertCount = meshData.IsSkinned
                 ? static_cast<u32>(meshData.SkinnedVertices.size())
@@ -125,7 +126,6 @@ namespace Luth
             info.Meshes.push_back(meshInfo);
         }
 
-        // Populate skeleton info
         info.BoneCount = m_Skeleton.BoneCount();
         info.AnimationCount = static_cast<u32>(m_AnimationClipUUIDs.size());
 
@@ -137,9 +137,8 @@ namespace Luth
             info.BoneHierarchy.push_back(bni);
         }
 
-        // Best-effort clip metadata. Cached on first GetModelInfo() call (during
-        // ProcessMeshData), so async-loaded clips show as "<not loaded>" until
-        // CacheModelInfo() runs again.
+        // Best-effort clip metadata. Cached on first GetModelInfo() call (during ProcessMeshData),
+        // so async-loaded clips show as "<not loaded>" until CacheModelInfo() runs again.
         for (const auto& uuid : m_AnimationClipUUIDs) {
             AnimationInfo ai;
             if (auto clip = AssetManager::GetAsset<AnimationClip>(uuid)) {

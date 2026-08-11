@@ -15,7 +15,8 @@ namespace Luth
     namespace {
         // gbufferScale/dispatchW/dispatchH let a channel run at a working resolution below the full
         // G-buffer (half-res GI). scale==1 + dispatch==full is the identity path for full-res channels.
-        // Mirrors svgf_reproject.slang's push_constant (5 floats + 3 ints = 32 B).
+        // Mirrors svgf_reproject.slang's push_constant (7 floats + 3 ints = 40 B); the spec variant
+        // shares the layout (confidenceScale unused there - its input alpha is hitDist).
         struct SvgfReprojectPC {
             f32 alphaColor;
             f32 alphaMoments;
@@ -25,8 +26,10 @@ namespace Luth
             i32 gbufferScale;
             i32 dispatchW;
             i32 dispatchH;
+            f32 antiFireflySigma;   // 3x3 mean + k*sigma clamp on the incoming sample; 0 = off
+            f32 confidenceScale;    // reservoir-confidence history-cap shortening; 0 = off / spec variant
         };
-        static_assert(sizeof(SvgfReprojectPC) == 32, "SvgfReprojectPC must match svgf_reproject.slang push_constant");
+        static_assert(sizeof(SvgfReprojectPC) == 40, "SvgfReprojectPC must match svgf_reproject.slang push_constant");
 
         // Mirrors svgf_moments.slang's push_constant (2 floats + 3 ints = 20 B).
         struct SvgfMomentsPC {
@@ -38,7 +41,7 @@ namespace Luth
         };
         static_assert(sizeof(SvgfMomentsPC) == 20, "SvgfMomentsPC must match svgf_moments.slang push_constant");
 
-        // Mirrors svgf_atrous.slang's push_constant (2 ints + 3 floats + 3 ints = 32 B).
+        // Mirrors svgf_atrous.slang's push_constant (2 ints + 3 floats + 3 ints + 1 float = 36 B).
         struct SvgfAtrousPC {
             i32 stepSize;
             i32 writeFinal;
@@ -48,10 +51,11 @@ namespace Luth
             i32 gbufferScale;
             i32 dispatchW;
             i32 dispatchH;
+            f32 phiRough;   // roughness edge-stop; spec channels only, diffuse channels pass 0
         };
-        static_assert(sizeof(SvgfAtrousPC) == 32, "SvgfAtrousPC must match svgf_atrous.slang push_constant");
+        static_assert(sizeof(SvgfAtrousPC) == 36, "SvgfAtrousPC must match svgf_atrous.slang push_constant");
 
-        // Channel-selected pointers into ViewResources — DI uses the svgf* fields, GI the svgfGi*
+        // Channel-selected pointers into ViewResources: DI uses the svgf* fields, GI the svgfGi*
         // (flat parallel set, mirroring the S0 restirDI/restirGiDI split). All array fields are
         // length-2; denoised/noisy are single. Resolved once per method; cheap pointer fixups.
         struct ChannelRefs {
@@ -60,7 +64,7 @@ namespace Luth
             std::shared_ptr<Texture>* geom;        // [2]
             std::shared_ptr<Texture>* atrous;      // [2]
             std::shared_ptr<Texture>* denoised;    // single
-            std::shared_ptr<Texture>* noisy;       // single — restirDI / restirGiDI (denoiser input)
+            std::shared_ptr<Texture>* noisy;       // single: restirDI / restirGiDI (denoiser input)
             VkDescriptorSet*          passthroughSet;
             VkDescriptorSet*          reprojectSet; // [2]
             VkDescriptorSet*          momentsSet;   // [2]
@@ -69,9 +73,9 @@ namespace Luth
         ChannelRefs Resolve(DenoiserChannel ch, ViewResources& vr) {
             if (ch == DenoiserChannel::Reflections)
             {
-                // Half-res reflections: à-trous final + passthrough write svgfSpecHalf (a bilateral upscale
+                // Half-res reflections: a-trous final + passthrough write svgfSpecHalf (a bilateral upscale
                 // resolves it into the full svgfSpecDenoised). Detect from the history extent vs the full
-                // denoised image — mirrors the DiSpecular/Gi half detection, no setting plumbing.
+                // denoised image; mirrors the DiSpecular/Gi half detection, no setting plumbing.
                 const bool specHalf = vr.svgfSpecHalf && vr.svgfSpecColorHist[0] && vr.svgfSpecDenoised
                     && std::static_pointer_cast<VKTexture>(vr.svgfSpecColorHist[0])->GetWidth()
                        < std::static_pointer_cast<VKTexture>(vr.svgfSpecDenoised)->GetWidth();
@@ -92,9 +96,9 @@ namespace Luth
             }
             if (ch == DenoiserChannel::Gi)
             {
-                // Half-res GI: the chain runs below full res, so the à-trous final + passthrough write the
+                // Half-res GI: the chain runs below full res, so the a-trous final + passthrough write the
                 // half svgfGiHalf (a bilateral upscale resolves it into the full svgfGiDenoised). Detect
-                // from the history extent vs the full-res denoised image — no setting plumbing needed.
+                // from the history extent vs the full-res denoised image; no setting plumbing needed.
                 const bool giHalf = vr.svgfGiHalf && vr.svgfGiColorHist[0] && vr.svgfGiDenoised
                     && std::static_pointer_cast<VKTexture>(vr.svgfGiColorHist[0])->GetWidth()
                        < std::static_pointer_cast<VKTexture>(vr.svgfGiDenoised)->GetWidth();
@@ -143,7 +147,7 @@ namespace Luth
         m_Pipeline = &pipeline;
         VkDevice device = VulkanContext::Get().GetDevice();
 
-        // Linear clamp-to-edge — matches the ReSTIR/RT pass samplers for SceneDepth/SlimNormal.
+        // Linear clamp-to-edge: matches the ReSTIR/RT pass samplers for SceneDepth/SlimNormal.
         VkSamplerCreateInfo sampCI{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         sampCI.magFilter    = VK_FILTER_LINEAR;
         sampCI.minFilter    = VK_FILTER_LINEAR;
@@ -165,26 +169,27 @@ namespace Luth
 
         // Reproject set (pass-local): b0-b3 current-frame samplers (DI, depth, normal, motion);
         // b4-b6 prev history storage (color+variance, moments+histLen, geom); b7-b9 curr history
-        // storage. History stays GENERAL (storage), so no UAB / per-frame rewrite — the two sets are
-        // pre-built per parity and bound by frameAbs & 1. The denoised output moved to the à-trous final
-        // level, so the reproject no longer binds it.
+        // storage; b10 slim matID sampler (motion variant's material history gate; the spec variant's
+        // shader leaves it undeclared). History stays GENERAL (storage), so no UAB / per-frame rewrite;
+        // the two sets are pre-built per parity and bound by frameAbs & 1. The denoised output moved to
+        // the a-trous final level, so the reproject no longer binds it.
         {
-            VkDescriptorSetLayoutBinding b[10]{};
-            for (u32 i = 0; i < 10; ++i)
+            VkDescriptorSetLayoutBinding b[11]{};
+            for (u32 i = 0; i < 11; ++i)
             {
                 b[i].binding         = i;
                 b[i].descriptorCount = 1;
                 b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-                b[i].descriptorType  = (i < 4) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                               : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                b[i].descriptorType  = (i < 4 || i == 10) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                          : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             }
             VkDescriptorSetLayoutCreateInfo ci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            ci.bindingCount = 10; ci.pBindings = b;
+            ci.bindingCount = 11; ci.pBindings = b;
             vkCreateDescriptorSetLayout(device, &ci, nullptr, &m_ReprojectLayout);
         }
 
         // Moments set (pass-local): b0 colorHist[curr] storage, b1 moments[curr] storage, b2 depth
-        // sampler, b3 normal sampler, b4 svgfAtrous[0] storage (à-trous level-0 input).
+        // sampler, b3 normal sampler, b4 svgfAtrous[0] storage (a-trous level-0 input).
         {
             VkDescriptorSetLayoutBinding b[5]{};
             const VkDescriptorType types[5] = {
@@ -202,27 +207,29 @@ namespace Luth
             vkCreateDescriptorSetLayout(device, &ci, nullptr, &m_MomentsLayout);
         }
 
-        // À-trous set (pass-local): b0 svgfAtrous[IN] storage, b1 depth sampler, b2 normal sampler,
-        // b3 svgfAtrous[OUT] storage, b4 svgfDenoised storage (final level). Two sets by iter parity.
+        // A-trous set (pass-local): b0 svgfAtrous[IN] storage, b1 depth sampler, b2 normal sampler,
+        // b3 svgfAtrous[OUT] storage, b4 svgfDenoised storage (final level), b5 slim roughness sampler
+        // (spec channels' edge-stop; diffuse channels disable via phiRough 0). Two sets by iter parity.
         {
-            VkDescriptorSetLayoutBinding b[5]{};
-            const VkDescriptorType types[5] = {
+            VkDescriptorSetLayoutBinding b[6]{};
+            const VkDescriptorType types[6] = {
                 VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                 VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             };
-            for (u32 i = 0; i < 5; ++i)
+            for (u32 i = 0; i < 6; ++i)
             {
                 b[i].binding = i; b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
                 b[i].descriptorType = types[i];
             }
             VkDescriptorSetLayoutCreateInfo ci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            ci.bindingCount = 5; ci.pBindings = b;
+            ci.bindingCount = 6; ci.pBindings = b;
             vkCreateDescriptorSetLayout(device, &ci, nullptr, &m_AtrousLayout);
         }
 
-        // Reflections denoises a specular signal → a SPECULAR reproject variant (hit-distance virtual
-        // reprojection); same layout/pcRange as the diffuse reproject. Moments/à-trous/passthrough shared.
+        // Reflections denoises a specular signal -> a SPECULAR reproject variant (hit-distance virtual
+        // reprojection); same layout/pcRange as the diffuse reproject. Moments/a-trous/passthrough shared.
         const char* reprojShader = (m_Channel == DenoiserChannel::Reflections)
             ? "shaders/svgf_spec_reproject.slang" : "shaders/svgf_reproject.slang";
         if (auto sh = ShaderLibrary::LoadEngine("shaders/svgf_passthrough.slang"))
@@ -245,7 +252,7 @@ namespace Luth
 
         VkDescriptorSetLayout globalLayout = m_Pipeline->GetGlobal().GetSetLayout();
 
-        // Reproject binds Set 0 (global UBO — nearZ/farZ/viewportSize) + the pass-local set.
+        // Reproject binds Set 0 (global UBO: nearZ/farZ/viewportSize) + the pass-local set.
         const std::vector<VkDescriptorSetLayout> reprojLayouts = { globalLayout, m_ReprojectLayout };
         VkPushConstantRange reprojPc{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SvgfReprojectPC) };
         m_ReprojectPipeline = std::make_unique<VKComputePipeline>(
@@ -292,7 +299,7 @@ namespace Luth
         LH_PROFILE_FUNCTION();
         if (!m_Pipeline) return false;
 
-        // Defer the old pipeline's destruction — an in-flight frame may still bind it; PushDeletion
+        // Defer the old pipeline's destruction; an in-flight frame may still bind it. PushDeletion
         // drains it MAX_FRAMES_IN_FLIGHT frames later (no vkDeviceWaitIdle).
         if (name == "svgf_passthrough.slang" && m_PassLayout != VK_NULL_HANDLE)
         {
@@ -443,50 +450,54 @@ namespace Luth
 
         // Reproject sets: pre-build both parities (set[p] reads prev = [p^1], writes curr = [p]).
         // Reproject b3: DI/GI bind slim MOTION; the specular variant binds slim ROUGHNESS (it computes
-        // the reflection's own motion internally via hit-distance virtual reprojection).
+        // the reflection's own motion internally via hit-distance virtual reprojection). b10 slim matID
+        // is written for every channel (layout parity); only the motion variant's shader reads it.
         const std::shared_ptr<Texture> b3Tex = (m_Channel == DenoiserChannel::Reflections)
             ? targets.GetSlimRoughness() : targets.GetSlimMotion();
         if (c.reprojectSet[0] != VK_NULL_HANDLE && *c.noisy
             && c.colorHist[0] && c.moments[0] && c.geom[0]
-            && targets.GetSceneDepth() && targets.GetSlimNormal() && b3Tex)
+            && targets.GetSceneDepth() && targets.GetSlimNormal() && b3Tex
+            && targets.GetSlimMaterialID())
         {
             const VkImageView depthV  = viewOf(targets.GetSceneDepth());
             const VkImageView normalV = viewOf(targets.GetSlimNormal());
             const VkImageView motionV = viewOf(b3Tex);
             const VkImageView diV     = viewOf(*c.noisy);
+            const VkImageView matIdV  = viewOf(targets.GetSlimMaterialID());
 
             for (u32 p = 0; p < 2; ++p)
             {
                 const u32 q = p ^ 1u;  // prev parity
-                VkDescriptorImageInfo info[10]{};
-                info[0] = { m_Sampler, diV,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-                info[1] = { m_Sampler, depthV,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-                info[2] = { m_Sampler, normalV, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-                info[3] = { m_Sampler, motionV, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-                info[4] = { VK_NULL_HANDLE, viewOf(c.colorHist[q]), VK_IMAGE_LAYOUT_GENERAL };
-                info[5] = { VK_NULL_HANDLE, viewOf(c.moments[q]),   VK_IMAGE_LAYOUT_GENERAL };
-                info[6] = { VK_NULL_HANDLE, viewOf(c.geom[q]),      VK_IMAGE_LAYOUT_GENERAL };
-                info[7] = { VK_NULL_HANDLE, viewOf(c.colorHist[p]), VK_IMAGE_LAYOUT_GENERAL };
-                info[8] = { VK_NULL_HANDLE, viewOf(c.moments[p]),   VK_IMAGE_LAYOUT_GENERAL };
-                info[9] = { VK_NULL_HANDLE, viewOf(c.geom[p]),      VK_IMAGE_LAYOUT_GENERAL };
+                VkDescriptorImageInfo info[11]{};
+                info[0]  = { m_Sampler, diV,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                info[1]  = { m_Sampler, depthV,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                info[2]  = { m_Sampler, normalV, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                info[3]  = { m_Sampler, motionV, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                info[4]  = { VK_NULL_HANDLE, viewOf(c.colorHist[q]), VK_IMAGE_LAYOUT_GENERAL };
+                info[5]  = { VK_NULL_HANDLE, viewOf(c.moments[q]),   VK_IMAGE_LAYOUT_GENERAL };
+                info[6]  = { VK_NULL_HANDLE, viewOf(c.geom[q]),      VK_IMAGE_LAYOUT_GENERAL };
+                info[7]  = { VK_NULL_HANDLE, viewOf(c.colorHist[p]), VK_IMAGE_LAYOUT_GENERAL };
+                info[8]  = { VK_NULL_HANDLE, viewOf(c.moments[p]),   VK_IMAGE_LAYOUT_GENERAL };
+                info[9]  = { VK_NULL_HANDLE, viewOf(c.geom[p]),      VK_IMAGE_LAYOUT_GENERAL };
+                info[10] = { m_Sampler, matIdV,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
 
-                VkWriteDescriptorSet w[10]{};
-                for (u32 i = 0; i < 10; ++i)
+                VkWriteDescriptorSet w[11]{};
+                for (u32 i = 0; i < 11; ++i)
                 {
                     w[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
                     w[i].dstSet          = c.reprojectSet[p];
                     w[i].dstBinding      = i;
-                    w[i].descriptorType  = (i < 4) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                                   : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                    w[i].descriptorType  = (i < 4 || i == 10) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                              : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                     w[i].descriptorCount = 1;
                     w[i].pImageInfo      = &info[i];
                 }
-                vkUpdateDescriptorSets(device, 10, w, 0, nullptr);
+                vkUpdateDescriptorSets(device, 11, w, 0, nullptr);
             }
         }
 
         // Moments sets: per parity p, b0/b1 = colorHist[p]/moments[p] (the reproject's curr output),
-        // b2/b3 depth/normal samplers, b4 svgfAtrous[0] (à-trous level-0 input — shared, not ping-ponged).
+        // b2/b3 depth/normal samplers, b4 svgfAtrous[0] (a-trous level-0 input; shared, not ping-ponged).
         if (c.momentsSet[0] != VK_NULL_HANDLE
             && c.colorHist[0] && c.moments[0] && c.atrous[0]
             && targets.GetSceneDepth() && targets.GetSlimNormal())
@@ -520,39 +531,43 @@ namespace Luth
             }
         }
 
-        // À-trous sets: per iter parity ip, b0 = svgfAtrous[ip] (in), b3 = svgfAtrous[ip^1] (out),
-        // b1/b2 depth/normal samplers, b4 svgfDenoised (final-level output).
+        // A-trous sets: per iter parity ip, b0 = svgfAtrous[ip] (in), b3 = svgfAtrous[ip^1] (out),
+        // b1/b2 depth/normal samplers, b4 svgfDenoised (final-level output), b5 slim roughness (spec
+        // channels' edge-stop; bound for every channel, diffuse ones disable via phiRough 0).
         if (c.atrousSet[0] != VK_NULL_HANDLE
             && c.atrous[0] && c.atrous[1] && *c.denoised
-            && targets.GetSceneDepth() && targets.GetSlimNormal())
+            && targets.GetSceneDepth() && targets.GetSlimNormal() && targets.GetSlimRoughness())
         {
             const VkImageView depthV  = viewOf(targets.GetSceneDepth());
             const VkImageView normalV = viewOf(targets.GetSlimNormal());
             const VkImageView denV    = viewOf(*c.denoised);
+            const VkImageView roughV  = viewOf(targets.GetSlimRoughness());
 
             for (u32 ip = 0; ip < 2; ++ip)
             {
                 const u32 op = ip ^ 1u;
-                VkDescriptorImageInfo info[5]{};
+                VkDescriptorImageInfo info[6]{};
                 info[0] = { VK_NULL_HANDLE, viewOf(c.atrous[ip]), VK_IMAGE_LAYOUT_GENERAL };
                 info[1] = { m_Sampler, depthV,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
                 info[2] = { m_Sampler, normalV, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
                 info[3] = { VK_NULL_HANDLE, viewOf(c.atrous[op]), VK_IMAGE_LAYOUT_GENERAL };
                 info[4] = { VK_NULL_HANDLE, denV, VK_IMAGE_LAYOUT_GENERAL };
+                info[5] = { m_Sampler, roughV,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
 
-                const VkDescriptorType types[5] = {
+                const VkDescriptorType types[6] = {
                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                 };
-                VkWriteDescriptorSet w[5]{};
-                for (u32 i = 0; i < 5; ++i)
+                VkWriteDescriptorSet w[6]{};
+                for (u32 i = 0; i < 6; ++i)
                 {
                     w[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
                     w[i].dstSet = c.atrousSet[ip]; w[i].dstBinding = i;
                     w[i].descriptorType = types[i]; w[i].descriptorCount = 1; w[i].pImageInfo = &info[i];
                 }
-                vkUpdateDescriptorSets(device, 5, w, 0, nullptr);
+                vkUpdateDescriptorSets(device, 6, w, 0, nullptr);
             }
         }
     }
@@ -560,7 +575,7 @@ namespace Luth
     RG::ResourceHandle SvgfDenoiser::AddPasses(RG::RenderGraph& rg, const DenoiseInputs& in)
     {
         LH_PROFILE_FUNCTION();
-        // Invalid input → ReSTIR produced no DI this frame; return invalid so the GeometryPass skips
+        // Invalid input -> ReSTIR produced no DI this frame; return invalid so the GeometryPass skips
         // the read and pbr.frag runs its own light loop.
         if (!in.di.IsValid()) return {};
 
@@ -588,7 +603,7 @@ namespace Luth
         const SvgfSettings& s = Settings();
 
         // Working resolution = the channel's history-texture extent. Half-res GI runs the whole chain
-        // below the full G-buffer; full-res channels keep chW/chH == full → scale 1 (identity remap).
+        // below the full G-buffer; full-res channels keep chW/chH == full -> scale 1 (identity remap).
         ViewResources* vrTop = m_Pipeline ? m_Pipeline->GetCurrentViewResources() : nullptr;
         u32 chW = vrTop ? vrTop->width  : 0u;
         u32 chH = vrTop ? vrTop->height : 0u;
@@ -604,15 +619,24 @@ namespace Luth
         }
         const i32 gbufScale = (vrTop && chW == vrTop->width && chH == vrTop->height) ? 1 : 2;
 
+        // Channel routing: confidence only for the MOTION-variant channels (Di / Gi / DiSpecular) -
+        // the spec variant's input alpha is hitDist, never confidence. Roughness edge-stop only for the
+        // specular channels (Reflections / DiSpecular); zeroing here is structural, not a UI convention.
+        const bool motionVariant = (m_Channel != DenoiserChannel::Reflections);
+        const bool specChannel   = (m_Channel == DenoiserChannel::Reflections
+                                 || m_Channel == DenoiserChannel::DiSpecular);
+
         SvgfReprojectPC rpc{};
-        rpc.alphaColor      = s.alphaColor;
-        rpc.alphaMoments    = s.alphaMoments;
-        rpc.historyCap      = static_cast<f32>(s.historyCap);
-        rpc.depthThreshold  = s.depthThreshold;
-        rpc.normalThreshold = s.normalThreshold;
-        rpc.gbufferScale    = gbufScale;
-        rpc.dispatchW       = static_cast<i32>(chW);
-        rpc.dispatchH       = static_cast<i32>(chH);
+        rpc.alphaColor       = s.alphaColor;
+        rpc.alphaMoments     = s.alphaMoments;
+        rpc.historyCap       = static_cast<f32>(s.historyCap);
+        rpc.depthThreshold   = s.depthThreshold;
+        rpc.normalThreshold  = s.normalThreshold;
+        rpc.gbufferScale     = gbufScale;
+        rpc.dispatchW        = static_cast<i32>(chW);
+        rpc.dispatchH        = static_cast<i32>(chH);
+        rpc.antiFireflySigma = s.antiFireflySigma;
+        rpc.confidenceScale  = motionVariant ? s.confidenceScale : 0.0f;
 
         SvgfMomentsPC mpc{};
         mpc.phiDepth     = s.phiDepth;
@@ -625,10 +649,10 @@ namespace Luth
         const u32 fp       = frameAbs & 1u;                       // reproject/moments curr parity
         const u32 N        = std::max(1u, s.atrousIterations);
 
-        // Import each distinct VkImage at most ONCE per frame — re-importing aliases distinct RG nodes
+        // Import each distinct VkImage at most ONCE per frame: re-importing aliases distinct RG nodes
         // (a known hazard). colorHist[fp], moments[fp], svgfAtrous[0], svgfAtrous[1], svgfDenoised each
         // get exactly one ImportResource; their handles thread forward across the chain so the RG inserts
-        // the within-frame barriers. History geom[fp] (reproject b9) stays descriptor-only — cross-frame.
+        // the within-frame barriers. History geom[fp] (reproject b9) stays descriptor-only (cross-frame).
         auto importTex = [&rg](const std::shared_ptr<Texture>& t, const char* name) {
             auto vt = std::static_pointer_cast<VKTexture>(t);
             RG::TextureDesc d;
@@ -640,7 +664,7 @@ namespace Luth
                                      RG::ResourceState::Undefined);
         };
 
-        // Reproject — writes colorHist[fp] (integrated color + temporal variance) + moments[fp]. The
+        // Reproject: writes colorHist[fp] (integrated color + temporal variance) + moments[fp]. The
         // current-frame inputs (DI/depth/normal/motion) come in through the RG; the curr history images
         // are imported here and their handles (hColor/hMom) thread into the moments read.
         struct ReprojData {
@@ -688,9 +712,9 @@ namespace Luth
                 vkCmdDispatch(cmd, gx, gy, 1);
             });
 
-        // Moments — reads colorHist[fp] + moments[fp] (threaded hColor/hMom → reproject→moments RAW
+        // Moments: reads colorHist[fp] + moments[fp] (threaded hColor/hMom -> reproject->moments RAW
         // barrier), writes svgfAtrous[0]. Depth/normal are descriptor-only (already SHADER_READ_ONLY
-        // from the reproject's RG reads). svgfAtrous[0] is imported ONCE here; hA0 threads into à-trous.
+        // from the reproject's RG reads). svgfAtrous[0] is imported ONCE here; hA0 threads into a-trous.
         struct MomentsData {
             RG::ResourceHandle color, mom, out;
         };
@@ -700,7 +724,7 @@ namespace Luth
             RG::QueueFamily::AsyncCompute,
             [&, this](MomentsData& data, RG::RenderPassBuilder& builder) {
                 // GENERAL-preserving reads: colorHist/moments are STORAGE images (imageLoad in the
-                // shader), so they must stay GENERAL — ReadStorageImage would transition them to
+                // shader), so they must stay GENERAL; ReadStorageImage would transition them to
                 // SHADER_READ_ONLY and mismatch the STORAGE_IMAGE descriptor.
                 data.color = builder.ReadStorageImageGeneral(hColor);
                 data.mom   = builder.ReadStorageImageGeneral(hMom);
@@ -733,10 +757,10 @@ namespace Luth
                 vkCmdDispatch(cmd, gx, gy, 1);
             });
 
-        // À-trous — N levels ping-ponging svgfAtrous[0]/[1] with a doubling step. hA[2] tracks the live
+        // A-trous: N levels ping-ponging svgfAtrous[0]/[1] with a doubling step. hA[2] tracks the live
         // handle per slot: hA[0] starts as the moments output; svgfAtrous[1] is imported ONCE (the first
-        // time it is written, i==0). Each level reads hA[in] and writes hA[out] (threaded → per-level
-        // RAW barrier). The final level also writes svgfDenoised (imported once → hDen).
+        // time it is written, i==0). Each level reads hA[in] and writes hA[out] (threaded -> per-level
+        // RAW barrier). The final level also writes svgfDenoised (imported once -> hDen).
         RG::ResourceHandle hA[2] = { hA0, {} };
         RG::ResourceHandle hDen{};
         for (u32 i = 0; i < N; ++i)
@@ -755,6 +779,7 @@ namespace Luth
             apc.gbufferScale = gbufScale;
             apc.dispatchW    = static_cast<i32>(chW);
             apc.dispatchH    = static_cast<i32>(chH);
+            apc.phiRough     = specChannel ? s.phiRough : 0.0f;
 
             struct AtrousData {
                 RG::ResourceHandle in, out, den;
@@ -763,7 +788,7 @@ namespace Luth
                 PassName(2),
                 RG::QueueFamily::AsyncCompute,
                 [&, this](AtrousData& data, RG::RenderPassBuilder& builder) {
-                    data.in = builder.ReadStorageImageGeneral(hA[inPar]);  // STORAGE imageLoad — keep GENERAL
+                    data.in = builder.ReadStorageImageGeneral(hA[inPar]);  // STORAGE imageLoad; keep GENERAL
 
                     ViewResources* vr = m_Pipeline->GetCurrentViewResources();
                     ChannelRefs c = Resolve(m_Channel, *vr);

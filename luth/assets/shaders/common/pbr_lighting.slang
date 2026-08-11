@@ -1,4 +1,4 @@
-// Shared forward lighting for PBR raster consumers — CSM cascade sampling, the clustered point-light loop,
+// Shared forward lighting for PBR raster consumers: CSM cascade sampling, the clustered point-light loop,
 // and split-sum IBL ambient. Twin of pbr_lighting.glsl (deleted once pbr + transparent convert).
 // Set 3 here is bindings 0-3 only; the opaque-depth-coupled screen-space inputs stay with the consumer.
 // see arch/rendering-pipeline.md
@@ -75,13 +75,13 @@ public uint ComputeClusterID(float4 fragCoord, float2 viewportPx, float nearZ, f
     return slice * k_ClusterTilesX * k_ClusterTilesY + tile.y * k_ClusterTilesX + tile.x;
 }
 
-// Fresnel-Schlick with roughness (IBL — rough surfaces reduce reflections).
+// Fresnel-Schlick with roughness (IBL: rough surfaces reduce reflections).
 public float3 FresnelSchlickRoughness(float cosTheta, float3 F0, float roughness)
 {
     return F0 + (max(float3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-// ── CSM PCF shadow ──
+// ---- CSM PCF shadow ----
 public struct CascadeProj { public float3 proj; public bool inside; }
 
 CascadeProj ProjectInCascade(float3 worldPos, int c, float2 texelSize, float depthBias)
@@ -89,7 +89,7 @@ CascadeProj ProjectInCascade(float3 worldPos, int c, float2 texelSize, float dep
     float4 lsPos = mul(ubo.lightSpaceMatrix[c], float4(worldPos, 1.0));
     float3 proj  = lsPos.xyz / lsPos.w;
     proj.xy      = proj.xy * 0.5 + 0.5;
-    float2 xyLo  = float2(2.0 * texelSize);   // inset matches the 3×3 PCF footprint
+    float2 xyLo  = float2(2.0 * texelSize);   // inset matches the 3x3 PCF footprint
     float2 xyHi  = float2(1.0) - xyLo;
     bool insideXY = all(proj.xy >= xyLo) && all(proj.xy <= xyHi);
     bool insideZ  = (proj.z >= max(depthBias, 0.0)) && (proj.z <= 1.0);
@@ -97,7 +97,7 @@ CascadeProj ProjectInCascade(float3 worldPos, int c, float2 texelSize, float dep
     return r;
 }
 
-// 3×3 PCF; slope-scaled depth bias. shadowMap is a comparison sampler → SampleCmp returns the PCF result.
+// 3x3 PCF; slope-scaled depth bias. shadowMap is a comparison sampler -> SampleCmp returns the PCF result.
 float SamplePCF(float3 proj, int cascade, float depthBias, float NdotL, float2 texelSize)
 {
     float slopeFactor = clamp(tan(acos(NdotL)), 1.0, 10.0);
@@ -162,11 +162,10 @@ public ShadowResult ComputeShadowCSM(float3 worldPos, float3 N)
     return res;
 }
 
-// Unshadowed Forward+ cluster loop — point + spot lights. Spot indices carry SPOT_INDEX_FLAG; the cone
+// Unshadowed Forward+ cluster loop: point + spot lights. Spot indices carry SPOT_INDEX_FLAG; the cone
 // term gates the shared point distance/range falloff. spotsOnly skips points when ReSTIR DI already
-// supplied them via the demodulated image — spots aren't in the DI reservoir yet, so they ride here.
-public float3 EvalClusteredLights(float4 fragCoord, float3 worldPos, float3 V, float3 N,
-                                  float3 albedo, float metallic, float roughness, bool spotsOnly)
+// supplied them via the demodulated image; spots aren't in the DI reservoir yet, so they ride here.
+public float3 EvalClusteredLights(float4 fragCoord, float3 worldPos, float3 V, SurfaceBRDF s, bool spotsOnly)
 {
     float3 Lo        = float3(0.0);
     uint   clusterID = ComputeClusterID(fragCoord, ubo.viewportSize, ubo.nearZ, ubo.farZ);
@@ -198,7 +197,7 @@ public float3 EvalClusteredLights(float4 fragCoord, float3 worldPos, float3 V, f
         float  rolloff = pow(1.0 - clamp(dist / range, 0.0, 1.0), 2.0);
         float3 radiance = color * intensity * atten * rolloff * cone;
         if (dot(radiance, radiance) > 0.0001)
-            Lo += EvalBRDFTimesNdotL(normalize(toLight), radiance, V, N, albedo, metallic, roughness);
+            Lo += EvalSurfBRDFTimesNdotL(normalize(toLight), radiance, V, s);
     }
     return Lo;
 }
@@ -207,22 +206,67 @@ public float3 EvalClusteredLights(float4 fragCoord, float3 worldPos, float3 V, f
 // specularIBL out for traced radiance above the roughness cutoff.
 public struct IblResult { public float3 ambient; public float3 envBRDF; public float3 specularIBL; }
 
-public IblResult EvalIblAmbient(float3 N, float3 V, float3 albedo, float metallic, float roughness, float ao, float iblIntensity)
+public IblResult EvalIblAmbient(SurfaceBRDF s, float3 V, float ao, float iblIntensity)
 {
-    float3 F0 = lerp(float3(0.04), albedo, metallic);
-    float3 F  = FresnelSchlickRoughness(max(dot(N, V), 0.0), F0, roughness);
-    float3 kD = (1.0 - F) * (1.0 - metallic);
+    float  NoV = max(dot(s.N, V), 0.0);
+    float3 F0  = lerp(float3(s.dielectricF0), s.albedo, s.metallic);
+    float3 F   = FresnelSchlickRoughness(NoV, F0, s.roughness);
+    float3 kD  = (1.0 - F) * (1.0 - s.metallic);
+    if (s.transmission > 0.0) kD *= (1.0 - s.transmission * (1.0 - s.metallic));  // glass: diffuse IBL -> transmission
 
-    float3 diffuseIBL = u_IrradianceMap.Sample(N).rgb * albedo;
+    float3 diffuseIBL = u_IrradianceMap.Sample(s.N).rgb * s.albedo;
 
     const float MAX_REFLECTION_LOD = 4.0;
-    float3 R = reflect(-V, N);
-    float3 prefilteredColor = u_PrefilteredMap.SampleLevel(R, roughness * MAX_REFLECTION_LOD).rgb;
-    float2 brdf = u_BrdfLUT.Sample(float2(max(dot(N, V), 0.0), roughness)).rg;
+    // Anisotropic bent reflection (McAuley/Filament): warp N toward the stretched-highlight axis.
+    float3 R;
+    if (abs(s.anisotropy) > 1.0e-3)
+    {
+        float3 dir  = (s.anisotropy >= 0.0) ? s.B : s.T;
+        float3 nA   = cross(cross(dir, V), dir);
+        float  bend = abs(s.anisotropy) * saturate(5.0 * s.roughness);
+        R = reflect(-V, normalize(lerp(s.N, nA, bend)));
+    }
+    else
+        R = reflect(-V, s.N);
+    float3 prefilteredColor = u_PrefilteredMap.SampleLevel(R, s.roughness * MAX_REFLECTION_LOD).rgb;
+    float2 brdf = u_BrdfLUT.Sample(float2(NoV, s.roughness)).rg;
 
     IblResult r;
     r.envBRDF     = F * brdf.x + brdf.y;
     r.specularIBL = prefilteredColor * r.envBRDF;
-    r.ambient     = (kD * diffuseIBL + r.specularIBL) * ao * iblIntensity;
+
+    float3 base = kD * diffuseIBL + r.specularIBL;
+
+    // Sheen env lobe UNDER the coat: split-sum with E_Sheen as the (Fresnel-free) BRDF term; the GGX
+    // prefilter at the sheen roughness stands in for a Charlie prefilter (Filament does the same). Folding
+    // sheenScale into envBRDF/specularIBL keeps the consumer's RT-reflection swap correct -- the fuzz
+    // attenuates the base spec whether it comes from the cube or the tracer.
+    float sheenW = max(s.sheenColor.r, max(s.sheenColor.g, s.sheenColor.b));
+    if (sheenW > 0.0)
+    {
+        float  sr = clamp(s.sheenRoughness, 0.04, 1.0);
+        float  Es = E_Sheen(NoV, sr);
+        float3 sheenEnv = u_PrefilteredMap.SampleLevel(reflect(-V, s.N), sr * MAX_REFLECTION_LOD).rgb
+                        * (s.sheenColor * Es);
+        float  sheenScale = 1.0 - sheenW * Es;
+        base = base * sheenScale + sheenEnv;
+        r.envBRDF     *= sheenScale;
+        r.specularIBL *= sheenScale;
+    }
+
+    if (s.clearcoat > 0.0)
+    {
+        // Isotropic F0=0.04 coat env lobe on top; base attenuates by (1-Fc). Folding (1-Fc) into
+        // envBRDF/specularIBL keeps the consumer's RT-reflection composite (base-spec swap) correct.
+        float  Fc  = s.clearcoat * (0.04 + 0.96 * pow(1.0 - NoV, 5.0));
+        float  ccR = clamp(s.clearcoatRoughness, 0.04, 1.0);
+        float3 Rc  = reflect(-V, s.N);
+        float2 ccB = u_BrdfLUT.Sample(float2(NoV, ccR)).rg;
+        float3 ccSpec = u_PrefilteredMap.SampleLevel(Rc, ccR * MAX_REFLECTION_LOD).rgb * (0.04 * ccB.x + ccB.y);
+        base = base * (1.0 - Fc) + ccSpec;
+        r.envBRDF     *= (1.0 - Fc);
+        r.specularIBL *= (1.0 - Fc);
+    }
+    r.ambient = base * ao * iblIntensity;
     return r;
 }

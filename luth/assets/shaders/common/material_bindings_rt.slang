@@ -1,50 +1,89 @@
 // RT-set material bindings (Set 3 material SSBO, Set 4 bindless textures) + the gradient-free fetch
 // policy + the FetchHitSurface / alpha-test wrappers that need those globals. Pairs with material.slang.
-// Hand-pinned sets — slang#8063 forbids auto-binding the variable-count bindless heap. see arch/rendering-pipeline.md
+// Hand-pinned sets; slang#8063 forbids auto-binding the variable-count bindless heap. see arch/rendering-pipeline.md
 import material;
-import mat_graph_registry;   // EvalGraphVariant — engine default (stock) or the project's generated override
+import mat_graph_registry;   // EvalGraphVariant: engine default (stock) or the project's generated override
+import globals;              // ubo.time for graph context; every RT consumer binds Set 0 globals
 
 [[vk::binding(0, 3)]] StructuredBuffer<GPUMaterialData> gMaterials;
-[[vk::binding(1, 3)]] StructuredBuffer<float4>          gMatParams;   // shares MaterialSystem's set (binding 1) — same buffer raster sees at set 2
+[[vk::binding(1, 3)]] StructuredBuffer<float4>          gMatParams;   // shares MaterialSystem's set (binding 1); same buffer raster sees at set 2
+[[vk::binding(2, 3)]] StructuredBuffer<uint>            gMatTexParams; // declared-texture bindless indices; same buffer raster sees at set 2 binding 2
 [[vk::binding(0, 4)]] Sampler2D                         gTextures[];
 
 public struct RayFetch : ITexFetch
 {
-    public uint paramBase;       // = materialSlot * MAT_GRAPH_STRIDE; set per hit before EvalGraphVariant
-    public __init() { paramBase = 0; }
+    public uint   paramBase;     // = materialSlot * MAT_GRAPH_STRIDE; set per hit before EvalGraphVariant
+    public uint   texBase;       // = materialSlot * MAT_TEX_STRIDE; indexes gMatTexParams for declared textures
+    public float3 worldPos;      // graph context, filled by FetchHitSurface from the hit
+    public float3 viewDir;
+    public float  time;
+    public float  ndotv;
+    public float3 worldNormal;   // Triplanar blend weights; FetchHitSurface fills it with the smooth hit normal
+    public float3 tangentViewDir; // tangent-space view dir (parallax); FetchHitSurface fills from the hit TBN
+    public __init() { paramBase = 0; texBase = 0; worldPos = float3(0.0); viewDir = float3(0.0, 0.0, 1.0); time = 0.0; ndotv = 1.0; worldNormal = float3(0.0, 0.0, 1.0); tangentViewDir = float3(0.0, 0.0, 1.0); }
     public float4 Sample(uint index, float2 uv) { return gTextures[NonUniformResourceIndex(index)].SampleLevel(uv, 0.0); }
+    public float4 SampleLod(uint index, float2 uv, float lod) { return gTextures[NonUniformResourceIndex(index)].SampleLevel(uv, lod); }
     public float4 Param(uint slot) { return gMatParams[paramBase + slot]; }
+    public uint TexIndex(uint slot) { return gMatTexParams[texBase + slot]; }
+    public float3 WorldPos() { return worldPos; }
+    public float3 ViewDir()  { return viewDir; }
+    public float  Time()     { return time; }
+    public float  NdotV()    { return ndotv; }
+    public float3 WorldNormal() { return worldNormal; }
+    public float3 TangentViewDir() { return tangentViewDir; }
 }
 
 // RT analog of EvalPbrSurface: gather geometry, decode channels (LOD 0), perturb + face the normal.
 public HitSurface FetchHitSurface(GtGeomEntry* geomTable, uint customIndex, uint primIndex,
-                                  float2 bary, float3x4 o2w, float3 rayDir)
+                                  float2 bary, float3x4 o2w, float3 rayDir, float3 hitPos)
 {
     HitGeometry g = GatherHitGeometry(geomTable, customIndex, primIndex, bary, o2w, rayDir);
     GPUMaterialData m = gMaterials[g.materialSlot];
     RayFetch rf;
     rf.paramBase = g.materialSlot * MAT_GRAPH_STRIDE;
+    rf.texBase   = g.materialSlot * MAT_TEX_STRIDE;
+    rf.worldPos  = hitPos;
+    rf.viewDir   = -rayDir;
+    rf.time      = ubo.time;
+    rf.ndotv     = saturate(dot(g.ns, -rayDir));
+    rf.worldNormal = g.ns;
+    // Tangent-space view dir for parallax (same bitangent the normal map uses below); tangentless -> straight-on.
+    rf.tangentViewDir = g.hasTangent
+        ? float3(dot(rf.viewDir, g.T), dot(rf.viewDir, cross(g.ns, g.T) * g.tSign), dot(rf.viewDir, g.ns))
+        : float3(0.0, 0.0, 1.0);
     MaterialInputs mi = EvalGraphVariant<RayFetch>(GraphVariant(m.flags), m, g.uv0, g.uv1, rf);
 
     float3 N = g.ns;
     if ((m.flags & FLAG_HAS_NORMAL) != 0u && g.hasTangent)
-        N = ApplyNormalMap<RayFetch>(m, g.uv0, g.uv1, g.T, cross(g.ns, g.T), g.ns, rf);
+        N = ApplyNormalMap<RayFetch>(m, g.uv0, g.uv1, g.T, cross(g.ns, g.T) * g.tSign, g.ns, rf);
     // Graphed normal overrides on tangented meshes; tangentless RT keeps g.ns (stock-map parity).
     if (any(mi.normal != float3(0.0, 0.0, 1.0)) && g.hasTangent)
-        N = ApplyTangentNormal(mi.normal, g.T, cross(g.ns, g.T), g.ns);
+        N = ApplyTangentNormal(mi.normal, g.T, cross(g.ns, g.T) * g.tSign, g.ns);
     if (dot(N, g.ng) < 0.0) N = -N;   // face shading normal to the geometric side (RT analog of gl_FrontFacing)
 
     HitSurface s;
     s.ns = N;  s.ng = g.ng;
-    s.baseColor = mi.baseColor.rgb;
+    s.baseColor = mi.baseColor.rgb * g.color;   // per-vertex color modulation (raster==RT albedo parity)
     s.emission  = mi.emissive;
     s.metalness = mi.metallic;
     s.roughness = mi.roughness;
     s.ao        = mi.occlusion;
+    // Tangent the RT tier already reconstructed (dropped until now); re-orthonormalized vs N in MakeSurfaceBRDF.
+    s.T = g.T;  s.tSign = g.tSign;  s.hasTangent = g.hasTangent;
+    s.clearcoat = mi.clearcoat;  s.clearcoatRoughness = mi.clearcoatRoughness;
+    s.anisotropy = mi.anisotropy;  s.anisotropyRotation = mi.anisotropyRotation;
+    s.specular = mi.specular;
+    s.transmission = mi.transmission;  s.ior = mi.ior;
+    s.attenuationColor = mi.attenuationColor;  s.attenuationDistance = mi.attenuationDistance;
+    s.sheenColor = mi.sheenColor;  s.sheenRoughness = mi.sheenRoughness;
+    s.subsurfaceColor = mi.subsurfaceColor;  s.subsurfaceRadius = mi.subsurfaceRadius;  s.subsurfaceThickness = mi.subsurfaceThickness;
+    // Un-faced geometric smooth normal (g.ns keeps its outward orientation; s.ns above was faced against the
+    // ray): dot < 0 means the ray hit the outward side = entering the medium. Feeds the PT enter/exit + IOR ratio.
+    s.frontFace = dot(g.ns, rayDir) < 0.0;
     return s;
 }
 
-// Cutout alpha test at a rayQuery candidate hit — mirrors the diffuse-alpha decode at LOD 0.
+// Cutout alpha test at a rayQuery candidate hit: mirrors the diffuse-alpha decode at LOD 0.
 public bool AlphaTestCandidateHit(GtGeomEntry* geomTable, uint customIndex, uint primIndex, float2 bary)
 {
     GtGeomEntry ge = geomTable[customIndex];

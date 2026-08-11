@@ -10,29 +10,55 @@
 
 namespace Luth
 {
+    // Serialize to a temp sibling then atomically rename into place. std::ofstream truncates-then-streams,
+    // so an in-place write leaves fs::exists(path)==true over partial bytes for the whole write window and a
+    // racing reader torn-reads. Writing {path}.tmp then renaming makes the artifact appear atomically (same
+    // dir -> same volume), and a crash mid-write leaves the prior artifact intact instead of a truncated stub.
+    template <typename WriteFn>
+    static bool SerializeAtomic(const fs::path& path, WriteFn&& writeFn)
+    {
+        fs::path tmp = path;
+        tmp += ".tmp";
+
+        bool ok = false;
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            if (out.is_open())
+                ok = writeFn(out) && out.good();
+        }   // flush + close before the rename
+
+        std::error_code ec;
+        if (!ok) { fs::remove(tmp, ec); return false; }
+
+        fs::rename(tmp, path, ec);
+        if (ec) { fs::remove(tmp, ec); return false; }
+        return true;
+    }
+
     bool AssetSerializer::SerializeTexture(const fs::path& path, const TextureAssetData& data)
     {
         LH_PROFILE_FUNCTION();
-        std::ofstream out(path, std::ios::binary);
-        if (!out.is_open()) return false;
+        return SerializeAtomic(path, [&](std::ofstream& out) {
+            AssetHeader header;
+            header.Type = AssetType::Texture;
+            header.Version = 2; // V2: BCn payload + MipLevels. V1 artifacts fail the deserialize gate.
+            out.write((char*)&header, sizeof(AssetHeader));
 
-        AssetHeader header;
-        header.Type = AssetType::Texture;
-        out.write((char*)&header, sizeof(AssetHeader));
+            TextureHeader texHeader;
+            texHeader.Width = data.Width;
+            texHeader.Height = data.Height;
+            texHeader.Format = (u32)data.Format;
+            texHeader.SizeBytes = (u32)data.Pixels.size();
+            texHeader.GenerateMipmaps = data.Settings.GenerateMipmaps ? 1 : 0;
+            texHeader.WrapMode = (u32)data.Settings.WrapMode;
+            texHeader.MinFilter = (u32)data.Settings.MinFilter;
+            texHeader.MagFilter = (u32)data.Settings.MagFilter;
+            texHeader.MipLevels = data.MipLevels;
+            out.write((char*)&texHeader, sizeof(TextureHeader));
 
-        TextureHeader texHeader;
-        texHeader.Width = data.Width;
-        texHeader.Height = data.Height;
-        texHeader.Format = (u32)data.Format;
-        texHeader.SizeBytes = (u32)data.Pixels.size();
-        texHeader.GenerateMipmaps = data.Settings.GenerateMipmaps ? 1 : 0;
-        texHeader.WrapMode = (u32)data.Settings.WrapMode;
-        texHeader.MinFilter = (u32)data.Settings.MinFilter;
-        texHeader.MagFilter = (u32)data.Settings.MagFilter;
-        out.write((char*)&texHeader, sizeof(TextureHeader));
-
-        out.write((char*)data.Pixels.data(), data.Pixels.size());
-        return true;
+            out.write((char*)data.Pixels.data(), data.Pixels.size());
+            return true;
+        });
     }
 
     bool AssetSerializer::DeserializeTexture(const fs::path& path, TextureAssetData& outData)
@@ -44,6 +70,8 @@ namespace Luth
         AssetHeader header;
         in.read((char*)&header, sizeof(AssetHeader));
         if (header.Type != AssetType::Texture) return false;
+        // Reject pre-BCn (V1) artifacts so the loader's force-reimport self-heals them (AssetManager).
+        if (header.Version != 2) return false;
 
         TextureHeader texHeader;
         in.read((char*)&texHeader, sizeof(TextureHeader));
@@ -51,6 +79,7 @@ namespace Luth
         outData.Width = texHeader.Width;
         outData.Height = texHeader.Height;
         outData.Format = (TextureFormat)texHeader.Format;
+        outData.MipLevels = texHeader.MipLevels;
         outData.Settings.GenerateMipmaps = texHeader.GenerateMipmaps != 0;
         outData.Settings.WrapMode = (TextureWrapMode)texHeader.WrapMode;
         outData.Settings.MinFilter = (TextureFilterMode)texHeader.MinFilter;
@@ -58,10 +87,26 @@ namespace Luth
         outData.Pixels.resize(texHeader.SizeBytes);
         in.read((char*)outData.Pixels.data(), texHeader.SizeBytes);
 
+        // Reject corrupt compressed artifacts before they reach Vulkan (mipLevels 0 -> invalid image / 0
+        // copy regions; short payload -> OOB GPU read). Failing here triggers the loader force-reimport.
+        if (GetTextureFormatInfo(outData.Format).compressed)
+        {
+            u64 expect = 0;
+            u32 mw = outData.Width, mh = outData.Height;
+            for (u32 m = 0; m < outData.MipLevels; ++m)
+            {
+                expect += TextureLevelBytes(outData.Format, mw, mh);
+                mw = std::max(1u, mw >> 1);
+                mh = std::max(1u, mh >> 1);
+            }
+            if (outData.MipLevels == 0 || outData.MipLevels > 16 || outData.Pixels.size() != expect)
+                return false;
+        }
+
         return true;
     }
 
-    // --- Skeleton/Animation binary helpers ---
+    // ---- Skeleton/Animation binary helpers ----
 
     static void WriteString(std::ofstream& out, const std::string& str)
     {
@@ -187,7 +232,7 @@ namespace Luth
         for (u32 ci = 0; ci < clipCount; ++ci) ReadAnimationClip(in, clips[ci]);
     }
 
-    // --- Scene-graph binary helpers (V4) ---
+    // ---- Scene-graph binary helpers (V4) ----
 
     static void WriteSceneGraph(std::ofstream& out, const ModelAssetData& data)
     {
@@ -232,72 +277,71 @@ namespace Luth
         for (u32 i = 0; i < lightCount; ++i)  in.read((char*)&data.Lights[i], sizeof(ModelLight));
     }
 
-    // --- Model Serialization ---
+    // ---- Model Serialization ----
 
     bool AssetSerializer::SerializeModel(const fs::path& path, const ModelAssetData& data)
     {
         LH_PROFILE_FUNCTION();
-        std::ofstream out(path, std::ios::binary);
-        if (!out.is_open()) return false;
+        return SerializeAtomic(path, [&](std::ofstream& out) {
+            AssetHeader header;
+            header.Version = 6; // V6: Vertex gains tangent.w handedness sign + Vec4 color (was V5 per-mesh IsDeformable)
+            header.Type = AssetType::Model;
+            out.write((const char*)&header, sizeof(AssetHeader));
 
-        AssetHeader header;
-        header.Version = 5; // V5: per-mesh IsDeformable (was V4 scene-graph nodes + cameras + lights)
-        header.Type = AssetType::Model;
-        out.write((const char*)&header, sizeof(AssetHeader));
+            ModelHeader modelHeader;
+            modelHeader.MeshCount = (u32)data.Meshes.size();
+            modelHeader.MaterialCount = (u32)data.Materials.size();
+            modelHeader.IsSkinned = data.IsSkinned ? 1 : 0;
+            modelHeader.BoneCount = data.SkeletonData.BoneCount();
+            modelHeader.AnimationCount = (u32)data.AnimationClipUUIDs.size();
+            modelHeader.NodeCount = (u32)data.Nodes.size();
+            modelHeader.CameraCount = (u32)data.Cameras.size();
+            modelHeader.LightCount = (u32)data.Lights.size();
+            out.write((const char*)&modelHeader, sizeof(ModelHeader));
 
-        ModelHeader modelHeader;
-        modelHeader.MeshCount = (u32)data.Meshes.size();
-        modelHeader.MaterialCount = (u32)data.Materials.size();
-        modelHeader.IsSkinned = data.IsSkinned ? 1 : 0;
-        modelHeader.BoneCount = data.SkeletonData.BoneCount();
-        modelHeader.AnimationCount = (u32)data.AnimationClipUUIDs.size();
-        modelHeader.NodeCount = (u32)data.Nodes.size();
-        modelHeader.CameraCount = (u32)data.Cameras.size();
-        modelHeader.LightCount = (u32)data.Lights.size();
-        out.write((const char*)&modelHeader, sizeof(ModelHeader));
+            // Write Materials
+            out.write((const char*)data.Materials.data(), data.Materials.size() * sizeof(UUID));
 
-        // Write Materials
-        out.write((const char*)data.Materials.data(), data.Materials.size() * sizeof(UUID));
+            // Write Meshes
+            for (const auto& mesh : data.Meshes)
+            {
+                WriteString(out, mesh.Name);
 
-        // Write Meshes
-        for (const auto& mesh : data.Meshes)
-        {
-            WriteString(out, mesh.Name);
+                MeshHeader meshHeader;
+                meshHeader.IsSkinned = mesh.IsSkinned ? 1 : 0;
+                meshHeader.IsDeformable = mesh.IsDeformable ? 1 : 0;
+                meshHeader.IndexCount = (u32)mesh.Indices.size();
+                meshHeader.MaterialIndex = mesh.MaterialIndex;
 
-            MeshHeader meshHeader;
-            meshHeader.IsSkinned = mesh.IsSkinned ? 1 : 0;
-            meshHeader.IsDeformable = mesh.IsDeformable ? 1 : 0;
-            meshHeader.IndexCount = (u32)mesh.Indices.size();
-            meshHeader.MaterialIndex = mesh.MaterialIndex;
+                if (mesh.IsSkinned) {
+                    meshHeader.VertexCount = (u32)mesh.SkinnedVertices.size();
+                    out.write((const char*)&meshHeader, sizeof(MeshHeader));
+                    out.write((const char*)mesh.SkinnedVertices.data(), mesh.SkinnedVertices.size() * sizeof(SkinnedVertex));
+                } else {
+                    meshHeader.VertexCount = (u32)mesh.Vertices.size();
+                    out.write((const char*)&meshHeader, sizeof(MeshHeader));
+                    out.write((const char*)mesh.Vertices.data(), mesh.Vertices.size() * sizeof(Vertex));
+                }
 
-            if (mesh.IsSkinned) {
-                meshHeader.VertexCount = (u32)mesh.SkinnedVertices.size();
-                out.write((const char*)&meshHeader, sizeof(MeshHeader));
-                out.write((const char*)mesh.SkinnedVertices.data(), mesh.SkinnedVertices.size() * sizeof(SkinnedVertex));
-            } else {
-                meshHeader.VertexCount = (u32)mesh.Vertices.size();
-                out.write((const char*)&meshHeader, sizeof(MeshHeader));
-                out.write((const char*)mesh.Vertices.data(), mesh.Vertices.size() * sizeof(Vertex));
+                out.write((const char*)mesh.Indices.data(), mesh.Indices.size() * sizeof(u32));
             }
 
-            out.write((const char*)mesh.Indices.data(), mesh.Indices.size() * sizeof(u32));
-        }
+            // Write Skeleton
+            if (modelHeader.BoneCount > 0) {
+                WriteSkeleton(out, data.SkeletonData);
+            }
 
-        // Write Skeleton
-        if (modelHeader.BoneCount > 0) {
-            WriteSkeleton(out, data.SkeletonData);
-        }
+            // V3: clip UUIDs (was inline clip data in V2)
+            if (modelHeader.AnimationCount > 0) {
+                out.write((const char*)data.AnimationClipUUIDs.data(),
+                    modelHeader.AnimationCount * sizeof(UUID));
+            }
 
-        // V3: clip UUIDs (was inline clip data in V2)
-        if (modelHeader.AnimationCount > 0) {
-            out.write((const char*)data.AnimationClipUUIDs.data(),
-                modelHeader.AnimationCount * sizeof(UUID));
-        }
+            // V4: scene graph (nodes + cameras + lights), appended last
+            WriteSceneGraph(out, data);
 
-        // V4: scene graph (nodes + cameras + lights) — appended last
-        WriteSceneGraph(out, data);
-
-        return true;
+            return true;
+        });
     }
 
     bool AssetSerializer::DeserializeModel(const fs::path& path, ModelAssetData& outData)
@@ -310,9 +354,9 @@ namespace Luth
         in.read((char*)&header, sizeof(AssetHeader));
         if (header.Type != AssetType::Model) return false;
 
-        // V5 schema: per-mesh IsDeformable. Older artifacts are rejected so they get re-imported under
-        // the new schema on first load (mirrors the Shader V1->V2 reject pattern).
-        if (header.Version != 5) return false;
+        // V6 schema: Vertex gains tangent.w handedness sign + Vec4 color. Older artifacts are rejected so
+        // they get re-imported under the new schema on first load (mirrors the Shader V1->V2 reject pattern).
+        if (header.Version != 6) return false;
 
         ModelHeader modelHeader;
         in.read((char*)&modelHeader, sizeof(ModelHeader));
@@ -373,19 +417,18 @@ namespace Luth
     bool AssetSerializer::SerializeMaterial(const fs::path& path, const MaterialAssetData& data)
     {
         LH_PROFILE_FUNCTION();
-        std::ofstream out(path, std::ios::binary);
-        if (!out.is_open()) return false;
+        return SerializeAtomic(path, [&](std::ofstream& out) {
+            AssetHeader header;
+            header.Type = AssetType::Material;
+            out.write((char*)&header, sizeof(AssetHeader));
 
-        AssetHeader header;
-        header.Type = AssetType::Material;
-        out.write((char*)&header, sizeof(AssetHeader));
+            std::string jsonStr = data.JsonData.dump();
+            u32 size = (u32)jsonStr.size();
+            out.write((char*)&size, sizeof(u32));
+            out.write(jsonStr.data(), size);
 
-        std::string jsonStr = data.JsonData.dump();
-        u32 size = (u32)jsonStr.size();
-        out.write((char*)&size, sizeof(u32));
-        out.write(jsonStr.data(), size);
-
-        return true;
+            return true;
+        });
     }
 
     bool AssetSerializer::DeserializeMaterial(const fs::path& path, MaterialAssetData& outData)
@@ -410,19 +453,18 @@ namespace Luth
     bool AssetSerializer::SerializePhysicsMaterial(const fs::path& path, const PhysicsMaterialAssetData& data)
     {
         LH_PROFILE_FUNCTION();
-        std::ofstream out(path, std::ios::binary);
-        if (!out.is_open()) return false;
+        return SerializeAtomic(path, [&](std::ofstream& out) {
+            AssetHeader header;
+            header.Type = AssetType::PhysicsMaterial;
+            out.write((char*)&header, sizeof(AssetHeader));
 
-        AssetHeader header;
-        header.Type = AssetType::PhysicsMaterial;
-        out.write((char*)&header, sizeof(AssetHeader));
+            std::string jsonStr = data.JsonData.dump();
+            u32 size = (u32)jsonStr.size();
+            out.write((char*)&size, sizeof(u32));
+            out.write(jsonStr.data(), size);
 
-        std::string jsonStr = data.JsonData.dump();
-        u32 size = (u32)jsonStr.size();
-        out.write((char*)&size, sizeof(u32));
-        out.write(jsonStr.data(), size);
-
-        return true;
+            return true;
+        });
     }
 
     bool AssetSerializer::DeserializePhysicsMaterial(const fs::path& path, PhysicsMaterialAssetData& outData)
@@ -447,22 +489,21 @@ namespace Luth
     bool AssetSerializer::SerializeShader(const fs::path& path, const ShaderAssetData& data)
     {
         LH_PROFILE_FUNCTION();
-        std::ofstream out(path, std::ios::binary);
-        if (!out.is_open()) return false;
+        return SerializeAtomic(path, [&](std::ofstream& out) {
+            AssetHeader header;
+            header.Version = 2; // V2: single-stage shader asset
+            header.Type = AssetType::Shader;
+            out.write((char*)&header, sizeof(AssetHeader));
 
-        AssetHeader header;
-        header.Version = 2; // V2: single-stage shader asset
-        header.Type = AssetType::Shader;
-        out.write((char*)&header, sizeof(AssetHeader));
+            ShaderHeader shaderHeader;
+            shaderHeader.Stage = (u32)data.Stage;
+            shaderHeader.SpirVSize = (u32)data.SpirV.size();
+            out.write((char*)&shaderHeader, sizeof(ShaderHeader));
 
-        ShaderHeader shaderHeader;
-        shaderHeader.Stage = (u32)data.Stage;
-        shaderHeader.SpirVSize = (u32)data.SpirV.size();
-        out.write((char*)&shaderHeader, sizeof(ShaderHeader));
+            out.write((char*)data.SpirV.data(), data.SpirV.size() * sizeof(u32));
 
-        out.write((char*)data.SpirV.data(), data.SpirV.size() * sizeof(u32));
-
-        return true;
+            return true;
+        });
     }
 
     bool AssetSerializer::DeserializeShader(const fs::path& path, ShaderAssetData& outData)
@@ -475,8 +516,8 @@ namespace Luth
         in.read((char*)&header, sizeof(AssetHeader));
         if (header.Type != AssetType::Shader) return false;
 
-        // V2 schema: single-stage shader. V1 artifacts (paired vert+frag) are
-        // rejected so they get re-imported under the new schema on first load.
+        // V2 schema: single-stage shader. V1 artifacts (paired vert+frag) are rejected so they get re-imported
+        // under the new schema on first load.
         if (header.Version != 2) return false;
 
         ShaderHeader shaderHeader;
@@ -492,16 +533,15 @@ namespace Luth
     bool AssetSerializer::SerializeAnimation(const fs::path& path, const AnimationAssetData& data)
     {
         LH_PROFILE_FUNCTION();
-        std::ofstream out(path, std::ios::binary);
-        if (!out.is_open()) return false;
+        return SerializeAtomic(path, [&](std::ofstream& out) {
+            AssetHeader header;
+            header.Version = 1;
+            header.Type = AssetType::Animation;
+            out.write((const char*)&header, sizeof(AssetHeader));
 
-        AssetHeader header;
-        header.Version = 1;
-        header.Type = AssetType::Animation;
-        out.write((const char*)&header, sizeof(AssetHeader));
-
-        WriteAnimationClip(out, data.Clip);
-        return true;
+            WriteAnimationClip(out, data.Clip);
+            return true;
+        });
     }
 
     bool AssetSerializer::DeserializeAnimation(const fs::path& path, AnimationAssetData& outData)

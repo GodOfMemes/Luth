@@ -4,6 +4,7 @@
 #include "luth/scene/Scene.h"
 #include "luth/scene/Components.h"
 #include "luth/renderer/material/Material.h"
+#include "luth/renderer/material/MaterialGraphCodegen.h"
 #include "luth/renderer/resources/Model.h"
 #include "luth/resources/AssetManager.h"
 
@@ -11,9 +12,7 @@ namespace Luth
 {
     using namespace Component;
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  MaterialSnapshotCommand
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ---- MaterialSnapshotCommand ----
 
     MaterialSnapshotCommand::MaterialSnapshotCommand(UUID materialUUID,
                                                      nlohmann::json oldState,
@@ -31,12 +30,22 @@ namespace Luth
         auto mat = AssetManager::GetAsset<Material>(m_MaterialUUID);
         if (!mat) return;
         mat->Deserialize(state);
+        // The restored graph JSON is authoring data only: re-derive the runtime trio (shader UUID via
+        // structure hash-hit, RT variant, gMatParams constants) or the undo never reaches the GPU.
+        if (mat->HasGraph())
+        {
+            MaterialGraphCodegen::GenerateAndCompile(*mat);
+        }
+        else
+        {
+            mat->SetGraphShaderUUID(UUID::Invalid());
+            mat->SetGraphVariant(0);
+            mat->SetGraphParams({});
+        }
         mat->MarkDirty();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  ModelInstantiateCommand
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ---- ModelInstantiateCommand ----
 
     ModelInstantiateCommand::ModelInstantiateCommand(Scene* scene, UUID modelUUID, UUID parentUUID)
         : m_Scene(scene), m_ModelUUID(modelUUID), m_ParentUUID(parentUUID) {}

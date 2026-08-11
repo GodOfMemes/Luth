@@ -1,6 +1,7 @@
 #include "lepch.h"
 #include "luthien/panels/MaterialGraphPanel.h"
 #include "luthien/EditorSelection.h"
+#include "luthien/widgets/Charts.h"
 #include "luthien/widgets/Icons.h"
 #include "luth/renderer/material/Material.h"
 #include "luth/renderer/material/MaterialGraphCodegen.h"
@@ -20,12 +21,28 @@ namespace Luth
         // GraphEditor::Template's const char** pointers stay valid for the canvas's lifetime.
         const char* kIn_AB[]    = { "A", "B" };
         const char* kIn_ABT[]   = { "A", "B", "T" };
+        const char* kIn_OffOn[] = { "Off", "On" };
+        const char* kIn_UV[]    = { "UV" };
+        const char* kIn_ABCD[]  = { "A", "B", "C", "D" };
         const char* kIn_In[]    = { "in" };
         const char* kIn_RGBA[]  = { "rgba" };
-        const char* kIn_Out[]   = { "BaseColor", "Metallic", "Roughness", "Normal", "AO", "Emissive" };
         const char* kOut_1[]    = { "out" };
         const char* kOut_RGBA[] = { "rgba" };
         const char* kOut_Split[]= { "R", "G", "B", "A" };
+        const char* kIn_BaseDet[] = { "Base", "Detail" };
+        const char* kIn_BaseUV[]  = { "Base", "UV" };
+        const char* kIn_BTM[]     = { "Bottom", "Top", "Mask" };
+        const char* kOut_Layer[]  = { "Layer" };
+        // Ext channels appended to Output (after Surface, slots 7-20) and MakeLayer (slots 6-19): clear-coat/
+        // aniso, dielectric transmission (Transmission/IOR/Thickness/AttenColor/AttenDist), sheen, then subsurface.
+        const char* kIn_Out20[]   = { "BaseColor", "Metallic", "Roughness", "Normal", "AO", "Emissive",
+                                      "Surface", "ClearCoat", "CoatRough", "Anisotropy", "AnisoRot",
+                                      "Transmission", "IOR", "Thickness", "AttenColor", "AttenDist",
+                                      "Sheen", "SheenRough", "Subsurface", "ScatterRad", "ScatterThick" };
+        const char* kIn_Layer19[] = { "BaseColor", "Metallic", "Roughness", "Normal", "AO", "Emissive",
+                                      "ClearCoat", "CoatRough", "Anisotropy", "AnisoRot",
+                                      "Transmission", "IOR", "Thickness", "AttenColor", "AttenDist",
+                                      "Sheen", "SheenRough", "Subsurface", "ScatterRad", "ScatterThick" };
 
         struct TypeInfo
         {
@@ -38,15 +55,73 @@ namespace Luth
         const TypeInfo kTypes[] = {
             { "Float",    IM_COL32( 70, 90,120,255), nullptr,  0, kOut_1,     1 },  // ConstFloat
             { "Color",    IM_COL32(120, 90, 70,255), nullptr,  0, kOut_RGBA,  1 },  // ConstColor
-            { "Texture",  IM_COL32( 70,120, 90,255), nullptr,  0, kOut_RGBA,  1 },  // TextureSample
+            { "Texture",  IM_COL32( 70,120, 90,255), kIn_UV,   1, kOut_RGBA,  1 },  // TextureSample (UV pin optional)
             { "Multiply", IM_COL32( 90, 90, 90,255), kIn_AB,   2, kOut_1,     1 },  // Multiply
             { "Add",      IM_COL32( 90, 90, 90,255), kIn_AB,   2, kOut_1,     1 },  // Add
             { "Lerp",     IM_COL32( 90, 90, 90,255), kIn_ABT,  3, kOut_1,     1 },  // Lerp
             { "Remap",    IM_COL32( 90, 90, 90,255), kIn_In,   1, kOut_1,     1 },  // Remap
             { "Split",    IM_COL32( 90, 80,110,255), kIn_RGBA, 1, kOut_Split, 4 },  // Split
-            { "Output",   IM_COL32(120, 70, 70,255), kIn_Out,  6, nullptr,    0 },  // Output
+            { "Output",   IM_COL32(120, 70, 70,255), kIn_Out20,21, nullptr,   0 },  // Output (slot 6 = Surface; 7-10 coat/aniso; 11-15 transmission; 16-17 sheen; 18-20 subsurface)
+            { "Switch",   IM_COL32( 70,110,110,255), kIn_OffOn,2, kOut_1,     1 },  // StaticSwitch
+            { "Subtract", IM_COL32( 90, 90, 90,255), kIn_AB,   2, kOut_1,     1 },  // Subtract
+            { "Divide",   IM_COL32( 90, 90, 90,255), kIn_AB,   2, kOut_1,     1 },  // Divide
+            { "Power",    IM_COL32( 90, 90, 90,255), kIn_AB,   2, kOut_1,     1 },  // Power
+            { "Min",      IM_COL32( 90, 90, 90,255), kIn_AB,   2, kOut_1,     1 },  // Min
+            { "Max",      IM_COL32( 90, 90, 90,255), kIn_AB,   2, kOut_1,     1 },  // Max
+            { "Dot",      IM_COL32( 90, 90, 90,255), kIn_AB,   2, kOut_1,     1 },  // Dot
+            { "Abs",      IM_COL32( 90, 90, 90,255), kIn_In,   1, kOut_1,     1 },  // Abs
+            { "Saturate", IM_COL32( 90, 90, 90,255), kIn_In,   1, kOut_1,     1 },  // Saturate
+            { "One Minus",IM_COL32( 90, 90, 90,255), kIn_In,   1, kOut_1,     1 },  // OneMinus
+            { "UV",       IM_COL32( 70, 90,120,255), nullptr,  0, kOut_1,     1 },  // UV
+            { "Noise",    IM_COL32( 70,120, 90,255), kIn_UV,   1, kOut_1,     1 },  // Noise
+            { "World Pos",IM_COL32( 70, 90,120,255), nullptr,  0, kOut_1,     1 },  // WorldPos
+            { "View Dir", IM_COL32( 70, 90,120,255), nullptr,  0, kOut_1,     1 },  // ViewDir
+            { "Time",     IM_COL32( 70, 90,120,255), nullptr,  0, kOut_1,     1 },  // Time
+            { "Fresnel",  IM_COL32(110, 90, 60,255), nullptr,  0, kOut_1,     1 },  // Fresnel
+            { "Custom",   IM_COL32(110, 70,110,255), kIn_ABCD, 4, kOut_1,     1 },  // Custom
+            { "Triplanar",    IM_COL32( 70,120, 90,255), nullptr,     0, kOut_1,     1 },  // Triplanar
+            { "Detail Normal",IM_COL32( 80,110,110,255), kIn_BaseDet, 2, kOut_1,     1 },  // DetailNormal
+            { "Make Layer",   IM_COL32( 90,120, 90,255), kIn_Layer19,20, kOut_Layer, 1 },  // MakeLayer (6 channels + 4 coat/aniso + 5 transmission + 2 sheen + 3 subsurface)
+            { "Layer Blend",  IM_COL32( 90,120, 90,255), kIn_BTM,     3, kOut_Layer, 1 },  // LayerBlend
+            { "Parallax",     IM_COL32( 70,120,100,255), kIn_UV,      1, kOut_1,     1 },  // Parallax (UV pin optional)
+            { "Decal",        IM_COL32(100,120, 80,255), kIn_BaseUV,  2, kOut_Layer, 1 },  // Decal (Base layer + optional UV)
+            { "Property",     IM_COL32( 70, 90,120,255), nullptr,     0, kOut_1,     1 },  // PropertyRef (references a Blackboard value property)
         };
         constexpr size_t kTypeCount = sizeof(kTypes) / sizeof(kTypes[0]);
+
+        // A "layer" pin carries a MaterialInputs bundle (green); a value pin a float4 (default). Used to
+        // color pins and to reject cross-type links in AddLink, since the vendored AllowedLink lacks slots.
+        const ImU32 kLayerPinCol = IM_COL32(120, 200, 120, 255);
+        const ImU32 kValuePinCol = IM_COL32(170, 170, 170, 255);
+
+        bool PinIsLayer(MatNodeType t, u8 slot, bool isOutput)
+        {
+            if (isOutput) return IsLayerNode(t);                  // MakeLayer / LayerBlend emit a layer
+            if (t == MatNodeType::LayerBlend) return slot < 2;    // Bottom, Top are layers; Mask is a value
+            if (t == MatNodeType::Output)     return slot == 6;   // the Surface pin
+            if (t == MatNodeType::Decal)      return slot == 0;   // Base is a layer; UV is a value
+            return false;
+        }
+
+        ImU32* InPinColors(MatNodeType t)   // GraphEditor::Template holds non-const ImU32* (read-only in practice)
+        {
+            static ImU32 layerBlend[] = { kLayerPinCol, kLayerPinCol, kValuePinCol };
+            static ImU32 out20[] = { kValuePinCol, kValuePinCol, kValuePinCol, kValuePinCol, kValuePinCol,
+                                     kValuePinCol, kLayerPinCol, kValuePinCol, kValuePinCol, kValuePinCol, kValuePinCol,
+                                     kValuePinCol, kValuePinCol, kValuePinCol, kValuePinCol, kValuePinCol,
+                                     kValuePinCol, kValuePinCol, kValuePinCol, kValuePinCol, kValuePinCol };
+            static ImU32 decal[] = { kLayerPinCol, kValuePinCol };
+            if (t == MatNodeType::LayerBlend) return layerBlend;
+            if (t == MatNodeType::Decal)      return decal;
+            if (t == MatNodeType::Output)     return out20;
+            return nullptr;   // GraphEditor falls back to a default pin color
+        }
+
+        ImU32* OutPinColors(MatNodeType t)
+        {
+            static ImU32 layerOut[] = { kLayerPinCol };
+            return IsLayerNode(t) ? layerOut : nullptr;
+        }
 
         // A useful starter: baseColor = diffuse-texture x warm tint. Visible even with no diffuse map
         // (texture slot 0 is the reserved white texel), so creating it always tints the material.
@@ -79,6 +154,12 @@ namespace Luth
                 case MatNodeType::ConstFloat: n.value = Vec4(0.5f); break;
                 case MatNodeType::ConstColor: n.value = Vec4(1.0f); break;
                 case MatNodeType::Remap:      n.value = Vec4(0.0f, 1.0f, 0.0f, 1.0f); break;
+                case MatNodeType::Noise:      n.value = Vec4(8.0f, 3.0f, 0.0f, 0.0f); break;   // (scale, octaves)
+                case MatNodeType::Fresnel:    n.value = Vec4(5.0f, 0.0f, 0.0f, 0.0f); break;   // Schlick power
+                case MatNodeType::Triplanar:    n.value = Vec4(4.0f, 0.0f, 0.0f, 0.0f); break; // tiling
+                case MatNodeType::DetailNormal: n.value = Vec4(1.0f, 0.0f, 0.0f, 0.0f); break; // strength
+                case MatNodeType::Parallax:     n.value = Vec4(0.05f, 8.0f, 32.0f, 0.0f); break; // height, min/max steps
+                case MatNodeType::Decal:        n.value = Vec4(0.5f, 0.5f, 0.25f, 0.0f); break;  // center uv, scale, rotation
                 default:                      n.value = Vec4(0.0f); break;
             }
             return n;
@@ -94,12 +175,143 @@ namespace Luth
         }
 
         // A settled node-param edit, split by downstream cost: a Const/Remap VALUE change is pure data (refresh
-        // gMatParams, no recompile); a TextureSample slot change is STRUCTURE (re-emit the per-material shader).
-        struct NodeEdit { bool value = false; bool structure = false; };
+        // gMatParams, no recompile); a TextureSample slot change is STRUCTURE (re-emit the per-material shader);
+        // exposed-parameter METADATA (name/group/ui) only needs saving.
+        struct NodeEdit { bool value = false; bool structure = false; bool meta = false; };
+
+        std::string Trimmed(const std::string& s)
+        {
+            const size_t b = s.find_first_not_of(" \t");
+            const size_t e = s.find_last_not_of(" \t");
+            return b == std::string::npos ? std::string{} : s.substr(b, e - b + 1);
+        }
+
+        // Blackboard CRUD: declare graph inputs (value properties) referenced by PropertyRef nodes (+ declared
+        // TextureSample). Value/type/add/remove re-read gMatParams (RefreshParams); name/group only needs saving.
+        NodeEdit DrawProperties(MaterialGraph& g)
+        {
+            NodeEdit e;
+            if (ImGui::SmallButton("+ Float"))
+            { g.properties.push_back({ NextPropertyId(g), MatPropType::Float, 0, "Float", "", Vec4(0.0f), UUID::Invalid() }); e.value = true; }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("+ Color"))
+            { g.properties.push_back({ NextPropertyId(g), MatPropType::Color, 0, "Color", "", Vec4(1.0f), UUID::Invalid() }); e.value = true; }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("+ Texture"))
+            { g.properties.push_back({ NextPropertyId(g), MatPropType::Texture, 0, "Texture", "", Vec4(0.0f), UUID::Invalid() }); e.value = true; }
+
+            int removeIdx = -1;
+            for (size_t i = 0; i < g.properties.size(); ++i)
+            {
+                MaterialProperty& p = g.properties[i];
+                ImGui::PushID((int)p.id);
+                ImGui::Separator();
+
+                char nameBuf[64] = {}; snprintf(nameBuf, sizeof(nameBuf), "%s", p.name.c_str());
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputTextWithHint("##pn", "name...", nameBuf, sizeof(nameBuf))) p.name = nameBuf;
+                if (ImGui::IsItemDeactivatedAfterEdit()) { p.name = Trimmed(p.name); e.meta = true; }
+
+                char grpBuf[64] = {}; snprintf(grpBuf, sizeof(grpBuf), "%s", p.group.c_str());
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputTextWithHint("##pg", "group...", grpBuf, sizeof(grpBuf))) p.group = grpBuf;
+                if (ImGui::IsItemDeactivatedAfterEdit()) { p.group = Trimmed(p.group); e.meta = true; }
+
+                // Float<->Color is a data-only reinterpret of the gMatParams slot (no recompile). Texture props
+                // are created in Commit 3's CRUD and stay Texture.
+                if (p.type != MatPropType::Texture)
+                {
+                    static const char* kTy[] = { "Float", "Color" };
+                    int ty = (int)p.type;
+                    if (ImGui::Combo("Type", &ty, kTy, 2)) { p.type = (MatPropType)ty; e.value = true; }
+                }
+
+                if (p.type == MatPropType::Float)
+                {
+                    bool cb = p.uiKind == 1;
+                    if (ImGui::Checkbox("0/1", &cb)) { p.uiKind = cb ? 1 : 0; e.meta = true; }
+                    ImGui::DragFloat("##pv", &p.value.x, 0.01f);
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                }
+                else if (p.type == MatPropType::Color)
+                {
+                    ImGui::ColorEdit4("##pv", &p.value.x, ImGuiColorEditFlags_AlphaBar);
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                }
+                else if (p.type == MatPropType::Texture)
+                {
+                    // Self-contained texture slot (UI::PropertyAsset needs a BeginProperties context; the canvas
+                    // pane is raw ImGui). Drop a texture from the Project panel; right-click to clear.
+                    std::string texName = "None";
+                    if (p.texture.IsValid())
+                    {
+                        const auto& meta = AssetDatabase::GetMetadata(p.texture);
+                        texName = meta.Path.empty() ? "Texture" : meta.Path.filename().string();
+                    }
+                    ImGui::Button((texName + "##t").c_str(), ImVec2(-FLT_MIN, 0.0f));
+                    if (ImGui::BeginDragDropTarget())
+                    {
+                        if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("ASSET_UUID"))
+                        {
+                            const UUID dropped = *static_cast<const UUID*>(pl->Data);
+                            if (AssetDatabase::GetMetadata(dropped).Type == AssetType::Texture) { p.texture = dropped; e.value = true; }
+                        }
+                        ImGui::EndDragDropTarget();
+                    }
+                    if (ImGui::BeginPopupContextItem())
+                    { if (ImGui::MenuItem("Clear")) { p.texture = UUID::Invalid(); e.value = true; } ImGui::EndPopup(); }
+                }
+
+                if (ImGui::SmallButton("Remove")) removeIdx = (int)i;
+                ImGui::PopID();
+            }
+            if (removeIdx >= 0)
+            {
+                g.properties.erase(g.properties.begin() + removeIdx);   // a referencing PropertyRef now reads 0
+                e.value = true;
+            }
+            return e;
+        }
+
+        // Name/group/checkbox fields that expose a value node as a named Inspector parameter. Metadata is
+        // codegen-blind (never enters the canonical source), so naming can't split structure-shared shaders.
+        void DrawExposeFields(const MaterialGraph& g, MatNode& n, NodeEdit& e)
+        {
+            UI::SeparatorText("Parameter");
+
+            char nameBuf[64] = {};
+            snprintf(nameBuf, sizeof(nameBuf), "%s", n.name.c_str());
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputTextWithHint("##pname", "expose as...", nameBuf, sizeof(nameBuf)))
+                n.name = nameBuf;
+            if (ImGui::IsItemDeactivatedAfterEdit()) { n.name = Trimmed(n.name); e.meta = true; }
+            if (n.name.empty()) return;
+
+            char groupBuf[64] = {};
+            snprintf(groupBuf, sizeof(groupBuf), "%s", n.group.c_str());
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputTextWithHint("##pgroup", "group...", groupBuf, sizeof(groupBuf)))
+                n.group = groupBuf;
+            if (ImGui::IsItemDeactivatedAfterEdit()) { n.group = Trimmed(n.group); e.meta = true; }
+
+            if (n.type == MatNodeType::ConstFloat)
+            {
+                bool cb = n.ui == 1;
+                if (ImGui::Checkbox("Checkbox (0/1)", &cb)) { n.ui = cb ? 1 : 0; e.meta = true; }
+            }
+
+            // Advisory only: identity is the node id, so duplicate labels are harmless but confusing.
+            for (const auto& other : g.nodes)
+                if (other.id != n.id && !other.name.empty() && other.name == n.name)
+                {
+                    ImGui::TextDisabled("name also used by another node");
+                    break;
+                }
+        }
 
         // Draws the selected node's editable parameters; flags settled edits (release / combo change). Const
-        // values now flow to per-material data, so they no longer recompile — only structural edits re-emit.
-        NodeEdit DrawNodeParams(MatNode& n)
+        // values now flow to per-material data, so they no longer recompile; only structural edits re-emit.
+        NodeEdit DrawNodeParams(const MaterialGraph& g, MatNode& n)
         {
             NodeEdit e;
             switch (n.type)
@@ -121,14 +333,124 @@ namespace Luth
                 case MatNodeType::TextureSample:
                 {
                     static const char* kMap[] = { "Diffuse","Alpha","Normal","Metallic","Roughness","Specular","Occlusion","Emissive","Thickness" };
+                    std::string preview = "Diffuse";
+                    if (IsDeclaredTexRef(n.tex))
+                    {
+                        const MaterialProperty* p = FindProperty(g, TexRefPropertyId(n.tex));
+                        preview = p ? (p->name.empty() ? "(unnamed)" : p->name) : "(missing)";
+                    }
+                    else if (n.tex < 9) preview = kMap[n.tex];
+                    if (ImGui::BeginCombo("Map", preview.c_str()))
+                    {
+                        for (int t = 0; t < 9; ++t)
+                            if (ImGui::Selectable(kMap[t], !IsDeclaredTexRef(n.tex) && (int)n.tex == t)) { n.tex = (u32)t; e.structure = true; }
+                        // Declared Blackboard textures (lifts the fixed-map ceiling).
+                        for (const auto& p : g.properties)
+                            if (p.type == MatPropType::Texture)
+                            {
+                                const bool sel = IsDeclaredTexRef(n.tex) && TexRefPropertyId(n.tex) == p.id;
+                                const std::string lbl = "* " + (p.name.empty() ? std::string("(unnamed)") : p.name);
+                                if (ImGui::Selectable(lbl.c_str(), sel)) { n.tex = MakeTexRef(p.id); e.structure = true; }
+                            }
+                        ImGui::EndCombo();
+                    }
+                    break;
+                }
+                case MatNodeType::StaticSwitch:
+                {
+                    bool on = n.value.x != 0.0f;
+                    // Compile-time state: flipping selects which branch is EMITTED, so it recompiles.
+                    if (ImGui::Checkbox("On", &on)) { n.value.x = on ? 1.0f : 0.0f; e.structure = true; }
+                    break;
+                }
+                case MatNodeType::UV:
+                {
+                    static const char* kSets[] = { "UV0", "UV1" };
+                    int s = n.tex != 0u ? 1 : 0;
+                    if (ImGui::Combo("Set", &s, kSets, 2)) { n.tex = (u32)s; e.structure = true; }
+                    break;
+                }
+                case MatNodeType::Noise:
+                    ImGui::DragFloat("Scale",   &n.value.x, 0.05f, 0.01f, 512.0f);
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                    ImGui::DragFloat("Octaves", &n.value.y, 0.05f, 1.0f, 4.0f, "%.0f");
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                    break;
+                case MatNodeType::Fresnel:
+                    ImGui::DragFloat("Power", &n.value.x, 0.05f, 0.1f, 32.0f);
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                    break;
+                case MatNodeType::Custom:
+                {
+                    ImGui::TextDisabled("float4 expression\nover a, b, c, d");
+                    char code[1024] = {};
+                    snprintf(code, sizeof(code), "%s", n.code.c_str());
+                    if (ImGui::InputTextMultiline("##code", code, sizeof(code), ImVec2(-FLT_MIN, 80.0f)))
+                        n.code = code;
+                    if (ImGui::IsItemDeactivatedAfterEdit()) e.structure = true;   // code is emission -> recompile
+                    if (const char* bad = MaterialGraphCodegen::ValidateCustomCode(n.code))
+                        ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.3f, 1.0f), "banned: %s", bad);
+                    break;
+                }
+                case MatNodeType::Triplanar:
+                {
+                    static const char* kMap[] = { "Diffuse","Alpha","Normal","Metallic","Roughness","Specular","Occlusion","Emissive","Thickness" };
                     int t = (n.tex < 9) ? (int)n.tex : 0;
                     if (ImGui::Combo("Map", &t, kMap, 9)) { n.tex = (u32)t; e.structure = true; }
+                    ImGui::DragFloat("Tiling", &n.value.x, 0.05f, 0.01f, 256.0f);
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                    break;
+                }
+                case MatNodeType::DetailNormal:
+                    ImGui::DragFloat("Strength", &n.value.x, 0.02f, 0.0f, 4.0f);
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                    break;
+                case MatNodeType::Parallax:
+                    ImGui::DragFloat("Height",    &n.value.x, 0.002f, 0.0f, 0.5f, "%.3f");
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                    ImGui::DragFloat("Min Steps", &n.value.y, 0.5f, 1.0f, 64.0f, "%.0f");
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                    ImGui::DragFloat("Max Steps", &n.value.z, 0.5f, 1.0f, 64.0f, "%.0f");
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                    break;
+                case MatNodeType::Decal:
+                {
+                    ImGui::DragFloat("Offset X", &n.value.x, 0.005f);
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                    ImGui::DragFloat("Offset Y", &n.value.y, 0.005f);
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                    ImGui::DragFloat("Scale", &n.value.z, 0.005f, 0.001f, 8.0f, "%.3f");
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                    float deg = n.value.w * (180.0f / Math::Pi<f32>);
+                    if (ImGui::DragFloat("Rotation", &deg, 0.5f, -360.0f, 360.0f, "%.0f deg"))
+                        n.value.w = deg * (Math::Pi<f32> / 180.0f);
+                    e.value |= ImGui::IsItemDeactivatedAfterEdit();
+                    break;
+                }
+                case MatNodeType::PropertyRef:
+                {
+                    // References a declared Blackboard value property; the value flows via gMatParams (data swap).
+                    if (g.properties.empty()) { ImGui::TextDisabled("No properties.\nAdd one in Properties."); break; }
+                    const MaterialProperty* cur = FindProperty(g, n.tex);
+                    const char* preview = cur ? (cur->name.empty() ? "(unnamed)" : cur->name.c_str()) : "(none)";
+                    if (ImGui::BeginCombo("Property", preview))
+                    {
+                        for (const auto& p : g.properties)
+                        {
+                            if (p.type == MatPropType::Texture) continue;   // texture props feed TextureSample
+                            const char* nm = p.name.empty() ? "(unnamed)" : p.name.c_str();
+                            if (ImGui::Selectable(nm, p.id == n.tex)) { n.tex = p.id; e.value = true; }
+                        }
+                        ImGui::EndCombo();
+                    }
                     break;
                 }
                 default:
                     ImGui::TextDisabled("No parameters.");
                     break;
             }
+            if (IsExposableNode(n.type))
+                DrawExposeFields(g, n, e);
             return e;
         }
 
@@ -170,7 +492,7 @@ namespace Luth
         }
     }
 
-    // ── GraphDelegate ──────────────────────────────────────────────────────────────────────────────
+    // ---- GraphDelegate ----
 
     void MaterialGraphPanel::GraphDelegate::Bind(MaterialGraph* g)
     {
@@ -211,6 +533,12 @@ namespace Luth
         const u32 fromId = indexToId[inNode];   // producer (output pin)
         const u32 toId   = indexToId[outNode];  // consumer (input pin)
 
+        // Type-check the wire: the vendored AllowedLink sees only node indices, so the float4-vs-layer
+        // guard lives here where the slot indices are known. Reject a cross-type connection.
+        if (PinIsLayer(graph->nodes[inNode].type, (u8)inSlot, true)
+            != PinIsLayer(graph->nodes[outNode].type, (u8)outSlot, false))
+            return;
+
         // Single-input semantics: a consumer input slot holds at most one link.
         graph->links.erase(std::remove_if(graph->links.begin(), graph->links.end(),
             [&](const MatLink& l) { return l.toNode == toId && l.toSlot == (u8)outSlot; }), graph->links.end());
@@ -242,9 +570,27 @@ namespace Luth
             case MatNodeType::TextureSample:
             {
                 static const char* kMap[] = { "Diffuse","Alpha","Normal","Metallic","Roughness","Specular","Occlusion","Emissive","Thickness" };
-                snprintf(buf, sizeof(buf), "%s", kMap[n.tex < 9 ? n.tex : 0]);
+                if (IsDeclaredTexRef(n.tex))
+                {
+                    const MaterialProperty* p = FindProperty(*graph, TexRefPropertyId(n.tex));
+                    snprintf(buf, sizeof(buf), "*%s", p && !p->name.empty() ? p->name.c_str() : "tex");
+                }
+                else snprintf(buf, sizeof(buf), "%s", kMap[n.tex < 9 ? n.tex : 0]);
                 break;
             }
+            case MatNodeType::StaticSwitch: snprintf(buf, sizeof(buf), "%s", n.value.x != 0.0f ? "On" : "Off"); break;
+            case MatNodeType::UV:           snprintf(buf, sizeof(buf), "UV%u", n.tex != 0u ? 1u : 0u); break;
+            case MatNodeType::Noise:        snprintf(buf, sizeof(buf), "x%.3g o%d", n.value.x, (int)n.value.y); break;
+            case MatNodeType::Fresnel:      snprintf(buf, sizeof(buf), "p%.3g", n.value.x); break;
+            case MatNodeType::Triplanar:
+            {
+                static const char* kMap[] = { "Diffuse","Alpha","Normal","Metallic","Roughness","Specular","Occlusion","Emissive","Thickness" };
+                snprintf(buf, sizeof(buf), "%s x%.2g", kMap[n.tex < 9 ? n.tex : 0], n.value.x);
+                break;
+            }
+            case MatNodeType::DetailNormal: snprintf(buf, sizeof(buf), "s%.2g", n.value.x); break;
+            case MatNodeType::Parallax:     snprintf(buf, sizeof(buf), "h%.3g", n.value.x); break;
+            case MatNodeType::Decal:        snprintf(buf, sizeof(buf), "(%.2g,%.2g) x%.2g", n.value.x, n.value.y, n.value.z); break;
             default: return;
         }
         drawList->AddText(ImVec2(rect.Min.x + 4.0f, rect.Min.y + 2.0f), IM_COL32(210, 210, 210, 255), buf);
@@ -260,17 +606,19 @@ namespace Luth
 
     const GraphEditor::Template MaterialGraphPanel::GraphDelegate::GetTemplate(GraphEditor::TemplateIndex index)
     {
-        const TypeInfo& t = kTypes[index < kTypeCount ? index : 0];
+        const size_t ti = index < kTypeCount ? index : 0;
+        const TypeInfo& t = kTypes[ti];
+        const MatNodeType nt = (MatNodeType)ti;
         GraphEditor::Template tpl{};
         tpl.mHeaderColor         = t.header;
         tpl.mBackgroundColor     = IM_COL32(50, 50, 50, 255);
         tpl.mBackgroundColorOver = IM_COL32(64, 64, 64, 255);
         tpl.mInputCount  = t.inCount;
         tpl.mInputNames  = t.inNames;
-        tpl.mInputColors = nullptr;
+        tpl.mInputColors = InPinColors(nt);
         tpl.mOutputCount = t.outCount;
         tpl.mOutputNames = t.outNames;
-        tpl.mOutputColors= nullptr;
+        tpl.mOutputColors= OutPinColors(nt);
         return tpl;
     }
 
@@ -285,7 +633,8 @@ namespace Luth
         const float h = 34.0f + pins * 20.0f;
 
         GraphEditor::Node node;
-        node.mName          = t.name;
+        // Exposed nodes are titled by their parameter name (string stays alive on the bound graph).
+        node.mName          = n.name.empty() ? t.name : n.name.c_str();
         node.mTemplateIndex = (GraphEditor::TemplateIndex)n.type;
         node.mRect          = ImRect(ImVec2(n.pos.x, n.pos.y), ImVec2(n.pos.x + w, n.pos.y + h));
         node.mSelected      = index < selected.size() ? selected[index] : false;
@@ -309,14 +658,14 @@ namespace Luth
         return link;
     }
 
-    // ── Panel ──────────────────────────────────────────────────────────────────────────────────────
+    // ---- Panel ----
 
     MaterialGraphPanel::MaterialGraphPanel() { m_WindowID = "MaterialGraph"; }
 
     void MaterialGraphPanel::OnDraw(const EditorSnapshot& /*snapshot*/)
     {
         LH_PROFILE_FUNCTION();
-        // ImGui::Begin must always pair with End() — even on early-out or a throw. The guard keeps the
+        // ImGui::Begin must always pair with End(), even on early-out or a throw. The guard keeps the
         // window stack balanced so a mid-draw exception is logged by the panel error boundary instead of
         // tripping ImGui's "Missing End()" assert on the next frame.
         const bool open = BeginWindow(ICON_NODE_GRAPH "  Material Graph");
@@ -366,10 +715,20 @@ namespace Luth
         MaterialGraph& graph = material->GetGraphMutable();
         bool recodegen = false;   // structural edit -> re-emit the shader
         bool valueEdit = false;   // Const/Remap value -> per-material data only (no recompile)
+        bool metaEdit  = false;   // expose name/group/ui -> save only
 
         // Left: parameters for the selected node. Right: the graph canvas.
         ImGui::BeginChild("##ParamPane", ImVec2(210.0f, 0.0f), true);
         {
+            // Blackboard: declared graph inputs, referenced by PropertyRef nodes (+ declared TextureSample).
+            if (ImGui::CollapsingHeader("Properties"))
+            {
+                NodeEdit pe = DrawProperties(graph);
+                if (pe.value) valueEdit = true;
+                if (pe.meta)  metaEdit  = true;
+            }
+            ImGui::Separator();
+
             int selNode = -1;
             for (size_t i = 0; i < m_Delegate.selected.size(); ++i)
                 if (m_Delegate.selected[i]) { selNode = (int)i; break; }
@@ -379,9 +738,10 @@ namespace Luth
                 MatNode& n = graph.nodes[selNode];
                 ImGui::TextUnformatted(kTypes[(int)n.type].name);
                 ImGui::Separator();
-                NodeEdit edit = DrawNodeParams(n);
+                NodeEdit edit = DrawNodeParams(graph, n);
                 if (edit.structure) recodegen = true;
                 if (edit.value)     valueEdit = true;
+                if (edit.meta)      metaEdit  = true;
                 if (n.type != MatNodeType::Output)
                 {
                     ImGui::Separator();
@@ -412,7 +772,7 @@ namespace Luth
             {
                 for (int t = 0; t < (int)kTypeCount; ++t)
                 {
-                    if ((MatNodeType)t == MatNodeType::Output) continue;   // single terminal — ships with the graph
+                    if ((MatNodeType)t == MatNodeType::Output) continue;   // single terminal, ships with the graph
                     if (ImGui::MenuItem(kTypes[t].name))
                     {
                         const float c = (graph.nodes.size() % 6) * 26.0f;
@@ -468,6 +828,10 @@ namespace Luth
             // Value-only edit: lower the constants into per-material data; the generated shader is untouched.
             MaterialGraphCodegen::RefreshParams(*material);
             material->MarkDirty();
+        }
+        else if (metaEdit)
+        {
+            material->MarkDirty();   // expose metadata is structure-neutral; just persist it
         }
     }
 }

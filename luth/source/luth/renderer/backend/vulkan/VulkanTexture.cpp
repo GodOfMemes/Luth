@@ -9,9 +9,7 @@
 
 namespace Luth
 {
-    // -------------------------------------------------------------------------
-    // Format helpers
-    // -------------------------------------------------------------------------
+    // ---- Format helpers ----
 
     static VkFormat ToVkFormat(TextureFormat fmt)
     {
@@ -28,6 +26,10 @@ namespace Luth
             case TextureFormat::D24_Unorm_S8_Uint: return VK_FORMAT_D24_UNORM_S8_UINT;
             case TextureFormat::R32_Uint:        return VK_FORMAT_R32_UINT;
             case TextureFormat::R16_Uint:        return VK_FORMAT_R16_UINT;
+            case TextureFormat::BC1_Unorm:       return VK_FORMAT_BC1_RGB_UNORM_BLOCK;
+            case TextureFormat::BC4_Unorm:       return VK_FORMAT_BC4_UNORM_BLOCK;
+            case TextureFormat::BC5_Unorm:       return VK_FORMAT_BC5_UNORM_BLOCK;
+            case TextureFormat::BC7_Unorm:       return VK_FORMAT_BC7_UNORM_BLOCK;
             default:                             return VK_FORMAT_R8G8B8A8_UNORM;
         }
     }
@@ -63,9 +65,7 @@ namespace Luth
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Constructors
-    // -------------------------------------------------------------------------
+    // ---- Constructors ----
 
     VKTexture::VKTexture(u32 width, u32 height, TextureFormat format, const void* data)
         : m_Width(width), m_Height(height), m_Format(format)
@@ -82,6 +82,16 @@ namespace Luth
         if (settings.GenerateMipmaps && data && !IsDepthFormat(format))
             m_MipLevels = static_cast<u32>(std::floor(std::log2(std::max(m_Width, m_Height)))) + 1;
 
+        CreateImage(data);
+        CreateViewAndSampler();
+    }
+
+    VKTexture::VKTexture(u32 width, u32 height, TextureFormat format, const void* data, u64 sizeBytes,
+                         u32 mipLevels, const TextureSettings& settings)
+        : m_Width(width), m_Height(height), m_Format(format),
+          m_WrapMode(settings.WrapMode), m_MinFilter(settings.MinFilter), m_MagFilter(settings.MagFilter),
+          m_MipLevels(mipLevels), m_UploadBytes(sizeBytes)
+    {
         CreateImage(data);
         CreateViewAndSampler();
     }
@@ -123,19 +133,18 @@ namespace Luth
         // No-op for bindless
     }
 
-    // -------------------------------------------------------------------------
-    // CreateImage
-    // -------------------------------------------------------------------------
+    // ---- CreateImage ----
 
     void VKTexture::CreateImage(const void* data)
     {
         LH_PROFILE_FUNCTION();
 
         const bool isDepth = IsDepthFormat(m_Format);
+        const bool isCompressed = GetTextureFormatInfo(m_Format).compressed;
         VkFormat vkFmt = ToVkFormat(m_Format);
 
-        // Check blit support for mipmap generation
-        if (m_MipLevels > 1)
+        // Check blit support for mipmap generation (uncompressed only; BCn mips are pre-baked at import).
+        if (m_MipLevels > 1 && !isCompressed)
         {
             VkFormatProperties formatProps;
             vkGetPhysicalDeviceFormatProperties(VulkanContext::Get().GetPhysicalDevice(), vkFmt, &formatProps);
@@ -183,10 +192,17 @@ namespace Luth
         }
         else if (isVolume)
         {
-            // 3D atlases never render-target — only compute writes + shader reads.
+            // 3D atlases never render-target; only compute writes + shader reads.
             // Caller-supplied extraUsage carries STORAGE_BIT.
             imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
                             | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                            | VK_IMAGE_USAGE_SAMPLED_BIT;
+        }
+        else if (isCompressed)
+        {
+            // BCn is never blitted (mips pre-baked) nor render-targeted -- COLOR_ATTACHMENT is invalid
+            // for compressed formats and would fail image creation.
+            imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
                             | VK_IMAGE_USAGE_SAMPLED_BIT;
         }
         else
@@ -199,23 +215,48 @@ namespace Luth
         imageInfo.usage |= m_ExtraUsage;
 
         // Cross-queue CONCURRENT opt-in by usage:
-        //   * STORAGE_BIT — typical compute outputs (GTAO chain, future cluster textures) read on graphics-B.
-        //   * DEPTH_STENCIL_ATTACHMENT_BIT + SAMPLED_BIT — depth textures sampled by compute (SceneDepth →
+        //   * STORAGE_BIT: typical compute outputs (GTAO chain, future cluster textures) read on graphics-B.
+        //   * DEPTH_STENCIL_ATTACHMENT_BIT + SAMPLED_BIT: depth textures sampled by compute (SceneDepth ->
         //     GTAODepthPrefilter). Depth has no DCC so CONCURRENT is overhead-free.
-        // Color-only RTs (RGBA16F SceneColor, LDR output) stay EXCLUSIVE — they preserve AMD DCC. Compute never
+        // Color-only RTs (RGBA16F SceneColor, LDR output) stay EXCLUSIVE to preserve AMD DCC. Compute never
         // reads them; only graphics post-process samples them.
         const bool isStorage  = (imageInfo.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
         const bool isSampledDepth = (imageInfo.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0
                                  && (imageInfo.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
-        if (isStorage || isSampledDepth)
+        // Compressed textures upload on the transfer queue then sample on graphics; CONCURRENT makes that
+        // cross-family access well-defined (free for BC -- no DCC to preserve).
+        if (isStorage || isSampledDepth || isCompressed)
             VulkanContext::Get().ApplyConcurrentSharing(imageInfo);
 
         m_Allocation = VulkanAllocator::AllocateImage(imageInfo, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, m_Image);
 
         // Upload pixel data (color textures only; depth textures are never CPU-uploaded directly)
-        if (data && !isDepth)
+        if (data && !isDepth && isCompressed)
         {
-            u32 bytesPerPixel = 4; // RGBA8, R8, etc. — stb always gives RGBA
+            // Pre-baked BCn: one transfer submit copying every stored mip with block-aligned regions.
+            std::vector<VkBufferImageCopy> regions;
+            regions.reserve(m_MipLevels);
+            u64 offset = 0;
+            for (u32 mip = 0; mip < m_MipLevels; ++mip)
+            {
+                u32 mw = std::max(1u, m_Width  >> mip);
+                u32 mh = std::max(1u, m_Height >> mip);
+                VkBufferImageCopy r{};
+                r.bufferOffset = offset; // payload-relative; UploadImageLevels rebases onto staging
+                r.imageSubresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+                r.imageSubresource.mipLevel       = mip;
+                r.imageSubresource.baseArrayLayer = 0;
+                r.imageSubresource.layerCount     = 1;
+                r.imageExtent = { mw, mh, 1 };
+                regions.push_back(r);
+                offset += TextureLevelBytes(m_Format, mw, mh);
+            }
+            m_LastUploadFence = UploadContext::Get().UploadImageLevels(data, m_UploadBytes, m_Image, regions);
+            m_DidAsyncUpload = true;
+        }
+        else if (data && !isDepth)
+        {
+            u32 bytesPerPixel = 4; // RGBA8, R8, etc.; stb always gives RGBA
             VkDeviceSize imageSize = (VkDeviceSize)m_Width * m_Height * bytesPerPixel;
 
             m_LastUploadFence = UploadContext::Get().UploadImageMipped(
@@ -227,8 +268,8 @@ namespace Luth
         else
         {
             // No data (render target / shadow map): transition to a suitable initial layout.
-            // Color render targets → SHADER_READ_ONLY_OPTIMAL (will be transitioned by RG as needed)
-            // Depth textures → DEPTH_STENCIL_READ_ONLY_OPTIMAL (will be transitioned by RG as needed)
+            // Color render targets -> SHADER_READ_ONLY_OPTIMAL (will be transitioned by RG as needed)
+            // Depth textures -> DEPTH_STENCIL_READ_ONLY_OPTIMAL (will be transitioned by RG as needed)
             VkImageAspectFlags aspect = isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
             VkImageLayout newLayout = isDepth
                 ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
@@ -262,9 +303,7 @@ namespace Luth
         }
     }
 
-    // -------------------------------------------------------------------------
-    // CreateViewAndSampler
-    // -------------------------------------------------------------------------
+    // ---- CreateViewAndSampler ----
 
     void VKTexture::CreateViewAndSampler()
     {
@@ -311,7 +350,7 @@ namespace Luth
             return;
         }
 
-        // 3D atlases (volumetric in-scatter / density / history) carry no internal sampler —
+        // 3D atlases (volumetric in-scatter / density / history) carry no internal sampler;
         // the owning subsystem supplies a linear-clamp sampler at descriptor-write time.
         if (isVolume)
         {
@@ -399,7 +438,7 @@ namespace Luth
         VkImageViewCreateInfo viewInfo{};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         viewInfo.image = m_Image;
-        // Compute shaders use image2DArray (Dim=2D, Arrayed=1) → need VK_IMAGE_VIEW_TYPE_2D_ARRAY
+        // Compute shaders use image2DArray (Dim=2D, Arrayed=1) -> need VK_IMAGE_VIEW_TYPE_2D_ARRAY
         if (isCubemap && forStorage)
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         else if (isCubemap)
@@ -430,6 +469,10 @@ namespace Luth
             case TextureFormat::D32_Float: return "D32_Float";
             case TextureFormat::R32_Uint:  return "R32_Uint";
             case TextureFormat::R16_Uint:  return "R16_Uint";
+            case TextureFormat::BC1_Unorm: return "BC1";
+            case TextureFormat::BC4_Unorm: return "BC4";
+            case TextureFormat::BC5_Unorm: return "BC5";
+            case TextureFormat::BC7_Unorm: return "BC7";
             default: return "Unknown";
         }
     }

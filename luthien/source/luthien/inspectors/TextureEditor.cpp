@@ -14,6 +14,18 @@
 
 namespace Luth
 {
+    // Combo index <-> .meta "compression" key; index 0 = Auto.
+    static const char* kCompKeys[]      = { "auto", "none", "bc1", "bc4", "bc5", "bc7" };
+    static const char* kCompLabels[]    = { "Auto", "None", "BC1", "BC4", "BC5", "BC7" };
+    static const char* kQualityLabels[] = { "Fast", "Normal", "High" };
+
+    static int CompKeyToIndex(const std::string& key)
+    {
+        for (int i = 0; i < IM_ARRAYSIZE(kCompKeys); ++i)
+            if (key == kCompKeys[i]) return i;
+        return 0; // unknown -> Auto
+    }
+
     void TextureEditor::Draw(Texture& texture)
     {
         // Per-texture state: reset combos when the selected texture changes
@@ -24,9 +36,11 @@ namespace Luth
             m_MinFilter = (int)texture.GetFilterMode().first;
             m_MagFilter = (int)texture.GetFilterMode().second;
 
-            // Read generate_mipmaps + channel role from .meta
+            // Read generate_mipmaps + channel role + compression from .meta
             m_GenerateMipmaps = true;
             m_Role = 0;
+            m_Compression = 0;        // Auto
+            m_CompressionQuality = 1; // Normal
             fs::path metaPath = texture.GetPath().string() + ".meta";
             MetaFile meta(texture.Handle);
             if (meta.Load(metaPath))
@@ -34,6 +48,8 @@ namespace Luth
                 auto& ts = meta.GetTypeSettings();
                 if (ts.contains("generate_mipmaps")) m_GenerateMipmaps = ts["generate_mipmaps"].get<bool>();
                 if (ts.contains("role"))             m_Role = ts["role"].get<int>();
+                if (ts.contains("compression"))         m_Compression = CompKeyToIndex(ts["compression"].get<std::string>());
+                if (ts.contains("compression_quality")) m_CompressionQuality = std::clamp(ts["compression_quality"].get<int>(), 0, 2);
             }
         }
 
@@ -51,9 +67,9 @@ namespace Luth
 
         ImGui::Dummy({ 0, 4 });
 
-        // Pinned-footer layout: snapshot pattern — Settings + Preview size with
-        // the same frame-start value; Splitter mutates the persisted height so
-        // the change takes effect next frame (no one-frame overshoot).
+        // Pinned-footer layout, snapshot pattern: Settings + Preview size with the same frame-start
+        // value; Splitter mutates the persisted height so the change takes effect next frame (no
+        // one-frame overshoot).
         const float kSplitterH    = 4.0f;
         const float kMinSettingsH = 80.0f;
         const float kMinFooterH   = 80.0f;
@@ -97,12 +113,14 @@ namespace Luth
                     UI::PropertyCombo("Min Filter", m_MinFilter, filterModes, IM_ARRAYSIZE(filterModes));
                     UI::PropertyCombo("Mag Filter", m_MagFilter, filterModes, IM_ARRAYSIZE(filterModes));
                     UI::PropertyCombo("Channel Role", m_Role, roleModes, IM_ARRAYSIZE(roleModes));
+                    UI::PropertyCombo("Compression", m_Compression, kCompLabels, IM_ARRAYSIZE(kCompLabels));
+                    UI::PropertyCombo("Quality", m_CompressionQuality, kQualityLabels, IM_ARRAYSIZE(kQualityLabels));
                     UI::EndProperties();
                 }
 
                 ImGui::Dummy({ 0, 4 });
 
-                // Apply button — right-aligned
+                // Apply button, right-aligned
                 float buttonWidth = ImGui::CalcTextSize("Apply").x + ImGui::GetStyle().FramePadding.x * 2.0f;
                 ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - buttonWidth);
                 if (ImGui::Button("Apply")) {
@@ -116,6 +134,8 @@ namespace Luth
                         ts["filter_min"] = m_MinFilter;
                         ts["filter_mag"] = m_MagFilter;
                         ts["role"] = m_Role;
+                        ts["compression"] = kCompKeys[m_Compression];
+                        ts["compression_quality"] = m_CompressionQuality;
                         meta.Save(metaPath);
 
                         // Delete artifact to force reimport with new settings

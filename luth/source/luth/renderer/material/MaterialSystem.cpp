@@ -27,7 +27,7 @@ namespace Luth
         for (u32 i = 0; i < MAX_MATERIALS; ++i)
             m_FreeIndices.push_back(i);
 
-        // Loud init-time guard: GPUMaterialData must stay byte-identical to material.slang's std430 mirror —
+        // Loud init-time guard: GPUMaterialData must stay byte-identical to material.slang's std430 mirror;
         // a silent stride drift corrupts every material index > 0. Field names match the Slang struct.
         static constexpr MaterialLayoutGuard::CppField kFields[] = {
             { "color",           offsetof(GPUMaterialData, color) },
@@ -36,14 +36,26 @@ namespace Luth
             { "metalRoughIndex", offsetof(GPUMaterialData, metalRoughIndex) },
             { "occlusionIndex",  offsetof(GPUMaterialData, occlusionIndex) },
             { "emissiveIndex",   offsetof(GPUMaterialData, emissiveIndex) },
-            { "alphaIndex",      offsetof(GPUMaterialData, alphaIndex) },
-            { "specularIndex",   offsetof(GPUMaterialData, specularIndex) },
+            { "subsurfaceIndex", offsetof(GPUMaterialData, subsurfaceIndex) },
+            { "heightIndex",     offsetof(GPUMaterialData, heightIndex) },
             { "thicknessIndex",  offsetof(GPUMaterialData, thicknessIndex) },
             { "metalness",       offsetof(GPUMaterialData, metalness) },
             { "roughness",       offsetof(GPUMaterialData, roughness) },
             { "alphaCutoff",     offsetof(GPUMaterialData, alphaCutoff) },
             { "flags",           offsetof(GPUMaterialData, flags) },
-            { "emissive",        offsetof(GPUMaterialData, emissive) },
+            { "emissive",           offsetof(GPUMaterialData, emissive) },
+            { "decalIndex",         offsetof(GPUMaterialData, decalIndex) },
+            { "clearcoat",          offsetof(GPUMaterialData, clearcoat) },
+            { "clearcoatRoughness", offsetof(GPUMaterialData, clearcoatRoughness) },
+            { "anisotropy",         offsetof(GPUMaterialData, anisotropy) },
+            { "anisotropyRotation", offsetof(GPUMaterialData, anisotropyRotation) },
+            { "ior",                offsetof(GPUMaterialData, ior) },
+            { "transmission",       offsetof(GPUMaterialData, transmission) },
+            { "thickness",          offsetof(GPUMaterialData, thickness) },
+            { "attenuation",        offsetof(GPUMaterialData, attenuation) },
+            { "sheen",              offsetof(GPUMaterialData, sheen) },
+            { "subsurface",         offsetof(GPUMaterialData, subsurface) },
+            { "surfaceExt",         offsetof(GPUMaterialData, surfaceExt) },
         };
         MaterialLayoutGuard::Validate(FileSystem::EngineAssetsPath("shaders/common/material.slang"),
                                       "GPUMaterialData", kFields, sizeof(GPUMaterialData));
@@ -65,8 +77,7 @@ namespace Luth
     u32 MaterialSystem::RegisterMaterial(std::shared_ptr<Material> material)
     {
         LH_PROFILE_FUNCTION();
-        // Slot mutation must run on the game stage; concurrent Render(N-1)
-        // reads the slot map without locking.
+        // Slot mutation must run on the game stage; concurrent Render(N-1) reads the slot map without locking.
         assert(JobSystem::GetCurrentStage() == JobSystem::Stage::Game &&
             "MaterialSystem::RegisterMaterial must run on the game stage");
         SpinLockGuard lock(m_Lock);
@@ -103,8 +114,8 @@ namespace Luth
         assert(JobSystem::GetCurrentStage() == JobSystem::Stage::Game &&
             "MaterialSystem::Update must run on the game stage");
 
-        // Allocate a fresh region for this frame; tag is the absolute frame index so
-        // FreeTag(N-2) reclaims it once the GPU has retired the consuming frame.
+        // Allocate a fresh region for this frame; tag is the absolute frame index so FreeTag(N-2) reclaims it
+        // once the GPU has retired the consuming frame.
         auto* jobCtx = JobSystem::GetCurrentJobContext();
         if (!jobCtx) return;
         const u64 gameFrame = Renderer::GetFrameData()->GetFrameIndex();
@@ -112,15 +123,16 @@ namespace Luth
 
         constexpr u64 regionBytes = static_cast<u64>(MAX_MATERIALS) * MATERIAL_SIZE;
         constexpr u64 paramBytes  = static_cast<u64>(MAX_MATERIALS) * MAT_GRAPH_STRIDE * sizeof(Vec4);
+        constexpr u64 texBytes    = static_cast<u64>(MAX_MATERIALS) * MAT_TEX_STRIDE * sizeof(u32);
         auto& heap = Memory::GPUTaggedPageAllocator::Get();
         Memory::GPUSubRegion region      = heap.Allocate(jobCtx->GpuCache, regionBytes, 16);
         Memory::GPUSubRegion paramRegion = heap.Allocate(jobCtx->GpuCache, paramBytes, 16);
-        if (!region.buffer || !paramRegion.buffer) return;
+        Memory::GPUSubRegion texRegion   = heap.Allocate(jobCtx->GpuCache, texBytes, 16);
+        if (!region.buffer || !paramRegion.buffer || !texRegion.buffer) return;
 
-        // Lock spans slot iteration (~25us at MAX_MATERIALS=16384). Borderline for V1
-        // strictly, but contention is zero today: Register/Unregister also assert game
-        // stage and serialize through RenderSnapshot::Capture. Future parallel-register
-        // would justify shrinking to slot-alloc-only via an atomic free list.
+        // Lock spans slot iteration (~25us at MAX_MATERIALS=16384). Borderline for V1 strictly, but contention is
+        // zero today: Register/Unregister also assert game stage and serialize through RenderSnapshot::Capture.
+        // Future parallel-register would justify shrinking to slot-alloc-only via an atomic free list.
         {
             SpinLockGuard lock(m_Lock);
             for (u32 i = 0; i < MAX_MATERIALS; ++i)
@@ -141,23 +153,34 @@ namespace Luth
                     memcpy(static_cast<u8*>(paramRegion.mappedPtr) + (static_cast<u64>(i) * MAT_GRAPH_STRIDE * sizeof(Vec4)),
                            params.data(), n * sizeof(Vec4));
                 }
+
+                // Declared-texture bindless indices fill the parallel tex region (texBase = i*MAT_TEX_STRIDE).
+                const auto& texParams = m_Slots[i].material->GetGraphTexParams();
+                if (!texParams.empty())
+                {
+                    const u64 n = texParams.size() < MAT_TEX_STRIDE ? texParams.size() : MAT_TEX_STRIDE;
+                    memcpy(static_cast<u8*>(texRegion.mappedPtr) + (static_cast<u64>(i) * MAT_TEX_STRIDE * sizeof(u32)),
+                           texParams.data(), n * sizeof(u32));
+                }
                 m_Slots[i].material->ClearGpuDirty();
             }
         }
 
         heap.FlushRegion(region);
         heap.FlushRegion(paramRegion);
+        heap.FlushRegion(texRegion);
 
-        // Write the GAME-frame's slot (binding 0 = material SSBO, binding 1 = param buffer). Render stage K-1
-        // reads slot (K-1)%N — distinct slots, race-free. Both written every frame (binding 1 never unbound).
+        // Write the GAME-frame's slot (binding 0 = material SSBO, 1 = param buffer, 2 = tex-index buffer). Render
+        // stage K-1 reads slot (K-1)%N; distinct slots, race-free. All written every frame (never unbound).
         const u32 slot = static_cast<u32>(gameFrame) % MAX_FRAMES_IN_FLIGHT;
 
-        VkDescriptorBufferInfo bi[2]{};
+        VkDescriptorBufferInfo bi[3]{};
         bi[0].buffer = region.buffer;       bi[0].offset = region.offset;       bi[0].range = region.size;
         bi[1].buffer = paramRegion.buffer;  bi[1].offset = paramRegion.offset;  bi[1].range = paramRegion.size;
+        bi[2].buffer = texRegion.buffer;    bi[2].offset = texRegion.offset;    bi[2].range = texRegion.size;
 
-        VkWriteDescriptorSet writes[2]{};
-        for (u32 b = 0; b < 2; ++b)
+        VkWriteDescriptorSet writes[3]{};
+        for (u32 b = 0; b < 3; ++b)
         {
             writes[b].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[b].dstSet          = m_DescriptorSets[slot];
@@ -167,7 +190,7 @@ namespace Luth
             writes[b].descriptorCount = 1;
             writes[b].pBufferInfo     = &bi[b];
         }
-        vkUpdateDescriptorSets(VulkanContext::Get().GetDevice(), 2, writes, 0, nullptr);
+        vkUpdateDescriptorSets(VulkanContext::Get().GetDevice(), 3, writes, 0, nullptr);
     }
 
     VkDescriptorSet MaterialSystem::GetDescriptorSet(u32 slot)
@@ -185,11 +208,11 @@ namespace Luth
         LH_PROFILE_FUNCTION();
         VkDevice device = VulkanContext::Get().GetDevice();
 
-        // binding 0 = material SSBO, binding 1 = graph-param buffer (gMatParams), both rewritten per game stage.
-        // invariant: UAB even though slots cycle — the K%N write can fire while render-stage K's cmd buffer (same
-        // slot) is still pending. The one set binds at Set 2 (raster) and Set 3 (RT megakernels).
-        VkDescriptorSetLayoutBinding bindings[2]{};
-        for (u32 b = 0; b < 2; ++b)
+        // binding 0 = material SSBO, 1 = graph-param buffer (gMatParams), 2 = declared-texture indices
+        // (gMatTexParams), all rewritten per game stage. invariant: UAB even though slots cycle; the K%N write can
+        // fire while render-stage K's cmd buffer (same slot) is still pending. Binds at Set 2 (raster) / Set 3 (RT).
+        VkDescriptorSetLayoutBinding bindings[3]{};
+        for (u32 b = 0; b < 3; ++b)
         {
             bindings[b].binding         = b;
             bindings[b].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -197,24 +220,25 @@ namespace Luth
             bindings[b].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
         }
 
-        VkDescriptorBindingFlags bindingFlags[2] = {
-            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT, VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT };
+        VkDescriptorBindingFlags bindingFlags[3] = {
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT, VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT };
         VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsCI{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO };
-        bindingFlagsCI.bindingCount  = 2;
+        bindingFlagsCI.bindingCount  = 3;
         bindingFlagsCI.pBindingFlags = bindingFlags;
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         layoutInfo.pNext        = &bindingFlagsCI;
         layoutInfo.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
-        layoutInfo.bindingCount = 2;
+        layoutInfo.bindingCount = 3;
         layoutInfo.pBindings    = bindings;
         vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_DescriptorSetLayout);
 
-        // Pool sized for 2 storage buffers per set (material SSBO + param buffer) across N slots.
+        // Pool sized for 3 storage buffers per set (material SSBO + param buffer + tex-index buffer) across N slots.
         VkDescriptorPoolSize poolSize{};
         poolSize.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSize.descriptorCount = 2 * MAX_FRAMES_IN_FLIGHT;
+        poolSize.descriptorCount = 3 * MAX_FRAMES_IN_FLIGHT;
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;

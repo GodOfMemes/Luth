@@ -24,7 +24,8 @@ namespace Luth
                 { ShaderDataType::Float3, "a_Normal"    },
                 { ShaderDataType::Float2, "a_TexCoord0" },
                 { ShaderDataType::Float2, "a_TexCoord1" },
-                { ShaderDataType::Float3, "a_Tangent"   }
+                { ShaderDataType::Float4, "a_Tangent"   },
+                { ShaderDataType::Float4, "a_Color"     }
             };
         }
     }
@@ -35,10 +36,10 @@ namespace Luth
         m_Pipeline = &pipeline;
         VkDevice device = VulkanContext::Get().GetDevice();
 
-        // Set 6 — b0 fog atlas (sampler3D, parity-rewritten per frame → UAB), b1 OIT heads storage
+        // Set 6: b0 fog atlas (sampler3D, parity-rewritten per frame -> UAB), b1 OIT heads storage
         // image + b2 OIT nodes SSBO (UAB + PARTIALLY_BOUND: unwritten until the PPLL passes land;
         // the sorted pipeline never statically uses them, which partially-bound makes legal).
-        VkDescriptorSetLayoutBinding bindings[3]{};
+        VkDescriptorSetLayoutBinding bindings[4]{};
         bindings[0].binding         = 0;
         bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[0].descriptorCount = 1;
@@ -51,25 +52,43 @@ namespace Luth
         bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[2].descriptorCount = 1;
         bindings[2].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        // b3: screen-space refraction backdrop (pre-transparent scene copy). Partially-bound so a frame
+        // before the backdrop is first written stays legal (glass-free draws never sample it).
+        bindings[3].binding         = 3;
+        bindings[3].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[3].descriptorCount = 1;
+        bindings[3].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
 
-        VkDescriptorBindingFlags bindingFlags[3] = {
+        VkDescriptorBindingFlags bindingFlags[4] = {
             VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT,
             VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT,
             VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT,
         };
         VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsCI{
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO };
-        bindingFlagsCI.bindingCount  = 3;
+        bindingFlagsCI.bindingCount  = 4;
         bindingFlagsCI.pBindingFlags = bindingFlags;
 
         VkDescriptorSetLayoutCreateInfo layoutCI{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
         layoutCI.pNext        = &bindingFlagsCI;
         layoutCI.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
-        layoutCI.bindingCount = 3;
+        layoutCI.bindingCount = 4;
         layoutCI.pBindings    = bindings;
         vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &m_TransparentSetLayout);
 
-        // OIT resolve layout — b0 heads (storage image), b1 nodes (SSBO). Stable per-view; rewritten
+        // Linear clamp-to-edge sampler for the refraction backdrop tap (Set 6 b3).
+        VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+        sci.magFilter    = VK_FILTER_LINEAR;
+        sci.minFilter    = VK_FILTER_LINEAR;
+        sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod       = 0.0f;
+        vkCreateSampler(device, &sci, nullptr, &m_BackdropSampler);
+
+        // OIT resolve layout: b0 heads (storage image), b1 nodes (SSBO). Stable per-view; rewritten
         // only by WriteOitView on alloc/resize, so no UAB flags needed.
         VkDescriptorSetLayoutBinding resolveBindings[2]{};
         resolveBindings[0].binding         = 0;
@@ -190,6 +209,11 @@ namespace Luth
             vkDestroyDescriptorSetLayout(device, m_ResolveSetLayout, nullptr);
             m_ResolveSetLayout = VK_NULL_HANDLE;
         }
+        if (m_BackdropSampler != VK_NULL_HANDLE)
+        {
+            vkDestroySampler(device, m_BackdropSampler, nullptr);
+            m_BackdropSampler = VK_NULL_HANDLE;
+        }
     }
 
     bool TransparencySubsystem::OnShaderReloaded(const std::string& name, const std::vector<u32>& spv)
@@ -251,7 +275,7 @@ namespace Luth
         const bool parity = (frameAbs & 1u) != 0u;
         if (vr.transparentDescSet[slot] == VK_NULL_HANDLE) return;
 
-        // Same parity rule as the volumetric composite's b1 — sample this frame's resolved atlas.
+        // Same parity rule as the volumetric composite's b1: sample this frame's resolved atlas.
         auto vkScat = std::static_pointer_cast<VKTexture>(
             parity ? vr.volInScatterHistA : vr.volInScatterHistB);
 
@@ -260,13 +284,34 @@ namespace Luth
         scatInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         scatInfo.sampler     = m_Pipeline->GetVolumetric().GetSampler();
 
-        VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-        write.dstSet          = vr.transparentDescSet[slot];
-        write.dstBinding      = 0;
-        write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        write.descriptorCount = 1;
-        write.pImageInfo      = &scatInfo;
-        vkUpdateDescriptorSets(VulkanContext::Get().GetDevice(), 1, &write, 0, nullptr);
+        VkDescriptorImageInfo backdropInfo{};
+        VkWriteDescriptorSet  writes[2]{};
+        u32 count = 0;
+
+        writes[count]                 = VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        writes[count].dstSet          = vr.transparentDescSet[slot];
+        writes[count].dstBinding      = 0;
+        writes[count].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[count].descriptorCount = 1;
+        writes[count].pImageInfo      = &scatInfo;
+        ++count;
+
+        // b3 refraction backdrop (the copy pass leaves it SHADER_READ_ONLY before the transparent pass).
+        if (vr.refractionBackdrop && m_BackdropSampler != VK_NULL_HANDLE)
+        {
+            auto vkBackdrop = std::static_pointer_cast<VKTexture>(vr.refractionBackdrop);
+            backdropInfo.imageView   = vkBackdrop->GetImageView();
+            backdropInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            backdropInfo.sampler     = m_BackdropSampler;
+            writes[count]                 = VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            writes[count].dstSet          = vr.transparentDescSet[slot];
+            writes[count].dstBinding      = 3;
+            writes[count].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[count].descriptorCount = 1;
+            writes[count].pImageInfo      = &backdropInfo;
+            ++count;
+        }
+        vkUpdateDescriptorSets(VulkanContext::Get().GetDevice(), count, writes, 0, nullptr);
     }
 
     void TransparencySubsystem::WriteOitView(ViewResources& vr)
@@ -281,7 +326,7 @@ namespace Luth
         headsInfo.imageView   = vkHeads->GetImageView();
         headsInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        // Bind through the producer's GPUSubRegion {buffer, offset, size} — RG BufferHandles are
+        // Bind through the producer's GPUSubRegion {buffer, offset, size}; RG BufferHandles are
         // barrier bookkeeping only. see arch/rendering-pipeline.md (hazard 3)
         VkDescriptorBufferInfo nodesInfo{};
         nodesInfo.buffer = vr.oitNodes.buffer;
@@ -331,6 +376,7 @@ namespace Luth
                                                         RG::ResourceHandle entityID,
                                                         RG::ResourceHandle sceneDepth,
                                                         RG::ResourceHandle fogResolved,
+                                                        RG::ResourceHandle refractionBackdrop,
                                                         RG::BufferHandle indirectBufferHandle)
     {
         LH_PROFILE_FUNCTION();
@@ -338,8 +384,8 @@ namespace Luth
         if (sys.GetDrawList().transparent.empty())
             return sceneColor;
         if (sys.GetTransparencySettings().mode == TransparencyMode::OIT)
-            return AddOitPasses(rg, sceneColor, entityID, sceneDepth, fogResolved, indirectBufferHandle);
-        return AddSortedPass(rg, sceneColor, entityID, sceneDepth, fogResolved, indirectBufferHandle);
+            return AddOitPasses(rg, sceneColor, entityID, sceneDepth, fogResolved, refractionBackdrop, indirectBufferHandle);
+        return AddSortedPass(rg, sceneColor, entityID, sceneDepth, fogResolved, refractionBackdrop, indirectBufferHandle);
     }
 
     RG::ResourceHandle TransparencySubsystem::AddOitPasses(RG::RenderGraph& rg,
@@ -347,18 +393,19 @@ namespace Luth
                                                             RG::ResourceHandle entityID,
                                                             RG::ResourceHandle sceneDepth,
                                                             RG::ResourceHandle fogResolved,
+                                                            RG::ResourceHandle refractionBackdrop,
                                                             RG::BufferHandle indirectBufferHandle)
     {
         LH_PROFILE_FUNCTION();
         auto& sys = m_Pipeline->GetSystem();
         ViewResources* vr = m_Pipeline->GetCurrentViewResources();
         if (!vr || !vr->oitHeads || vr->oitNodes.buffer == VK_NULL_HANDLE || !m_ResolvePipeline)
-            return AddSortedPass(rg, sceneColor, entityID, sceneDepth, fogResolved, indirectBufferHandle);
+            return AddSortedPass(rg, sceneColor, entityID, sceneDepth, fogResolved, refractionBackdrop, indirectBufferHandle);
 
         auto vkHeads = std::static_pointer_cast<VKTexture>(vr->oitHeads);
 
         // Import in the end-of-frame state (GENERAL + fragment read) so the clear's barrier orders
-        // after LAST frame's resolve reads — an Undefined import would carry srcStage TOP and let
+        // after LAST frame's resolve reads; an Undefined import would carry srcStage TOP and let
         // the transition race them (cross-frame WAR). Frame 0 holds by the bootstrap transition.
         RG::TextureDesc headsDesc;
         headsDesc.name   = "OITHeads";
@@ -377,7 +424,7 @@ namespace Luth
 
         const u32 nodeCapacity = static_cast<u32>((vr->oitNodes.size - 16ull) / 16ull);
 
-        // ── OITClear — heads → OIT_EMPTY, node-count header → 0 (node payloads stay stale; the
+        // OITClear: heads -> OIT_EMPTY, node-count header -> 0 (node payloads stay stale; the
         // cleared heads make them unreachable). Transfer ops on the graphics primary.
         struct ClearData { RG::ResourceHandle heads; RG::BufferHandle nodes; };
         RG::ResourceHandle headsCleared;
@@ -402,9 +449,9 @@ namespace Luth
                 vkCmdFillBuffer(ctx.commandBuffer, view->oitNodes.buffer, view->oitNodes.offset, 16, 0u);
             });
 
-        // ── OITStore — depth-tested transparent draws shade once and push onto the per-pixel list.
+        // OITStore: depth-tested transparent draws shade once and push onto the per-pixel list.
         // Zero color attachments (depth-only BeginRendering, the ShadowPass shape); bucket order
-        // is irrelevant — the resolve sorts per pixel.
+        // is irrelevant, the resolve sorts per pixel.
         struct StoreData
         {
             RG::ResourceHandle depth, fog, heads;
@@ -422,6 +469,8 @@ namespace Luth
                 data.nodes    = builder.WriteBufferFragment(nodesCleared);
                 if (fogResolved.IsValid())
                     data.fog = builder.Read(fogResolved);
+                if (refractionBackdrop.IsValid())
+                    builder.Read(refractionBackdrop);   // barrier: copy(TransferDst) -> fragment sample (Set 6 b3)
                 data.indirect = builder.ReadIndirectBuffer(indirectBufferHandle);
                 data.fogValid = fogResolved.IsValid();
                 data.capacity = nodeCapacity;
@@ -505,7 +554,7 @@ namespace Luth
                     auto ib = std::static_pointer_cast<VKIndexBuffer >(mesh->GetIndexBuffer ());
                     if (!vb || !ib) continue;
 
-                    // Deformable draws bind no VB — the VS fetches the deformed buffer by gl_VertexIndex.
+                    // Deformable draws bind no VB; the VS fetches the deformed buffer by gl_VertexIndex.
                     if (!dc.isDeformed)
                     {
                         VkBuffer vbuf[] = { vb->GetVulkanBuffer() };
@@ -542,7 +591,7 @@ namespace Luth
                 sys.GetFrameDebugger().EndCapturePass();
             });
 
-        // ── OITResolve — fullscreen sort-K + under-composite onto sceneColor; nearest entity →
+        // OITResolve: fullscreen sort-K + under-composite onto sceneColor; nearest entity ->
         // EntityID (picking parity with the sorted path).
         struct ResolveData
         {
@@ -598,6 +647,7 @@ namespace Luth
                                                             RG::ResourceHandle entityID,
                                                             RG::ResourceHandle sceneDepth,
                                                             RG::ResourceHandle fogResolved,
+                                                            RG::ResourceHandle refractionBackdrop,
                                                             RG::BufferHandle indirectBufferHandle)
     {
         LH_PROFILE_FUNCTION();
@@ -605,7 +655,7 @@ namespace Luth
         const auto& draws = sys.GetDrawList().transparent;
         const u32 n = static_cast<u32>(draws.size());
 
-        // Per-view back-to-front order over the SHARED transparent bucket — an index array, never an
+        // Per-view back-to-front order over the SHARED transparent bucket: an index array, never an
         // in-place sort (the other view + the OIT store iterate the same vector). Key = view-space
         // depth of the world-space bind-pose bounds center; scratch from the per-frame LinearAllocator
         // (reset at Update entry; the RG records within the same Update body).
@@ -621,7 +671,7 @@ namespace Luth
             if (dc.model && dc.meshIndex < dc.model->GetMeshesData().size())
                 center = dc.model->GetMeshesData()[dc.meshIndex].BindPoseAABB.Center();
             const Vec4 worldCenter = dc.modelMatrix * Vec4(center, 1.0f);
-            keys[i] = -(viewMat * worldCenter).z;   // RH view space: -z in front → key = distance
+            keys[i] = -(viewMat * worldCenter).z;   // RH view space: -z in front -> key = distance
         }
         std::sort(order, order + n, [keys](u32 a, u32 b) { return keys[a] > keys[b]; });
 
@@ -643,6 +693,8 @@ namespace Luth
                 data.depth = builder.WriteDepth(sceneDepth, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, {});
                 if (fogResolved.IsValid())
                     data.fog = builder.Read(fogResolved);
+                if (refractionBackdrop.IsValid())
+                    builder.Read(refractionBackdrop);   // barrier: copy(TransferDst) -> fragment sample (Set 6 b3)
                 data.indirect = builder.ReadIndirectBuffer(indirectBufferHandle);
                 data.order    = order;
                 data.count    = n;
@@ -727,7 +779,7 @@ namespace Luth
                     auto ib = std::static_pointer_cast<VKIndexBuffer >(mesh->GetIndexBuffer ());
                     if (!vb || !ib) continue;
 
-                    // Deformable draws bind no VB — the VS fetches the deformed buffer by gl_VertexIndex.
+                    // Deformable draws bind no VB; the VS fetches the deformed buffer by gl_VertexIndex.
                     if (!dc.isDeformed)
                     {
                         VkBuffer vbuf[] = { vb->GetVulkanBuffer() };

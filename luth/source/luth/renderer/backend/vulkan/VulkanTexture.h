@@ -9,16 +9,19 @@ namespace Luth
     // Concrete Vulkan-backed Texture. Owns the VkImage / VkImageView / VkSampler trio plus the
     // VMA allocation and the bindless descriptor slot the texture is registered into. Three
     // constructors cover the common shapes: (data, default sampler), (data, custom sampler
-    // settings), and (storage / cubemap, no upload — filled by compute or blit later).
+    // settings), and (storage / cubemap, no upload; filled by compute or blit later).
     class VKTexture : public Texture
     {
     public:
         VKTexture(u32 width, u32 height, TextureFormat format, const void* data);
         VKTexture(u32 width, u32 height, TextureFormat format, const void* data, const TextureSettings& settings);
-        // Cubemap / storage image constructor (no data upload — filled via compute or blit)
+        // Pre-baked compressed (BCn) constructor: data = full concatenated mip chain (sizeBytes), mipLevels stored.
+        VKTexture(u32 width, u32 height, TextureFormat format, const void* data, u64 sizeBytes,
+                  u32 mipLevels, const TextureSettings& settings);
+        // Cubemap / storage image constructor (no data upload; filled via compute or blit)
         VKTexture(u32 width, u32 height, TextureFormat format, u32 arrayLayers,
                   VkImageCreateFlags createFlags, u32 mipLevels, VkImageUsageFlags extraUsage = 0);
-        // 3D storage image (no data upload — filled via compute). Sampler is null; the consumer
+        // 3D storage image (no data upload; filled via compute). Sampler is null; the consumer
         // subsystem provides its own (volumetrics wants linear-clamp, not bindless anisotropic).
         VKTexture(u32 width, u32 height, u32 depth, TextureFormat format, VkImageUsageFlags extraUsage = 0);
         virtual ~VKTexture();
@@ -73,6 +76,7 @@ namespace Luth
 
         u32 m_MipLevels = 1;
         u32 m_ArrayLayers = 1;
+        u64 m_UploadBytes = 0; // compressed payload size for the pre-baked upload path (0 = derive w*h*4)
         VkImageCreateFlags m_CreateFlags = 0;
         VkImageUsageFlags m_ExtraUsage = 0;
 

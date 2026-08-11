@@ -3,6 +3,7 @@
 #include "VulkanContext.h"
 #include "VulkanAccelerationStructure.h"
 #include "VulkanBuffer.h"
+#include "UploadContext.h"
 #include "luth/core/RenderSnapshot.h"
 #include "luth/core/diagnostics/Log.h"
 #include "luth/jobs/JobSystem.h"
@@ -11,6 +12,7 @@
 #include "luth/renderer/resources/Mesh.h"
 #include "luth/renderer/material/Material.h"
 #include "luth/resources/AssetManager.h"
+#include "luth/renderer/lighting/EmissiveLight.h"
 
 #include <vma/vk_mem_alloc.h>
 #include <cstring>
@@ -26,7 +28,7 @@ namespace Luth
 
         // CONTRACT: row-major transpose of glm column-major. VkAccelerationStructureInstanceKHR's
         // transform field is a 3x4 row-major matrix (VkTransformMatrixKHR := float[3][4]); our
-        // worldMatrix is glm::mat4 (column-major). A naive memcpy ships silently-wrong bounds —
+        // worldMatrix is glm::mat4 (column-major). A naive memcpy ships silently-wrong bounds;
         // validation layer doesn't catch it and rays miss geometry.
         VkTransformMatrixKHR ToVkTransform(const Mat4& m)
         {
@@ -37,20 +39,20 @@ namespace Luth
             return out;
         }
 
-        // Cheap u64 mix over the full world matrix — rotation + scale + translation. Mirrors
+        // Cheap u64 mix over the full world matrix: rotation + scale + translation. Mirrors
         // PathTraceSubsystem::ComputeResetHash so a static-mesh rotate/scale (no translation delta)
-        // still rebuilds; ~10 µs for ~100 instances. materialUUID is folded in because the geometry
-        // table carries each instance's material slot — a runtime material reassignment on a static
+        // still rebuilds; ~10 us for ~100 instances. materialUUID is folded in because the geometry
+        // table carries each instance's material slot: a runtime material reassignment on a static
         // mesh must force a rebuild or GI would shade the secondary hit with the stale material's
         // albedo. see arch/rendering-pipeline.md
-        u64 HashInstances(std::span<const MeshDrawSnapshot> instances)
+        u64 HashInstances(std::span<const MeshDrawSnapshot> instances, bool markEmitters)
         {
             u64 h = 0xcbf29ce484222325ull; // FNV-1a basis
             for (const auto& inst : instances)
             {
                 h ^= static_cast<u64>(inst.entity);
                 h *= 0x100000001b3ull;
-                // Full world matrix (16 floats) — rotation + scale + translation.
+                // Full world matrix (16 floats): rotation + scale + translation.
                 const f32* wm = &inst.worldMatrix[0][0];
                 for (int j = 0; j < 16; ++j)
                 {
@@ -61,26 +63,32 @@ namespace Luth
                 h *= 0x100000001b3ull;
                 h ^= inst.materialUUID.GetHalf0(); h *= 0x100000001b3ull;
                 h ^= inst.materialUUID.GetHalf1(); h *= 0x100000001b3ull;
-                // Fold RenderMode so an in-place opaque<->cutout edit (same UUID) forces a rebuild —
-                // the per-instance TLAS opaque flag (ST1) depends on it.
+                // Fold RenderMode so an in-place opaque<->cutout edit (same UUID) forces a rebuild;
+                // the per-instance TLAS opaque flag depends on it.
                 if (inst.materialUUID.IsValid())
                     if (auto mat = AssetManager::GetAsset<Material>(inst.materialUUID))
-                    { h ^= static_cast<u64>(mat->GetRenderMode()); h *= 0x100000001b3ull; }
+                    {
+                        h ^= static_cast<u64>(mat->GetRenderMode()); h *= 0x100000001b3ull;
+                        // Fold the emitter bit: an emissive on/off edit (or the feature toggle) must force
+                        // a rebuild so the geometry-table bit re-masks in lockstep with the light gatherer.
+                        const u64 emit = (markEmitters && IsEmissiveLightMaterial(*mat, inst.isSkinned, inst.isDeformable)) ? 1u : 0u;
+                        h ^= emit; h *= 0x100000001b3ull;
+                    }
             }
             return h;
         }
 
-        // GPU geometry-table entry — one per packed TLAS instance, indexed by instanceCustomIndex.
+        // GPU geometry-table entry: one per packed TLAS instance, indexed by instanceCustomIndex.
         // Mirrors the GtGeomEntry buffer_reference struct in common/material.slang (std430, 24 B).
         // Static meshes point vertexBDA at the original VB; skinned meshes point it at the per-mesh
-        // deformed vertex buffer — both the 52 B Vertex layout — so ray hits read post-skin
+        // deformed vertex buffer (both the interleaved Vertex layout) so ray hits read post-skin
         // normals/tangents/UVs, not bind pose. Stride is sizeof(Vertex) for both.
         struct GPUGeometryEntry
         {
             VkDeviceAddress vertexBDA;     // VB (static) or deformed vertex buffer (skinned)
             VkDeviceAddress indexBDA;      // uint32 index buffer device address
             u32             materialSlot;  // index into the Material SSBO
-            u32             vertexStride;  // bytes: sizeof(Vertex) = 52 (both tiers)
+            u32             vertexStride;  // bytes = sizeof(Vertex); bit 31 = emissive-area-light flag
         };
         static_assert(sizeof(GPUGeometryEntry) == 24, "GPUGeometryEntry must match common/material.slang GtGeomEntry (24 B)");
 
@@ -103,23 +111,25 @@ namespace Luth
         }
     }
 
-    void TlasBuilder::RefitSkinnedBLASes(VkCommandBuffer cmd,
-                                         std::span<const MeshDrawSnapshot> instances,
-                                         u32 frameAbs)
+    u32 TlasBuilder::RefitSkinnedBLASes(VkCommandBuffer cmd,
+                                        std::span<const MeshDrawSnapshot> instances,
+                                        u32 frameAbs)
     {
         auto& ctx = VulkanContext::Get();
         const auto& rt = ctx.GetRtFn();
 
-        // Pre-resolve + compute aggregate scratch size. Per NVIDIA: each BLAS build in a batched
-        // call needs its own scratch sub-region; sum the per-mesh updateScratchSize aligned up.
+        // Pre-resolve + compute aggregate scratch size. Per NVIDIA: each BLAS build in a batched call needs
+        // its own scratch sub-region; sum per-mesh, aligned up. A deformable BLAS whose build has not been
+        // recorded yet takes its (larger) build scratch + MODE_BUILD; the rest take update scratch.
         const u64 scratchAlign = ctx.GetAsProperties().minAccelerationStructureScratchOffsetAlignment;
 
         struct RefitEntry
         {
-            const VKAccelerationStructure* blas;
-            const Mesh*                    mesh;
-            u64                            scratchOffset;
-            u64                            scratchSize;
+            VKAccelerationStructure* blas;   // non-const: a first build marks it recorded
+            const Mesh*              mesh;
+            u64                      scratchOffset;
+            u64                      scratchSize;
+            bool                     firstBuild;
         };
         std::vector<RefitEntry> entries;
         entries.reserve(instances.size());
@@ -129,13 +139,27 @@ namespace Luth
             if (!inst.isSkinned && !inst.isDeformable) continue;
             ResolvedMesh r = Resolve(inst);
             if (!r.blas || !r.blas->IsDeformable()) continue;
-            const u64 sz = AlignUp(r.blas->GetUpdateScratchSize(), scratchAlign);
-            entries.push_back({ r.blas, r.mesh, totalScratch, sz });
+
+            // The deform compute reads the source VB/IB; gate on their upload so neither the deform nor the
+            // first build reads a not-yet-resident buffer. Not ready -> skip this frame (stays unbuilt).
+            auto vbk = std::dynamic_pointer_cast<VKVertexBuffer>(r.mesh->GetVertexBuffer());
+            auto ibk = std::dynamic_pointer_cast<VKIndexBuffer>(r.mesh->GetIndexBuffer());
+            const u64 upFence = std::max<u64>(vbk ? vbk->GetUploadFence() : 0, ibk ? ibk->GetUploadFence() : 0);
+            if (!UploadContext::Get().IsComplete(upFence)) continue;
+
+            const bool firstBuild = !r.blas->IsBuildRecorded();
+            // A BLAS first-built this frame already reflects this frame's deform; skip a redundant same-frame
+            // MODE_UPDATE over the identical CURR region.
+            if (!firstBuild && r.blas->GetBuildFrameAbs() == frameAbs) continue;
+
+            const u64 sz = AlignUp(firstBuild ? r.blas->GetBuildScratchSize()
+                                              : r.blas->GetUpdateScratchSize(), scratchAlign);
+            entries.push_back({ const_cast<VKAccelerationStructure*>(r.blas), r.mesh, totalScratch, sz, firstBuild });
             totalScratch += sz;
         }
-        if (entries.empty()) return;
+        if (entries.empty()) return 0;
 
-        // AS-build scratch must be DEVICE_LOCAL — the tagged heap is HOST_VISIBLE (the CPU->GPU data
+        // AS-build scratch must be DEVICE_LOCAL: the tagged heap is HOST_VISIBLE (the CPU->GPU data
         // path) and NVIDIA's RT accelerator TDRs on it; PushDeletion retires it N+2. see arch/memory.md
         VkBufferCreateInfo scratchCi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
         scratchCi.size        = totalScratch;
@@ -145,7 +169,7 @@ namespace Luth
         VkBuffer scratchBuf = VK_NULL_HANDLE;
         VmaAllocation scratchAlloc = VulkanAllocator::AllocateBuffer(
             scratchCi, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, scratchBuf);
-        if (!scratchBuf) return;
+        if (!scratchBuf) return 0;
         VkBufferDeviceAddressInfo addrInfo{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
         addrInfo.buffer = scratchBuf;
         const VkDeviceAddress scratchBase = vkGetBufferDeviceAddress(ctx.GetDevice(), &addrInfo);
@@ -192,8 +216,9 @@ namespace Luth
             info.type                     = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
             info.flags                    = VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR
                                           | VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-            info.mode                     = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
-            info.srcAccelerationStructure = e.blas->GetHandle();
+            info.mode                     = e.firstBuild ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR
+                                                          : VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+            info.srcAccelerationStructure = e.firstBuild ? VK_NULL_HANDLE : e.blas->GetHandle();
             info.dstAccelerationStructure = e.blas->GetHandle();
             info.geometryCount            = 1;
             info.pGeometries              = &refitCtx->geoms[i];
@@ -209,16 +234,27 @@ namespace Luth
                                                refitCtx->rangePtrs.data());
 
         VulkanContext::Get().PushDeletion([refitCtx]() { delete refitCtx; });
+
+        // Mark first-builds recorded so the TLAS gather includes them this frame (post-barrier) and next
+        // frame refits them as MODE_UPDATE. The count drives the TLAS ready-generation (H1).
+        u32 firstBuilt = 0;
+        for (const auto& e : entries)
+            if (e.firstBuild) { e.blas->MarkBuildRecorded(frameAbs); ++firstBuilt; }
+        return firstBuilt;
     }
 
     TlasBuildResult TlasBuilder::BuildTlas(VkCommandBuffer cmd,
                                            std::span<const MeshDrawSnapshot> instances,
                                            u32 frameAbs,
                                            const TlasBuildResult& prev,
-                                           const std::unordered_map<UUID, u32, UUIDHash>& materialSlotMap)
+                                           const std::unordered_map<UUID, u32, UUIDHash>& materialSlotMap,
+                                           u64 blasReadyGen,
+                                           bool markEmitters)
     {
-        const u64 hash = HashInstances(instances);
-        if (prev.tlas != VK_NULL_HANDLE && hash == prev.instanceHash)
+        const u64 hash = HashInstances(instances, markEmitters);
+        // A newly first-built BLAS changes the ready-generation but not the instance hash; force one rebuild
+        // when the generation advances so the now-ready BLAS is gathered, then hash-reuse resumes.
+        if (prev.tlas != VK_NULL_HANDLE && hash == prev.instanceHash && blasReadyGen == prev.blasReadyGen)
         {
             TlasBuildResult r = prev;
             r.reused = true;
@@ -231,8 +267,8 @@ namespace Luth
 
         // Pack instance buffer + the parallel geometry table in ONE loop so instanceCustomIndex (the
         // packed index) indexes the table 1:1. One VkAccelerationStructureInstanceKHR per resolved mesh
-        // with a non-null BLAS — meshes still uploading or with build failures get skipped.
-        // CONTRACT (rt-renderer C.3): instanceCustomIndex was the entity id (read by no shader); it is
+        // with a non-null BLAS; meshes still uploading or with build failures get skipped.
+        // CONTRACT: instanceCustomIndex was the entity id (read by no shader); it is
         // now the geometry-table index. restir_gi_initial.comp fetches {vertexBDA, indexBDA, materialSlot,
         // stride} from the table to shade the secondary hit's real material. see arch/rendering-pipeline.md
         std::vector<VkAccelerationStructureInstanceKHR> packed;
@@ -242,10 +278,13 @@ namespace Luth
         for (const auto& inst : instances)
         {
             ResolvedMesh r = Resolve(inst);
-            if (!r.blas || r.blas->GetDeviceAddress() == 0) continue;
+            // Skip a BLAS whose build hasn't been recorded yet (deferred static build still pending, or
+            // upload not retired): its storage is uninitialized and the TLAS builder would TDR on it. The
+            // device address is valid pre-build, so IsBuildRecorded (not address) is the readiness test.
+            if (!r.blas || !r.blas->IsBuildRecorded()) continue;
 
-            // Resolve the material once: slot (geom table) + render mode → visibility mask + opaque flag.
-            // Transparent/Fade pack with the GLASS mask only — shadow-class rays cull to SOLID (glass
+            // Resolve the material once: slot (geom table) + render mode -> visibility mask + opaque flag.
+            // Transparent/Fade pack with the GLASS mask only: shadow-class rays cull to SOLID (glass
             // never blocks light), world-class rays (GI bounce / reflections / PT) trace SOLID|GLASS and
             // auto-confirm glass as a surface: emissive glass feeds the GI bounce and shows in reflections
             // (unblended approximation). Masks mirror common/material.slang's GT_VIS_*. HashInstances
@@ -255,6 +294,7 @@ namespace Luth
             u32  matSlot     = 0;  // slot 0 = reserved white material
             bool cutout      = false;
             bool transparent = false;
+            bool isEmitter   = false;
             if (inst.materialUUID.IsValid())
             {
                 auto it = materialSlotMap.find(inst.materialUUID);
@@ -264,6 +304,7 @@ namespace Luth
                     const Material::RenderMode mode = mat->GetRenderMode();
                     transparent = mode == Material::RenderMode::Transparent || mode == Material::RenderMode::Fade;
                     cutout      = mode == Material::RenderMode::Cutout;
+                    isEmitter   = markEmitters && IsEmissiveLightMaterial(*mat, inst.isSkinned, inst.isDeformable);
                 }
             }
 
@@ -282,8 +323,8 @@ namespace Luth
 
             // Skinned meshes source attributes from the deformed vertex buffer (post-skin pos/normal/
             // tangent + passthrough UVs, interleaved Vertex layout) so ray hits shade with the same
-            // deformed basis raster sees; static meshes read the original VB. Both are the 52 B Vertex
-            // layout, so GatherHitGeometry reads either unchanged.
+            // deformed basis raster sees; static meshes read the original VB. Both use the interleaved
+            // Vertex layout (sizeof(Vertex)), so GatherHitGeometry reads either unchanged.
             auto ib = std::dynamic_pointer_cast<VKIndexBuffer>(r.mesh->GetIndexBuffer());
             GPUGeometryEntry ge{};
             if (r.blas->IsDeformable())
@@ -297,21 +338,24 @@ namespace Luth
             }
             ge.indexBDA     = ib ? ib->GetDeviceAddress() : 0;
             ge.materialSlot = matSlot;
-            ge.vertexStride = sizeof(Vertex);
+            // Stride is sizeof(Vertex); bit 31 flags an emissive AREA LIGHT (DI owns its direct lighting,
+            // so restir_gi_initial drops its on-hit emission seed). GatherHitGeometry masks bit 31 before >>2.
+            ge.vertexStride = static_cast<u32>(sizeof(Vertex)) | (isEmitter ? 0x80000000u : 0u);
             geomEntries.push_back(ge);
         }
 
         TlasBuildResult result{};
         result.instanceHash  = hash;
         result.instanceCount = static_cast<u32>(packed.size());
+        result.blasReadyGen  = blasReadyGen;
 
         if (packed.empty())
         {
-            // Empty TLAS — return null handle; Set 0 binding 6 will bind VK_NULL_HANDLE this frame.
+            // Empty TLAS: return null handle; Set 0 binding 6 will bind VK_NULL_HANDLE this frame.
             return result;
         }
 
-        // Per-frame instance buffer (mapped-sequential write — small data, no benefit from staging).
+        // Per-frame instance buffer (mapped-sequential write; small data, no benefit from staging).
         const VkDeviceSize instanceBytes = packed.size() * sizeof(VkAccelerationStructureInstanceKHR);
         VkBufferCreateInfo instCi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
         instCi.size  = instanceBytes;
@@ -328,7 +372,7 @@ namespace Luth
         instAddr.buffer = instBuffer;
         const VkDeviceAddress instBda = vkGetBufferDeviceAddress(device, &instAddr);
 
-        // Instance buffer retires N+2 — by then this frame's TLAS build has long completed.
+        // Instance buffer retires N+2; by then this frame's TLAS build has long completed.
         VulkanContext::Get().PushDeletion([instBuffer, instAlloc]() {
             VulkanAllocator::FreeBuffer(instBuffer, instAlloc);
         });
@@ -336,7 +380,7 @@ namespace Luth
         // Geometry table (host-visible SSBO, BDA-deref'd by restir_gi_initial.comp). UNLIKE the
         // instance buffer it is NOT retired here: it shares the TLAS lifetime (read every frame the
         // TLAS is bound, including hash-skipped frames). Caller PushDeletion-s the prior table only
-        // when a rebuild replaces it — same handling as result.storageBuffer.
+        // when a rebuild replaces it (same handling as result.storageBuffer).
         const VkDeviceSize geomBytes = geomEntries.size() * sizeof(GPUGeometryEntry);
         VkBufferCreateInfo geomCi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
         geomCi.size        = geomBytes;
@@ -349,7 +393,7 @@ namespace Luth
             // Geom-table alloc failed (host-visible OOM / fragmentation). Abort the build: return an
             // empty result so GetTlas() falls back to the persistent empty TLAS. Binding a REAL TLAS
             // with a null table BDA would let a committed hit deref a null buffer_reference in
-            // restir_gi_initial.comp (device lost). Nothing to free — only the instance buffer was
+            // restir_gi_initial.comp (device lost). Nothing to free: only the instance buffer was
             // allocated this call, and it is already PushDeletion-queued above.
             return TlasBuildResult{};
         }
@@ -363,7 +407,7 @@ namespace Luth
         // Vulkan's vkCmdBuildAccelerationStructuresKHR may keep pointers to the geometry / build /
         // range structs until the command executes on the GPU; stack-local versions would die after
         // BuildTlas returns and subsequent passes' stack frames could clobber the bytes. The block
-        // is freed via PushDeletion (N+2 frames out — same lifetime as the storage buffer).
+        // is freed via PushDeletion (N+2 frames out, same lifetime as the storage buffer).
         struct BuildCtx
         {
             VkAccelerationStructureBuildGeometryInfoKHR buildInfo{
@@ -375,7 +419,7 @@ namespace Luth
         };
         auto* ctx_ = new BuildCtx;
 
-        // Geometry desc for the TLAS — INSTANCES type points at our packed instance buffer.
+        // Geometry desc for the TLAS: INSTANCES type points at the packed instance buffer.
         ctx_->geom.geometryType                          = VK_GEOMETRY_TYPE_INSTANCES_KHR;
         ctx_->geom.geometry.instances.sType              = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
         ctx_->geom.geometry.instances.arrayOfPointers    = VK_FALSE;
@@ -399,7 +443,7 @@ namespace Luth
             &primitiveCount,
             &sizes);
 
-        // Per-frame TLAS storage (VMA, PushDeletion — drains N+2). CONCURRENT so RtSunShadowsPass
+        // Per-frame TLAS storage (VMA, PushDeletion; drains N+2). CONCURRENT so RtSunShadowsPass
         // raygen can read it from the AsyncCompute queue without a queue-family-ownership transfer.
         VkBufferCreateInfo storageCi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
         storageCi.size        = sizes.accelerationStructureSize;
@@ -409,8 +453,8 @@ namespace Luth
         result.storageAlloc = VulkanAllocator::AllocateBuffer(
             storageCi, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, result.storageBuffer);
 
-        // AS-build scratch must be DEVICE_LOCAL — the tagged-heap path
-        // (AllocateMappedSequentialBuffer) returns HOST_VISIBLE memory, the documented CPU→GPU
+        // AS-build scratch must be DEVICE_LOCAL: the tagged-heap path
+        // (AllocateMappedSequentialBuffer) returns HOST_VISIBLE memory, the documented CPU->GPU
         // data path; wrong tool for GPU-only scratch (NVIDIA's RT hardware accelerator can TDR
         // on HOST_VISIBLE scratch). Mirrors BuildEmptyTlas's pattern. PushDeletion N+2 retires
         // it on the same schedule as the persistent instance buffer.
@@ -456,7 +500,7 @@ namespace Luth
         ctx_->pRange = &ctx_->range;
         rt.vkCmdBuildAccelerationStructuresKHR(cmd, 1, &ctx_->buildInfo, &ctx_->pRange);
 
-        // Heap context retires N+2 frames out — by then the GPU has long finished the build.
+        // Heap context retires N+2 frames out; by then the GPU has long finished the build.
         VulkanContext::Get().PushDeletion([ctx_]() { delete ctx_; });
 
         return result;

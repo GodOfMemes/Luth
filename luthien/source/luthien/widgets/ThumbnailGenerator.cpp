@@ -22,11 +22,13 @@ namespace Luth::UI
 {
     namespace fs = std::filesystem;
 
-    // ThumbnailCache exposes these to its sibling generator only — wire-internal.
+    // ThumbnailCache exposes these to its sibling generator only; wire-internal.
     namespace ThumbnailCacheInternal
     {
         void PushTextureCompletion(UUID asset, std::vector<u8> pixels, u32 width, u32 height);
         void NotifyBakeFailed(UUID asset);
+        // Asset not loaded yet: drop the entry so the panel's next Get re-queues the bake once it lands.
+        void NotifyBakeDeferred(UUID asset);
         // Records the texture UUIDs a material samples. The cache uses this to
         // cascade-invalidate dependent material thumbnails when one of those
         // textures changes (AssetChangedSignal::Modified handler).
@@ -48,7 +50,7 @@ namespace Luth::UI
 
         void BakeTexture(UUID asset, u32 targetSize)
         {
-            // Snapshot the source path under no lock — AssetDatabase::GetMetadata
+            // Snapshot the source path under no lock: AssetDatabase::GetMetadata
             // returns a const reference, but project switching could destroy the
             // entry under us. Copy the path immediately, validate after.
             fs::path srcPath;
@@ -124,19 +126,19 @@ namespace Luth::UI
 
     namespace
     {
-        // Mesh bake runs synchronously on the main thread because LoadImmediate
-        // and ImmediateSubmit are both main-thread-only. ThumbnailCache caps
-        // GPU-bake dispatches at 1/frame so this can't dominate frame time.
+        // The GPU mesh bake is main-thread-only (LoadImmediate/ImmediateSubmit) and ThumbnailCache caps
+        // dispatches at 1/frame. The model LOAD, though, stays off the app loop: GetAsset is non-blocking,
+        // and a not-yet-resident model async-loads + defers, so a fresh (still-importing) model can't
+        // freeze the frame the way LoadImmediate would.
         void BakeMeshSync(UUID asset)
         {
+            auto model = AssetManager::GetAsset<Model>(asset);
+            if (!model) {
+                AssetManager::LoadAsync(asset);                  // resident within a couple frames
+                ThumbnailCacheInternal::NotifyBakeDeferred(asset);
+                return;
+            }
             try {
-                auto modelBase = AssetManager::LoadImmediate(asset);
-                auto model = std::dynamic_pointer_cast<Model>(modelBase);
-                if (!model) {
-                    ThumbnailCacheInternal::NotifyBakeFailed(asset);
-                    return;
-                }
-
                 // ThumbnailPreviewScene picks the matching pipeline (static vs
                 // skinned) based on model->IsSkinned(); both paths render the
                 // bind-pose mesh through the same Lambert+ambient shader.
@@ -169,17 +171,16 @@ namespace Luth::UI
 
         void BakeMaterialSync(UUID asset)
         {
+            auto material = AssetManager::GetAsset<Material>(asset);
+            if (!material) {
+                AssetManager::LoadAsync(asset);
+                ThumbnailCacheInternal::NotifyBakeDeferred(asset);
+                return;
+            }
             try {
-                auto matBase = AssetManager::LoadImmediate(asset);
-                auto material = std::dynamic_pointer_cast<Material>(matBase);
-                if (!material) {
-                    ThumbnailCacheInternal::NotifyBakeFailed(asset);
-                    return;
-                }
-
-                // Capture sampled-texture UUIDs for cascade invalidation —
+                // Capture sampled-texture UUIDs for cascade invalidation:
                 // editing a sampled texture invalidates this material thumbnail.
-                // Recorded even though v1 bakes only use the albedo color.
+                // Recorded even though bakes currently use only the albedo color.
                 std::vector<UUID> deps;
                 deps.reserve(material->GetTextures().size());
                 for (const auto& mapInfo : material->GetTextures()) {
@@ -222,7 +223,7 @@ namespace Luth::UI
         if (type == AssetType::Texture) {
             auto* ctx = LH_NEW(Memory::Category::Editor, TextureBakeContext);
             ctx->asset = asset;
-            ctx->targetSize = 128;                // settings-driven in commit G
+            ctx->targetSize = 128;
             JobSystem::Execute(BakeTextureJobThunk, ctx, nullptr,
                                "Thumbnail.Bake.Tex", JobSystem::Priority::Low);
         }
@@ -241,7 +242,7 @@ namespace Luth::UI
 
         const fs::path path = ThumbnailDiskPath(asset);
         // IOThread::ReadFile dispatches its callback onto a worker fiber after
-        // the read completes — same execution context as a bake job, so the
+        // the read completes, same execution context as a bake job, so the
         // decode + push-completion path mirrors BakeTexture exactly.
         IOThread::ReadFile(path.string(), [asset](std::vector<u8> bytes) {
             try {

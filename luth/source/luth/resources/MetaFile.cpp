@@ -25,8 +25,8 @@ namespace Luth
         switch (type) {
             case AssetType::Texture:
                 settings["generate_mipmaps"] = true;
-                settings["compression_format"] = "BC7";
-                settings["srgb"] = true;
+                settings["compression"] = "auto";       // auto | none | bc1 | bc4 | bc5 | bc7
+                settings["compression_quality"] = 1;    // 0 fast | 1 normal | 2 high
                 settings["wrap_mode"] = 0;   // TextureWrapMode::Repeat
                 settings["filter_min"] = 0;  // TextureFilterMode::Linear
                 settings["filter_mag"] = 0;  // TextureFilterMode::Linear
@@ -40,7 +40,7 @@ namespace Luth
                 settings["up_axis"] = -1;              // -1 = auto-detect
                 settings["bake_axis_conversion"] = true;
                 settings["skin_mesh_transform"] = 0;   // Auto
-                settings["physics_bake"] = 0;          // None — opt-in per model
+                settings["physics_bake"] = 0;          // None; opt-in per model
                 break;
 
             case AssetType::Material:
@@ -49,7 +49,7 @@ namespace Luth
                 break;
 
             case AssetType::PhysicsMaterial:
-                // No type-specific knobs at the .meta layer — friction/restitution/density live
+                // No type-specific knobs at the .meta layer; friction/restitution/density live
                 // inside the .physmat JSON itself.
                 break;
 

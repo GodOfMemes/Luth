@@ -4,6 +4,8 @@
 #include "luth/resources/MetaFile.h"
 #include "luth/core/diagnostics/Log.h"
 #include "luth/resources/AssetManager.h"
+#include "luth/resources/importers/TextureResolver.h"
+#include "luth/jobs/JobSystem.h"
 #include <fstream>
 #include <nlohmann/json.hpp>
 
@@ -27,7 +29,7 @@ namespace Luth
     std::unordered_set<UUID, UUIDHash> AssetDatabase::s_SelfWrites;
     std::mutex AssetDatabase::s_SelfWriteMutex;
 
-    // ── Phase 1: Engine-only init (register shaders, fonts) ──
+    // ---- Phase 1: Engine-only init (register shaders, fonts) ----
 
     void AssetDatabase::InitEngine(const std::filesystem::path& engineAssetsRoot)
     {
@@ -57,7 +59,7 @@ namespace Luth
             if (type == AssetType::None) continue;
 
             // Slang modules under common/ + registry/ are pulled in via the compiler's search path, never as
-            // standalone shader assets — skip them so the scan never mints a meta + fails to compile an
+            // standalone shader assets; skip them so the scan never mints a meta + fails to compile an
             // entry-less module (e.g. mat_graph_registry, material_bindings_*).
             if (path.extension() == ".slang")
             {
@@ -108,7 +110,7 @@ namespace Luth
         LH_LOG(Assets, info, "AssetDatabase: Registered {} engine assets", engineAssetCount);
     }
 
-    // ── Phase 2: Load project assets (called when user selects a project) ──
+    // ---- Phase 2: Load project assets (called when user selects a project) ----
 
     void AssetDatabase::LoadProject(const std::filesystem::path& projectAssetsRoot)
     {
@@ -116,8 +118,8 @@ namespace Luth
         std::lock_guard<std::mutex> lock(s_Mutex);
 
         s_ProjectRoot = fs::absolute(projectAssetsRoot).parent_path();
-        // projectAssetsRoot IS the <project>/assets/ path, but s_ProjectRoot should be <project>/
-        // Actually, let's derive it from FileSystem which already has the project root
+        // projectAssetsRoot is <project>/assets/, but s_ProjectRoot must be <project>/; take it from
+        // FileSystem, which already tracks the project root.
         s_ProjectRoot = FileSystem::ProjectPath();
 
         s_DirtyAssets.clear();
@@ -152,7 +154,7 @@ namespace Luth
 
         u32 projectAssetCount = 0;
 
-        // Phase 2: Process asset files — create .meta if missing, register in DB
+        // Phase 2: Process asset files; create .meta if missing, register in DB.
         for (const auto& path : assetFiles)
         {
             AssetType type = FileSystem::ClassifyFileType(path);
@@ -212,7 +214,7 @@ namespace Luth
         SaveLibraryState_Unlocked();
     }
 
-    // ── Unload project assets (keeps engine assets intact) ──
+    // ---- Unload project assets (keeps engine assets intact) ----
 
     void AssetDatabase::UnloadProject()
     {
@@ -225,7 +227,6 @@ namespace Luth
         std::vector<UUID> toRemove;
         for (const auto& [uuid, meta] : s_Assets)
         {
-            // Keep assets whose path starts with the engine assets root
             std::string pathStr = meta.Path.string();
             std::string engineStr = s_EngineAssetsRoot.string();
             if (pathStr.rfind(engineStr, 0) != 0) // Not under engine root
@@ -245,7 +246,7 @@ namespace Luth
         LH_LOG(Assets, info, "AssetDatabase: Project unloaded, {} engine assets remain", s_Assets.size());
     }
 
-    // ── Shutdown ──
+    // ---- Shutdown ----
 
     void AssetDatabase::Shutdown()
     {
@@ -266,7 +267,7 @@ namespace Luth
         s_DirtyAssets.clear();
     }
 
-    // ── Queries & Registration ──
+    // ---- Queries & Registration ----
 
     const AssetMetadata& AssetDatabase::GetMetadata(UUID uuid)
     {
@@ -329,7 +330,7 @@ namespace Luth
         }
     }
 
-    // ── Library State Persistence ──
+    // ---- Library State Persistence ----
 
     void AssetDatabase::LoadLibraryState_Unlocked()  // caller must hold s_Mutex
     {
@@ -361,7 +362,7 @@ namespace Luth
 
     u64 AssetDatabase::CalculateAssetHash(const fs::path& source, const fs::path& meta)
     {
-        // FNV-1a over timestamps and file size — order-dependent, no information loss.
+        // FNV-1a over timestamps and file size; order-dependent, no information loss.
         u64 hash = 14695981039346656037ULL;  // FNV-1a offset basis
         auto mix = [&hash](u64 val) {
             const u8* bytes = reinterpret_cast<const u8*>(&val);
@@ -382,7 +383,7 @@ namespace Luth
         return hash;
     }
 
-    // ── File Ingestion (drag-and-drop, external import) ──
+    // ---- File Ingestion (drag-and-drop, external import) ----
 
     static bool IsImageExtension(const fs::path& ext)
     {
@@ -448,6 +449,52 @@ namespace Luth
         }
     }
 
+    // glTF references its textures by relative URI, often deeply nested (e.g. objects/props/x/foo.png). Copy each
+    // referenced image PRESERVING that relative path under destDir, so the imported glTF resolves it directly at any
+    // depth. Embedded (buffer-view / data:) images are skipped; so are formats the engine can't load (e.g. .dds),
+    // since materials reference the loadable siblings the glTF also lists.
+    static void CopyGltfImages(const fs::path& srcGltf, const fs::path& destDir)
+    {
+        std::ifstream in(srcGltf);
+        if (!in.is_open()) return;
+
+        nlohmann::json gltf;
+        try { in >> gltf; }
+        catch (...) { LH_LOG(Assets, warn, "CopyGltfImages: cannot parse {0}", srcGltf.filename().string()); return; }
+
+        if (!gltf.contains("images")) return;
+        int copied = 0, missing = 0;
+        for (const auto& img : gltf["images"]) {
+            if (!img.contains("uri") || !img["uri"].is_string()) continue;   // buffer-view image (embedded)
+            std::string uri = img["uri"].get<std::string>();
+            if (uri.empty() || uri.rfind("data:", 0) == 0) continue;         // embedded data URI
+
+            fs::path rel = fs::path(PercentDecode(uri));
+            if (!IsImageExtension(rel.extension())) continue;                 // skip .dds etc. the engine can't load
+            fs::path src = srcGltf.parent_path() / rel;
+            fs::path dst = destDir / rel;
+            std::error_code ec;
+            if (!fs::exists(src, ec)) { ++missing; continue; }
+            fs::create_directories(dst.parent_path(), ec);
+            fs::copy_file(src, dst, fs::copy_options::skip_existing, ec);
+            if (!ec) ++copied;
+            else LH_LOG(Assets, warn, "CopyGltfImages: copy failed {0}: {1}", src.string(), ec.message());
+        }
+        if (copied || missing)
+            LH_LOG(Assets, info, "CopyGltfImages: copied {0} texture(s) (paths preserved), {1} referenced file(s) missing", copied, missing);
+    }
+
+    std::vector<fs::path> AssetDatabase::GetPathsOfType(AssetType type)
+    {
+        std::vector<fs::path> paths;
+        std::lock_guard<std::mutex> lock(s_Mutex);
+        paths.reserve(s_Assets.size());
+        for (const auto& [uuid, meta] : s_Assets)
+            if (meta.Type == type)
+                paths.push_back(meta.Path);
+        return paths;
+    }
+
     void AssetDatabase::IngestFile(const fs::path& sourcePath, const fs::path& destDir)
     {
         LH_PROFILE_FUNCTION();
@@ -468,47 +515,49 @@ namespace Luth
             fs::copy_file(sourcePath, destPath, fs::copy_options::overwrite_existing);
             LH_LOG(Assets, info, "Imported {0} to {1}", sourcePath.filename().string(), destPath.string());
 
-            // For model assets, discover and copy adjacent textures
+            // For model assets, bring the textures across alongside the model.
             if (resType == AssetType::Model) {
-                // glTF references its .bin buffer by relative URI; copy it next to the model first.
                 std::string ext = sourcePath.extension().string();
                 for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
-                if (ext == ".gltf")
+
+                if (ext == ".gltf") {
+                    // glTF references its .bin buffer + textures by relative URI; copy both preserving the relative
+                    // paths so the imported glTF resolves them directly however deeply they nest (objects/, textures/).
                     CopyGltfBuffers(sourcePath, destDir);
-
-                fs::path texDestDir = destDir / (sourcePath.stem().string() + "_Textures");
-                fs::path srcDir = sourcePath.parent_path();
-
-                std::vector<fs::path> scanDirs = { srcDir };
-                static const char* k_SiblingDirs[] = {
-                    "textures", "Textures", "texture", "Texture",
-                    "tex",      "Tex",      "maps",   "Maps",
-                    "images",   "Images"
-                };
-                for (const char* sub : k_SiblingDirs) {
-                    fs::path candidate = srcDir / sub;
-                    if (fs::exists(candidate) && fs::is_directory(candidate))
-                        scanDirs.push_back(candidate);
+                    CopyGltfImages(sourcePath, destDir);
                 }
+                else {
+                    // FBX/OBJ reference textures by filename, so gather images from the model folder and its common
+                    // texture subdirs (RECURSIVELY, to catch nested layouts) into a flat <model>_Textures/.
+                    fs::path texDestDir = destDir / (sourcePath.stem().string() + "_Textures");
+                    fs::path srcDir = sourcePath.parent_path();
 
-                bool copiedAny = false;
-                for (const auto& dir : scanDirs) {
-                    for (const auto& entry : fs::directory_iterator(dir)) {
-                        if (!entry.is_regular_file()) continue;
-                        if (!IsImageExtension(entry.path().extension())) continue;
-
-                        if (!copiedAny) {
-                            fs::create_directories(texDestDir);
-                            copiedAny = true;
-                        }
-
-                        fs::path imgDest = texDestDir / entry.path().filename();
-                        if (!fs::exists(imgDest))
-                            fs::copy_file(entry.path(), imgDest, fs::copy_options::skip_existing);
+                    std::vector<fs::path> scanDirs;
+                    for (const char* sub : k_CommonTextureDirs) {
+                        fs::path candidate = srcDir / sub;
+                        if (fs::exists(candidate) && fs::is_directory(candidate))
+                            scanDirs.push_back(candidate);
                     }
+
+                    bool copiedAny = false;
+                    auto copyImg = [&](const fs::path& p) {
+                        if (!IsImageExtension(p.extension())) return;
+                        if (!copiedAny) { fs::create_directories(texDestDir); copiedAny = true; }
+                        fs::path imgDest = texDestDir / p.filename();
+                        std::error_code ec;
+                        if (!fs::exists(imgDest)) fs::copy_file(p, imgDest, fs::copy_options::skip_existing, ec);
+                    };
+                    // Model-folder root non-recursively (don't drag in a sibling model's images), then each common
+                    // texture dir recursively (its nested subfolders hold this model's textures).
+                    for (const auto& entry : fs::directory_iterator(srcDir))
+                        if (entry.is_regular_file()) copyImg(entry.path());
+                    for (const auto& dir : scanDirs)
+                        for (const auto& entry : fs::recursive_directory_iterator(dir, fs::directory_options::skip_permission_denied))
+                            if (entry.is_regular_file()) copyImg(entry.path());
+
+                    if (copiedAny)
+                        LH_LOG(Assets, info, "Copied adjacent textures to {0}", texDestDir.filename().string());
                 }
-                if (copiedAny)
-                    LH_LOG(Assets, info, "Copied adjacent textures to {0}", texDestDir.filename().string());
             }
 
             UUID newUuid = MetaFile::Create(destPath, resType);
@@ -531,7 +580,21 @@ namespace Luth
         }
     }
 
-    // ── File System Watching ──
+    void AssetDatabase::IngestFileAsync(const fs::path& sourcePath, const fs::path& destDir)
+    {
+        // Whole ingest runs on a worker: the copy + import are the freeze, and everything IngestFile
+        // touches off the main thread is already safe -- RegisterAsset/MetaFile are s_Mutex-locked, and
+        // the change callbacks only stage flags / enqueue on the MainThread event bus / push under a SpinLock.
+        struct IngestReq { fs::path Src; fs::path Dest; };
+        IngestReq* req = new IngestReq{ sourcePath, destDir };
+        JobSystem::Execute([](JobSystem::JobArgs args) {
+            IngestReq* r = (IngestReq*)args.data;
+            AssetDatabase::IngestFile(r->Src, r->Dest);
+            delete r;
+        }, req, nullptr, "IngestFile", JobSystem::Priority::Low);
+    }
+
+    // ---- File System Watching ----
 
     void AssetDatabase::StartWatching()
     {
@@ -643,10 +706,9 @@ namespace Luth
                     fs::path artifact = GetArtifactPath(uuid);
                     if (fs::exists(artifact)) fs::remove(artifact);
 
-                    // Drop the in-memory asset so the next GetAsset/LoadAsync
-                    // picks up the freshly-cooked artifact. Anything still
-                    // holding a shared_ptr keeps the old data alive until
-                    // it lets go (no use-after-free).
+                    // Drop the in-memory asset so the next GetAsset/LoadAsync picks up the freshly-cooked
+                    // artifact. Anything still holding a shared_ptr keeps the old data alive until it
+                    // lets go (no use-after-free).
                     AssetManager::Evict(uuid);
 
                     s_DirtyAssets.push_back(uuid);

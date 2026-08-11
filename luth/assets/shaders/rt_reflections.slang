@@ -1,7 +1,7 @@
-// RT specular reflections (rt-renderer D.1). One GGX-VNDF reflection ray per opaque pixel below a
+// RT specular reflections. One GGX-VNDF reflection ray per opaque pixel below a
 // roughness cutoff, traced from the slim G-buffer, shaded at the hit (NEE + emission + diffuse IBL) or the
 // sharp environment on miss. Outputs lobe-mean incoming radiance (rgb) + world hitDist (a) for the
-// specular denoiser; pbr.frag composites it (S4). Opaque-only. see arch/rendering-pipeline.md
+// specular denoiser; pbr.frag composites it. Opaque-only. see arch/rendering-pipeline.md
 import globals;
 import restir_common;       // light structs + PCG/luminance/oct + PointLightRadiance
 import restir_gi_common;    // BranchlessONB + GI_PI
@@ -24,14 +24,16 @@ struct PC
 {
     float4x4     invViewProj;
     uint         frameSeed;
-    float        roughnessCutoff;   // skip the trace above this (rough → prefiltered-env IBL fallback)
+    float        roughnessCutoff;   // skip the trace above this (rough -> prefiltered-env IBL fallback)
     float        maxRayDistance;
     float        fireflyClamp;
-    uint         envReady;          // 1 → IBL prefiltered env bound
+    uint         envReady;          // 1 -> IBL prefiltered env bound
     int          gbufferScale;      // 1 = full-res; 2 = half-res (G-buffer reads remap to full)
     int          dispatchW;         // reflection working (dispatch) resolution
     int          dispatchH;
     GtGeomEntry* geomTable;
+    float        minLobeAlpha;   // GGX rough^2 floor: near-mirror 1-spp point-samples bright hits -> fireflies
+    float        neeClamp;       // luminance cap on the point-light NEE term (the x-count un-pdf spike)
 };
 [[vk::push_constant]] PC pc;
 
@@ -54,17 +56,6 @@ DirectionalLightData LoadDirLight()
     d._pad      = 0.0;
     return d;
 }
-uint LoadPointCount() { return g_Lights.Load(32); }
-PointLightData LoadPoint(uint j)
-{
-    uint b = 48u + j * 32u;
-    PointLightData p;
-    p.position  = asfloat(g_Lights.Load3(b + 0u));
-    p.range     = asfloat(g_Lights.Load(b + 12u));
-    p.color     = asfloat(g_Lights.Load3(b + 16u));
-    p.intensity = asfloat(g_Lights.Load(b + 28u));
-    return p;
-}
 
 // Shadow ray: true iff `dir` is unoccluded from x up to maxDist (Wächter-Binder geometric-normal offset).
 bool Visible(float3 x, float3 offsetN, float3 dir, float maxDist)
@@ -86,16 +77,21 @@ float3 ShadeHit(float3 xs, HitSurface hs, inout uint seed)
     float3 diffAlb = hs.baseColor * (1.0 - hs.metalness);   // metals carry no Lambertian diffuse
     float3 Lo      = hs.emission;
 
-    uint lc = LoadPointCount();
-    if (lc > 0u)
+    if ((LightPointCount(g_Lights) + LightTriCount(g_Lights)) > 0u)
     {
-        uint j = min(uint(RandFromSeed(seed) * float(lc)), lc - 1u);
-        PointLightData pl = LoadPoint(j);
-        float3 Lw; float ld;
-        float3 Li  = PointLightRadiance(pl, xs, Lw, ld);
-        float  ndl = max(dot(ns, Lw), 0.0);
-        if (ndl > 0.0 && Visible(xs, hs.ng, Lw, ld - 2.0 * ubo.rtShadowParams.y))
-            Lo += (diffAlb / GI_PI) * Li * ndl * float(lc);   // × count undoes the 1/count pick pdf
+        uint lightIndex; uint uvPacked; float invSourcePdf;
+        DrawLightCandidate(g_Lights, seed, lightIndex, uvPacked, invSourcePdf);
+        LightSample s = ReSampleLight(g_Lights, lightIndex, uvPacked, xs);
+        float ndl = max(dot(ns, s.L), 0.0);
+        if (ndl > 0.0 && Visible(xs, hs.ng, s.L, ShadowTMax(lightIndex, s.dist, ubo.rtShadowParams.y, ubo.rtShadowParams.z)))
+        {
+            // invSourcePdf undoes the alias/uniform pick pdf; that single-light lottery is the NEE spike
+            // source, so clamp this term (not sun/emission/IBL) before it enters the 1-spp reflection.
+            float3 nee  = (diffAlb / GI_PI) * s.Li * ndl * invSourcePdf;
+            float  nlum = Luminance(nee);
+            if (nlum > pc.neeClamp) nee *= pc.neeClamp / nlum;
+            Lo += nee;
+        }
     }
     DirectionalLightData dl = LoadDirLight();
     if (dl.intensity > 0.0)
@@ -136,12 +132,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     // GGX-VNDF reflection ray: sample a visible half-vector in tangent space (N = +Z), reflect V.
     float3 t, bt; BranchlessONB(N, t, bt);
     float3 Vt = float3(dot(V, t), dot(V, bt), dot(V, N));
-    float3 Ht = SampleGGXVNDF(Vt, rough * rough, RandFromSeed(seed), RandFromSeed(seed));
+    float3 Ht = SampleGGXVNDF(Vt, max(rough * rough, pc.minLobeAlpha), RandFromSeed(seed), RandFromSeed(seed));
     float3 H  = Ht.x * t + Ht.y * bt + Ht.z * N;
     float3 R  = reflect(-V, H);
     if (dot(N, R) <= 0.0)           { u_Refl[uint2(pixel)] = float4(0.0); return; }   // below horizon
 
-    // Trace to the nearest hit; origin offset grows as R grazes (slim normal ≠ geometric → self-hit guard).
+    // Trace to the nearest hit; origin offset grows as R grazes (slim normal != geometric -> self-hit guard).
     float  tMin = ubo.rtShadowParams.y;
     float3 ro   = worldPos + N * (ubo.rtShadowParams.z * (2.0 - dot(N, R))) + R * tMin;
     RayDesc ray; ray.Origin = ro; ray.TMin = tMin; ray.Direction = R; ray.TMax = pc.maxRayDistance;
@@ -153,7 +149,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float  hitDist;
     if (rq.CommittedStatus() == COMMITTED_NOTHING)
     {
-        // Miss → SHARP environment along R (LOD 0; the VNDF already spread R), × iblIntensity.
+        // Miss -> SHARP environment along R (LOD 0; the VNDF already spread R), x iblIntensity.
         Li      = (pc.envReady != 0u) ? u_PrefilteredEnv.SampleLevel(R, 0.0).rgb * ubo.iblIntensity : float3(0.0);
         hitDist = pc.maxRayDistance;
     }
@@ -162,8 +158,17 @@ void main(uint3 tid : SV_DispatchThreadID)
         float  tHit = rq.CommittedRayT();
         float3 xs   = ro + R * tHit;
         HitSurface hs = FetchHitSurface(pc.geomTable, rq.CommittedInstanceID(), rq.CommittedPrimitiveIndex(),
-                                        rq.CommittedTriangleBarycentrics(), rq.CommittedObjectToWorld3x4(), R);
+                                        rq.CommittedTriangleBarycentrics(), rq.CommittedObjectToWorld3x4(), R, xs);
         Li      = ShadeHit(xs, hs, seed);
+        // Glass seen in a reflection: Fresnel-weighted surface shading + a single straight-through env tap
+        // (no bend, no geometry behind glass) -- a bounded stand-in; the PathTrace reference is the oracle.
+        if (hs.transmission > 0.0)
+        {
+            float  tw  = hs.transmission * (1.0 - hs.metalness);
+            float  Fg  = F_Dielectric(abs(dot(hs.ns, R)), hs.frontFace ? (1.0 / hs.ior) : hs.ior);
+            float3 thr = (pc.envReady != 0u) ? u_PrefilteredEnv.SampleLevel(R, hs.roughness * 4.0).rgb * ubo.iblIntensity : float3(0.0);
+            Li = lerp(Li, Li * Fg + (1.0 - Fg) * thr, tw);   // achromatic transmitted env (tint = absorption, not albedo)
+        }
         hitDist = tHit;
     }
 

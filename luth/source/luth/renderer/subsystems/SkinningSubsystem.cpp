@@ -5,6 +5,7 @@
 #include "luth/renderer/backend/vulkan/VulkanContext.h"
 #include "luth/renderer/backend/vulkan/VulkanAccelerationStructure.h"
 #include "luth/renderer/backend/vulkan/VulkanBuffer.h"
+#include "luth/renderer/backend/vulkan/UploadContext.h"
 #include "luth/renderer/resources/BoneMatrixBuffer.h"
 #include "luth/renderer/resources/Mesh.h"
 #include "luth/renderer/resources/Model.h"
@@ -23,7 +24,7 @@ namespace Luth
 {
     namespace
     {
-        // Push constant block — exact layout the GLSL `pc` struct expects (std430, 24 bytes total).
+        // Push constant block: exact layout the GLSL `pc` struct expects (std430, 24 bytes total).
         struct SkinPC
         {
             VkDeviceAddress inputBda;     //  0
@@ -33,23 +34,23 @@ namespace Luth
         };
         static_assert(sizeof(SkinPC) == 24, "SkinPC must match skinning.slang push_constant layout");
 
-        // deform.slang push constants — 72 B; the uint64 BDAs force 8-align (14 trailing 4-byte fields
-        // → 72 is exactly 8-aligned, no pad). windXYZ is the per-instance OBJECT-space wind direction
+        // deform.slang push constants: 72 B; the uint64 BDAs force 8-align (14 trailing 4-byte fields
+        // -> 72 is exactly 8-aligned, no pad). windXYZ is the per-instance OBJECT-space wind direction
         // (the global world-space dir transformed by inverse(mat3(world)) on the CPU).
         struct DeformPC
         {
-            VkDeviceAddress inputBda;      //  0 — source Vertex VB (52 B)
-            VkDeviceAddress deformedBda;   //  8 — write the CURRENT region
+            VkDeviceAddress inputBda;      //  0: source Vertex VB (52 B)
+            VkDeviceAddress deformedBda;   //  8: write the CURRENT region
             u32             vertexCount;   // 16
             f32             time;          // 20
-            f32             windX;         // 24 — object-space dir (CPU-resolved per instance)
+            f32             windX;         // 24: object-space dir (CPU-resolved per instance)
             f32             windY;         // 28
             f32             windZ;         // 32
             f32             strength;      // 36
             f32             mainBendScale; // 40
             f32             detailScale;   // 44
             f32             frequency;     // 48
-            f32             phaseOffset;   // 52 — per-entity de-sync
+            f32             phaseOffset;   // 52: per-entity de-sync
             f32             gustStrength;  // 56
             f32             gustFrequency; // 60
             f32             turbAmplitude; // 64
@@ -80,7 +81,7 @@ namespace Luth
             std::vector<VkDescriptorSetLayout>{ BoneMatrixBuffer::GetDescriptorSetLayout() },
             std::vector<VkPushConstantRange>{ pcRange });
 
-        // deform.slang — static wind-deformable. No bones / no descriptor set; all inputs ride DeformPC.
+        // deform.slang: static wind-deformable. No bones / no descriptor set; all inputs ride DeformPC.
         if (auto sh = ShaderLibrary::LoadEngine("shaders/deform.slang"))
             m_DeformSpv = sh->GetSpirV();
         if (!m_DeformSpv.empty())
@@ -136,10 +137,11 @@ namespace Luth
         if (!blas || !blas->IsDeformable()) return;
         if (blas->GetDeformedBdaCurr(frameAbs) == 0) return;
 
-        // The compute reads the source SkinnedVertex VB directly (scalar buffer_reference) — its
-        // upload fence is waited at BLAS-build time, so it is resident before the first dispatch.
+        // The compute reads the source SkinnedVertex VB directly (scalar buffer_reference). The deferred
+        // BLAS build no longer waits on its upload, so gate here: skip until the VB has retired.
         auto vb = std::dynamic_pointer_cast<VKVertexBuffer>(mesh.GetVertexBuffer());
         if (!vb) return;
+        if (!UploadContext::Get().IsComplete(vb->GetUploadFence())) return;
 
         SkinPC pc{};
         pc.inputBda    = vb->GetDeviceAddress();
@@ -195,7 +197,7 @@ namespace Luth
 
         const u32 frameAbs = static_cast<u32>(Renderer::GetFrameData()->GetRenderFrameIndex());
         // Global wind FIELD. The world-space direction is transformed into each mesh's object space
-        // inside the loop (so rotated instances bend the same world direction); a zero vector → no main
+        // inside the loop (so rotated instances bend the same world direction); a zero vector -> no main
         // bend (detail still applies). Per-entity response (Component::Wind) folds in below.
         const f32  wlen      = Math::Length(wind.direction);
         const Vec3 worldDir  = (wlen > 1e-5f) ? wind.direction * (1.0f / wlen) : Vec3(0.0f);
@@ -213,13 +215,14 @@ namespace Luth
             if (!blas || !blas->IsDeformable() || blas->GetDeformedBdaCurr(frameAbs) == 0) continue;
             auto vb = std::dynamic_pointer_cast<VKVertexBuffer>(mesh->GetVertexBuffer());
             if (!vb) continue;
+            if (!UploadContext::Get().IsComplete(vb->GetUploadFence())) continue;   // source VB not resident yet
 
-            // Lazy bind — no descriptor set (deform.slang has no Set 0). A snapshot with zero deformable
+            // Lazy bind; no descriptor set (deform.slang has no Set 0). A snapshot with zero deformable
             // meshes records zero commands.
             if (!boundPipeline) { m_DeformPipeline->Bind(cmd); boundPipeline = true; }
 
-            // World→object: a wind direction is a contravariant flow vector, so transform by the plain
-            // inverse of the linear part (NOT the inverse-transpose normal matrix). Singular → no bend.
+            // World->object: a wind direction is a contravariant flow vector, so transform by the plain
+            // inverse of the linear part (NOT the inverse-transpose normal matrix). Singular -> no bend.
             const Mat3 invLin = Math::Inverse(Mat3(inst.worldMatrix));
 
             // Per-entity direction: an override (world- or object-space) else the global world field.
@@ -231,7 +234,7 @@ namespace Luth
             const f32 olen = Math::Length(objDir);
             objDir = (olen > 1e-5f && olen < 1e18f) ? objDir * (1.0f / olen) : Vec3(0.0f);
 
-            // Per-entity response folds into the global field; windRespond == false → bind pose.
+            // Per-entity response folds into the global field; windRespond == false -> bind pose.
             const f32 strength = inst.windRespond ? (gStrength * inst.windStrengthMul) : 0.0f;
 
             DeformPC pc{};
@@ -286,9 +289,9 @@ namespace Luth
 
                 // One global compute-write barrier over every mesh's deformed buffer. dst spans the
                 // raster vertex fetch (VERTEX_SHADER) + fragment TBN reads, the BLAS-build vertex read,
-                // and the rayQuery-in-compute trace reads. Same-queue raster (gA) is gated here; cross-
-                // queue consumers (refit + RT on async-compute, GeometryPass on gB) ride the gA→compute
-                // →gB timeline semaphores. see arch/multi-queue.md
+                // and the rayQuery-in-compute trace reads. Same-queue raster (gA) is gated here;
+                // cross-queue consumers (refit + RT on async-compute, GeometryPass on gB) ride the
+                // gA->compute->gB timeline semaphores. see arch/multi-queue.md
                 VkMemoryBarrier2 mem{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
                 mem.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
                 mem.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;

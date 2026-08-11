@@ -52,8 +52,8 @@ project "LuthTests"
       "Jolt",
       "glfw",
       "Tracy",
+      "bc7enc",
       --"vulkan-1",
-      --"slang-compiler"
       --"ws2_32",
       --"dbghelp"
    }
@@ -81,7 +81,7 @@ project "LuthTests"
       runtime "Release"
       optimize "on"
 
-   -- DebugASan — debug-style defines + Release CRT + /fsanitize=address.
+   -- DebugASan: debug-style defines + Release CRT + /fsanitize=address.
    -- MSVC requires Release CRT for ASan; Debug CRT is incompatible.
    -- Symbols on for stack-frame symbolization; edit-and-continue off (ASan rejects).
    -- TRACY_ENABLE omitted; Tracy's dbghelp init trips an ASan strlen false positive
