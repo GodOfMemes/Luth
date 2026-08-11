@@ -99,7 +99,7 @@ Engine → editor calls route through the nullptr-safe `Luth::EditorHooks` inter
  ├── ProjectLauncher ............. Startup project selector, recent projects
  ├── panels/ ..................... Scene, Hierarchy, Inspector, Project, Render, FrameDebugger, Profiler, History, TextureRemapDialog
  ├── inspectors/ ................. MaterialEditor, ModelViewer, TextureEditor, ShaderEditor, SceneViewer, FontViewer
- └── widgets/ .................... Icons (FontAwesome defs), ImGuiUtils
+ └── widgets/ .................... Icons (semantic map → Phosphor), ImGuiUtils
 ```
 
 > For pipelined frame execution details, see [`arch/frame-pipeline.md`](arch/frame-pipeline.md).
@@ -112,7 +112,7 @@ Engine → editor calls route through the nullptr-safe `Luth::EditorHooks` inter
 |--------|-------|
 | RenderGraph | DAG compile, barrier injection, dead-pass cull, serial execution; per-pass secondary-cmd recording |
 | Geometry | Clustered Forward+ PBR (Olsson log-slice clusters); slim G-buffer prepass (normal RG16F / roughness R8 / motion RG16F / matID R16U); 3 render-mode variants |
-| Shader | Cook-Torrance BRDF (GGX + Smith + Fresnel-Schlick); shared raster/RT eval via `common/brdf.glsl` |
+| Shader | Slang-only stack (one compiler, reflection-driven); Cook-Torrance BRDF shared raster/RT eval via `common/brdf.slang` |
 | Material | `GPUMaterialData` SSBO (Set 2), 8 bindless maps + flag bitfield, JSON `.mat` |
 | Lighting | Clustered Forward+ — 1 directional + clustered point lights; per-view cluster grid + light-index SSBOs (Set 3) |
 | Shadows | RT ray-query sun shadows (default) + per-view mask; 4-cascade PSSM CSM retained as an A/B `ShadowingMode` toggle |

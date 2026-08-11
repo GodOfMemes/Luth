@@ -20,6 +20,9 @@ namespace Luth
         bool ImportNormals    = true;
         bool ImportTangents   = false;
         bool OptimizeMesh     = true;
+        // Wind-deformable: route this model's STATIC meshes through the GPU deform seam (per-frame
+        // deform compute + refittable BLAS) so global wind bends them, RT-correct. Ignored for skinned.
+        bool MarkDeformable   = false;
         float ScaleFactor     = 1.0f;
 
         // Axis
@@ -38,6 +41,14 @@ namespace Luth
         // Disable to kip clip extraction entirely.
         bool ExtractClipsAsSeparateAssets = true;
 
+        // Scene-graph extras (static models): import source cameras / lights as entities.
+        bool ImportCameras = true;
+        bool ImportLights  = true;
+
+        // Stamp an inferred TextureRole into each resolved texture's .meta (Assimp semantic + filename
+        // suffix), so packed/non-standard layouts canonicalize at import. Never clobbers a user-set role.
+        bool AutoDetectTextureRoles = true;
+
         // Physics shape sourcing. None (default) → ShapeCache returns null for asset-backed colliders referencing
         // this model and warns once per UUID. Auto → ShapeCache builds JPH::ConvexHullShape / JPH::MeshShape on
         // demand from Model::m_MeshesData. Per-mesh override + actual on-disk shape cooking are deferred to a future effort.
@@ -55,6 +66,11 @@ namespace Luth
         Skeleton SkeletonData;
         std::vector<UUID> AnimationClipUUIDs;
         bool IsSkinned = false;
+
+        // V4 scene graph — populated for static models only (skinned models stay empty).
+        std::vector<ModelNode>   Nodes;
+        std::vector<ModelCamera> Cameras;
+        std::vector<ModelLight>  Lights;
     };
 
     class ModelImporter : public AssetImporter

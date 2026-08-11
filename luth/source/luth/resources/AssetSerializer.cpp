@@ -12,6 +12,7 @@ namespace Luth
 {
     bool AssetSerializer::SerializeTexture(const fs::path& path, const TextureAssetData& data)
     {
+        LH_PROFILE_FUNCTION();
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) return false;
 
@@ -36,6 +37,7 @@ namespace Luth
 
     bool AssetSerializer::DeserializeTexture(const fs::path& path, TextureAssetData& outData)
     {
+        LH_PROFILE_FUNCTION();
         std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) return false;
 
@@ -185,15 +187,61 @@ namespace Luth
         for (u32 ci = 0; ci < clipCount; ++ci) ReadAnimationClip(in, clips[ci]);
     }
 
+    // --- Scene-graph binary helpers (V4) ---
+
+    static void WriteSceneGraph(std::ofstream& out, const ModelAssetData& data)
+    {
+        for (const auto& node : data.Nodes) {
+            WriteString(out, node.Name);
+            out.write((const char*)&node.ParentIndex, sizeof(i32));
+            out.write((const char*)&node.Translation, sizeof(Vec3));
+            out.write((const char*)&node.Rotation, sizeof(Quat));
+            out.write((const char*)&node.Scale, sizeof(Vec3));
+            u32 meshCount = (u32)node.MeshIndices.size();
+            out.write((const char*)&meshCount, sizeof(u32));
+            out.write((const char*)node.MeshIndices.data(), meshCount * sizeof(u32));
+            out.write((const char*)&node.CameraIndex, sizeof(i32));
+            out.write((const char*)&node.LightIndex, sizeof(i32));
+        }
+        // ModelCamera / ModelLight are trivially-copyable PODs (round-trips with the matching read).
+        for (const auto& cam : data.Cameras)   out.write((const char*)&cam,   sizeof(ModelCamera));
+        for (const auto& light : data.Lights)  out.write((const char*)&light, sizeof(ModelLight));
+    }
+
+    static void ReadSceneGraph(std::ifstream& in, ModelAssetData& data,
+        u32 nodeCount, u32 cameraCount, u32 lightCount)
+    {
+        data.Nodes.resize(nodeCount);
+        for (u32 i = 0; i < nodeCount; ++i) {
+            auto& node = data.Nodes[i];
+            node.Name = ReadString(in);
+            in.read((char*)&node.ParentIndex, sizeof(i32));
+            in.read((char*)&node.Translation, sizeof(Vec3));
+            in.read((char*)&node.Rotation, sizeof(Quat));
+            in.read((char*)&node.Scale, sizeof(Vec3));
+            u32 meshCount = 0;
+            in.read((char*)&meshCount, sizeof(u32));
+            node.MeshIndices.resize(meshCount);
+            in.read((char*)node.MeshIndices.data(), meshCount * sizeof(u32));
+            in.read((char*)&node.CameraIndex, sizeof(i32));
+            in.read((char*)&node.LightIndex, sizeof(i32));
+        }
+        data.Cameras.resize(cameraCount);
+        for (u32 i = 0; i < cameraCount; ++i) in.read((char*)&data.Cameras[i], sizeof(ModelCamera));
+        data.Lights.resize(lightCount);
+        for (u32 i = 0; i < lightCount; ++i)  in.read((char*)&data.Lights[i], sizeof(ModelLight));
+    }
+
     // --- Model Serialization ---
 
     bool AssetSerializer::SerializeModel(const fs::path& path, const ModelAssetData& data)
     {
+        LH_PROFILE_FUNCTION();
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) return false;
 
         AssetHeader header;
-        header.Version = 3; // V3: clips referenced by UUID (was inline AnimationClips in V2)
+        header.Version = 5; // V5: per-mesh IsDeformable (was V4 scene-graph nodes + cameras + lights)
         header.Type = AssetType::Model;
         out.write((const char*)&header, sizeof(AssetHeader));
 
@@ -203,6 +251,9 @@ namespace Luth
         modelHeader.IsSkinned = data.IsSkinned ? 1 : 0;
         modelHeader.BoneCount = data.SkeletonData.BoneCount();
         modelHeader.AnimationCount = (u32)data.AnimationClipUUIDs.size();
+        modelHeader.NodeCount = (u32)data.Nodes.size();
+        modelHeader.CameraCount = (u32)data.Cameras.size();
+        modelHeader.LightCount = (u32)data.Lights.size();
         out.write((const char*)&modelHeader, sizeof(ModelHeader));
 
         // Write Materials
@@ -215,6 +266,7 @@ namespace Luth
 
             MeshHeader meshHeader;
             meshHeader.IsSkinned = mesh.IsSkinned ? 1 : 0;
+            meshHeader.IsDeformable = mesh.IsDeformable ? 1 : 0;
             meshHeader.IndexCount = (u32)mesh.Indices.size();
             meshHeader.MaterialIndex = mesh.MaterialIndex;
 
@@ -242,11 +294,15 @@ namespace Luth
                 modelHeader.AnimationCount * sizeof(UUID));
         }
 
+        // V4: scene graph (nodes + cameras + lights) — appended last
+        WriteSceneGraph(out, data);
+
         return true;
     }
 
     bool AssetSerializer::DeserializeModel(const fs::path& path, ModelAssetData& outData)
     {
+        LH_PROFILE_FUNCTION();
         std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) return false;
 
@@ -254,10 +310,9 @@ namespace Luth
         in.read((char*)&header, sizeof(AssetHeader));
         if (header.Type != AssetType::Model) return false;
 
-        // V3 schema: clips by UUID. V1/V2 artifacts are rejected so they get
-        // re-imported under the new schema on first load (mirrors the Shader
-        // V1->V2 reject pattern below).
-        if (header.Version != 3) return false;
+        // V5 schema: per-mesh IsDeformable. Older artifacts are rejected so they get re-imported under
+        // the new schema on first load (mirrors the Shader V1->V2 reject pattern).
+        if (header.Version != 5) return false;
 
         ModelHeader modelHeader;
         in.read((char*)&modelHeader, sizeof(ModelHeader));
@@ -279,6 +334,7 @@ namespace Luth
             in.read((char*)&meshHeader, sizeof(MeshHeader));
             mesh.MaterialIndex = meshHeader.MaterialIndex;
             mesh.IsSkinned = (meshHeader.IsSkinned != 0);
+            mesh.IsDeformable = (meshHeader.IsDeformable != 0);
 
             if (mesh.IsSkinned) {
                 mesh.SkinnedVertices.resize(meshHeader.VertexCount);
@@ -308,11 +364,15 @@ namespace Luth
                 modelHeader.AnimationCount * sizeof(UUID));
         }
 
+        // V4: scene graph (nodes + cameras + lights)
+        ReadSceneGraph(in, outData, modelHeader.NodeCount, modelHeader.CameraCount, modelHeader.LightCount);
+
         return true;
     }
 
     bool AssetSerializer::SerializeMaterial(const fs::path& path, const MaterialAssetData& data)
     {
+        LH_PROFILE_FUNCTION();
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) return false;
 
@@ -330,6 +390,7 @@ namespace Luth
 
     bool AssetSerializer::DeserializeMaterial(const fs::path& path, MaterialAssetData& outData)
     {
+        LH_PROFILE_FUNCTION();
         std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) return false;
 
@@ -348,6 +409,7 @@ namespace Luth
 
     bool AssetSerializer::SerializePhysicsMaterial(const fs::path& path, const PhysicsMaterialAssetData& data)
     {
+        LH_PROFILE_FUNCTION();
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) return false;
 
@@ -365,6 +427,7 @@ namespace Luth
 
     bool AssetSerializer::DeserializePhysicsMaterial(const fs::path& path, PhysicsMaterialAssetData& outData)
     {
+        LH_PROFILE_FUNCTION();
         std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) return false;
 
@@ -383,6 +446,7 @@ namespace Luth
 
     bool AssetSerializer::SerializeShader(const fs::path& path, const ShaderAssetData& data)
     {
+        LH_PROFILE_FUNCTION();
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) return false;
 
@@ -403,6 +467,7 @@ namespace Luth
 
     bool AssetSerializer::DeserializeShader(const fs::path& path, ShaderAssetData& outData)
     {
+        LH_PROFILE_FUNCTION();
         std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) return false;
 
@@ -426,6 +491,7 @@ namespace Luth
 
     bool AssetSerializer::SerializeAnimation(const fs::path& path, const AnimationAssetData& data)
     {
+        LH_PROFILE_FUNCTION();
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) return false;
 
@@ -440,6 +506,7 @@ namespace Luth
 
     bool AssetSerializer::DeserializeAnimation(const fs::path& path, AnimationAssetData& outData)
     {
+        LH_PROFILE_FUNCTION();
         std::ifstream in(path, std::ios::binary);
         if (!in.is_open()) return false;
 

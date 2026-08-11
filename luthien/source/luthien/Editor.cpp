@@ -36,6 +36,7 @@
 #include "luthien/panels/FrameDebuggerPanel.h"
 #include "luthien/panels/HistoryPanel.h"
 #include "luthien/panels/ConsolePanel.h"
+#include "luthien/panels/MaterialGraphPanel.h"
 #include "luthien/panels/EditorSettingsWindow.h"
 #include "luthien/panels/TextureRemapDialog.h"
 #include "luth/resources/importers/ModelImporter.h"
@@ -80,7 +81,7 @@ namespace Luth
     void Editor::Init(Window* window)
     {
         s_Window = window;
-        LH_CORE_INFO("Initializing Luth Editor");
+        LH_LOG(Editor, info, "Initializing Luth Editor");
 
         // Settings must be loaded first so InitImGui can apply the persisted style,
         // which populates io.Fonts before the Vulkan font atlas is built.
@@ -129,12 +130,12 @@ namespace Luth
     {
         IMGUI_CHECKVERSION();
         s_Context = ImGui::CreateContext();
-        LH_CORE_TRACE(" - Created ImGui context");
+        LH_LOG(Editor, trace, " - Created ImGui context");
 
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
         io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
-        LH_CORE_TRACE(" - Enabled docking + multi-viewport");
+        LH_LOG(Editor, trace, " - Enabled docking + multi-viewport");
 
         // Apply persisted style BEFORE CreateFontsTexture: LoadFonts populates
         // io.Fonts. Window-chrome colors belong here too since Matrix tints them.
@@ -153,7 +154,7 @@ namespace Luth
         #endif
 
         if (Renderer::GetBackend()->GetAPI() == RenderBackend::API::Vulkan) {
-            LH_CORE_TRACE(" - Initialized ImGui GLFW/Vulkan backend");
+            LH_LOG(Editor, trace, " - Initialized ImGui GLFW/Vulkan backend");
             // Callbacks installed manually in WinWindow for event routing.
             ImGui_ImplGlfw_InitForVulkan((GLFWwindow*)window->GetNativeWindow(), false);
 
@@ -210,6 +211,7 @@ namespace Luth
         AddPanel(new FrameDebuggerPanel());
         AddPanel(new HistoryPanel());
         AddPanel(new ConsolePanel());
+        AddPanel(new MaterialGraphPanel());
 
         ComponentDrawers::RegisterComponentDrawers();
 
@@ -254,6 +256,7 @@ namespace Luth
         if (auto* pp = GetPanel<ProjectPanel>())
             s_Settings.thumbnailSize = pp->GetThumbnailSize();
         s_Settings.lastSceneUUID = s_ScenePath.empty() ? "" : AssetDatabase::GetUUID(s_ScenePath).ToString();
+        CaptureSceneView();
 
         SaveSettings();
         SaveActiveWorkspaceSidecar();
@@ -262,7 +265,7 @@ namespace Luth
         UI::ThumbnailCache::Shutdown();
         EditorAutoSave::Shutdown();
 
-        LH_CORE_TRACE("Cleaning up {} panels", s_Panels.size());
+        LH_LOG(Editor, trace, "Cleaning up {} panels", s_Panels.size());
         // Run OnShutdown before destroying — gives panels a chance to detach from
         // engine subsystems (Log sinks, EventBus subscriptions) while the rest of
         // the editor is still alive. Without this hop, a post-clear LH_CORE_* call
@@ -314,7 +317,7 @@ namespace Luth
         s_Context = nullptr;
         s_Window = nullptr;
         s_ActiveScene.reset();
-        LH_CORE_INFO("Editor system shutdown completed");
+        LH_LOG(Editor, info, "Editor system shutdown completed");
     }
 
     void Editor::BeginFrame()
@@ -381,14 +384,14 @@ namespace Luth
         }
         catch (const std::exception& e)
         {
-            LH_CORE_ERROR("Panel '{}' threw in OnGather: {}", panel->GetWindowID(), e.what());
+            LH_LOG(Editor, error, "Panel '{}' threw in OnGather: {}", panel->GetWindowID(), e.what());
             StackTrace::LogStackTrace(1, 32);
             panel->m_SnapshotFragment = nullptr;
             if (++panel->m_CrashStreak >= 3) panel->m_Crashed = true;
         }
         catch (...)
         {
-            LH_CORE_ERROR("Panel '{}' threw non-std exception in OnGather", panel->GetWindowID());
+            LH_LOG(Editor, error, "Panel '{}' threw non-std exception in OnGather", panel->GetWindowID());
             StackTrace::LogStackTrace(1, 32);
             panel->m_SnapshotFragment = nullptr;
             if (++panel->m_CrashStreak >= 3) panel->m_Crashed = true;
@@ -403,13 +406,13 @@ namespace Luth
         }
         catch (const std::exception& e)
         {
-            LH_CORE_ERROR("Panel '{}' threw in OnDraw: {}", panel->GetWindowID(), e.what());
+            LH_LOG(Editor, error, "Panel '{}' threw in OnDraw: {}", panel->GetWindowID(), e.what());
             StackTrace::LogStackTrace(1, 32);
             if (++panel->m_CrashStreak >= 3) panel->m_Crashed = true;
         }
         catch (...)
         {
-            LH_CORE_ERROR("Panel '{}' threw non-std exception in OnDraw", panel->GetWindowID());
+            LH_LOG(Editor, error, "Panel '{}' threw non-std exception in OnDraw", panel->GetWindowID());
             StackTrace::LogStackTrace(1, 32);
             if (++panel->m_CrashStreak >= 3) panel->m_Crashed = true;
         }
@@ -422,8 +425,8 @@ namespace Luth
         if (panel->BeginWindow(panel->GetWindowID()))
         {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
-            ImGui::PushFont(GetFASolid());
-            ImGui::TextUnformatted(ICON_FA_TRIANGLE_EXCLAMATION);
+            ImGui::PushFont(GetIconRegular());
+            ImGui::TextUnformatted(ICON_WARNING);
             ImGui::PopFont();
             ImGui::SameLine();
             ImGui::TextUnformatted("Panel crashed.");
@@ -540,13 +543,17 @@ namespace Luth
         // it floats independently and is not tied to any dock node.
         EditorSettingsWindow::Draw();
 
-        // Check if a model import completed with unresolved textures
+        // Check if a model import completed with unresolved or reduced-fidelity textures
         {
             static fs::path s_LastReportedModel;
             const ImportReport& report = ModelImporter::GetLastImportReport();
-            if (report.HasUnresolved() && report.ModelPath != s_LastReportedModel) {
+            if (report.ModelPath != s_LastReportedModel && (report.HasUnresolved() || report.HasDegraded())) {
                 s_LastReportedModel = report.ModelPath;
-                TextureRemapDialog::Open(report);
+                if (report.HasDegraded())
+                    LH_LOG(Editor, warn, "Import: {0} texture(s) routed at reduced fidelity (see warnings above)",
+                                 report.Degraded.size());
+                if (report.HasUnresolved())
+                    TextureRemapDialog::Open(report);
             }
         }
 
@@ -566,7 +573,7 @@ namespace Luth
             std::ofstream f(layoutDir / "Default.ini");
             if (f.is_open()) {
                 f.write(iniData, size);
-                LH_CORE_INFO("Saved first-run default layout to layouts/Default.ini");
+                LH_LOG(Editor, info, "Saved first-run default layout to layouts/Default.ini");
             }
             s_NeedDefaultLayoutSave = false;
         }
@@ -663,7 +670,7 @@ namespace Luth
         // Random window transparency
         style.Alpha = 0.8f + dist(rng) * 0.2f;
 
-        LH_CORE_INFO("Applied random style - Hue: {0}, WindowRounding: {1}",
+        LH_LOG(Editor, info, "Applied random style - Hue: {0}, WindowRounding: {1}",
                     hue, style.WindowRounding);
     }
 
@@ -693,14 +700,35 @@ namespace Luth
     {
         if (!s_ActiveScene) return;
 
+        // Persist the outgoing scene's camera before clearing.
+        CaptureSceneView();
+
         // Clear all entities
         s_ActiveScene->Clear();
         CommandHistory::Clear();
 
+        // Seed the fresh scene with a sun + camera so it doesn't open onto a black, unlit viewport
+        // (mirrors the hierarchy "Create > Directional Light / Camera" defaults). Created directly,
+        // not via commands, since NewScene wipes the undo history anyway.
+        Entity sun = s_ActiveScene->CreateEntity("Directional Light");
+        sun.AddComponent<Component::DirectionalLight>();
+        {
+            auto& t = sun.GetComponent<Component::Transform>();
+            t.Rotation = Vec3(-45.0f, 0.0f, 0.0f);
+            t.IsDirty  = true;
+        }
+        Entity cam = s_ActiveScene->CreateEntity("Camera");
+        cam.AddComponent<Component::Camera>();
+        {
+            auto& t = cam.GetComponent<Component::Transform>();
+            t.Position = Vec3(0.0f, 1.0f, 5.0f);
+            t.IsDirty  = true;
+        }
+
         s_ScenePath.clear();
         s_IsDirty = false;
 
-        LH_CORE_INFO("New scene created");
+        LH_LOG(Editor, info, "New scene created");
     }
 
     void Editor::OpenScene()
@@ -714,11 +742,18 @@ namespace Luth
     {
         if (!s_ActiveScene) return;
 
+        // Persist the outgoing scene's camera before swapping scenes.
+        CaptureSceneView();
+
         if (SceneSerializer::Load(*s_ActiveScene, path)) {
             CommandHistory::Clear();
             s_ScenePath = path;
             s_IsDirty = false;
-            s_Settings.lastSceneUUID = AssetDatabase::GetUUID(path).ToString();
+            std::string sceneUUID = AssetDatabase::GetUUID(path).ToString();
+            s_Settings.lastSceneUUID = sceneUUID;
+
+            // Restore the editor camera to where this scene was last framed.
+            RestoreSceneView(sceneUUID);
 
             // Eagerly kick off loading for all assets referenced by the scene
             auto view = s_ActiveScene->GetAllEntitiesWith<Component::MeshRenderer>();
@@ -761,6 +796,9 @@ namespace Luth
             if (!fs::exists(metaPath)) {
                 MetaFile::Create(s_ScenePath, AssetType::Scene);
             }
+
+            // Persist the current scene-view camera alongside the save.
+            CaptureSceneView();
         }
     }
 
@@ -802,6 +840,35 @@ namespace Luth
             EditorSettings::Save(s_Settings, s_SettingsPath);
     }
 
+    std::filesystem::path Editor::SceneViewsPath()
+    {
+        return FileSystem::ProjectPath() / ".luth" / "scene_views.json";
+    }
+
+    void Editor::CaptureSceneView()
+    {
+        // Unsaved scenes have no path, hence no UUID to key the pose against.
+        if (s_ScenePath.empty()) return;
+
+        UUID uuid = AssetDatabase::GetUUID(s_ScenePath);
+        if (!uuid.IsValid()) return;
+
+        auto* sp = GetPanel<ScenePanel>();
+        if (!sp) return;
+
+        s_SceneViews.Set(uuid.ToString(), sp->GetEditorCamera().CapturePose());
+        s_SceneViews.Save(SceneViewsPath());   // write-through — tiny file, crash-safe
+    }
+
+    void Editor::RestoreSceneView(const std::string& sceneUUID)
+    {
+        auto pose = s_SceneViews.Get(sceneUUID);
+        if (!pose) return;
+
+        if (auto* sp = GetPanel<ScenePanel>())
+            sp->GetEditorCamera().ApplyPose(*pose);
+    }
+
     namespace
     {
         // Built-ins live alongside other engine assets; user copies under cwd-relative
@@ -833,7 +900,7 @@ namespace Luth
         const fs::path jsonPath = fs::exists(bJson) ? bJson : uJson;
 
         if (!fs::exists(iniPath)) {
-            LH_CORE_WARN("Workspace '{}' not found", name);
+            LH_LOG(Editor, warn, "Workspace '{}' not found", name);
             return false;
         }
 
@@ -845,7 +912,7 @@ namespace Luth
 
         std::ifstream f(iniPath, std::ios::binary | std::ios::ate);
         if (!f.is_open()) {
-            LH_CORE_ERROR("Failed to open workspace ini '{}'", iniPath.string());
+            LH_LOG(Editor, error, "Failed to open workspace ini '{}'", iniPath.string());
             return false;
         }
         auto size = f.tellg();
@@ -859,7 +926,7 @@ namespace Luth
         const bool isBuiltin = Workspace::IsBuiltinPath(iniPath);
         EventBus::Enqueue<WorkspaceChangedSignal>(BusType::MainThread, name, isBuiltin);
 
-        LH_CORE_INFO("Loaded workspace '{}' from '{}'", name, iniPath.string());
+        LH_LOG(Editor, info, "Loaded workspace '{}' from '{}'", name, iniPath.string());
         return true;
     }
 
@@ -868,7 +935,7 @@ namespace Luth
         namespace fs = std::filesystem;
 
         if (fs::exists(BuiltinIni(name))) {
-            LH_CORE_WARN("Cannot overwrite built-in workspace '{}' — pick a different name", name);
+            LH_LOG(Editor, warn, "Cannot overwrite built-in workspace '{}' — pick a different name", name);
             return false;
         }
 
@@ -886,7 +953,7 @@ namespace Luth
         const char* iniData = ImGui::SaveIniSettingsToMemory(&size);
         std::ofstream f(iniPath);
         if (!f.is_open()) {
-            LH_CORE_ERROR("Failed to write workspace ini '{}'", iniPath.string());
+            LH_LOG(Editor, error, "Failed to write workspace ini '{}'", iniPath.string());
             return false;
         }
         f.write(iniData, size);
@@ -897,7 +964,7 @@ namespace Luth
 
         s_Settings.panelOpen    = snap;
         s_Settings.activeLayout = name;
-        LH_CORE_INFO("Saved workspace '{}' to '{}'", name, iniPath.string());
+        LH_LOG(Editor, info, "Saved workspace '{}' to '{}'", name, iniPath.string());
         return true;
     }
 
@@ -907,11 +974,11 @@ namespace Luth
         if (oldName == newName) return true;
 
         if (fs::exists(BuiltinIni(oldName))) {
-            LH_CORE_WARN("Cannot rename built-in workspace '{}'", oldName);
+            LH_LOG(Editor, warn, "Cannot rename built-in workspace '{}'", oldName);
             return false;
         }
         if (fs::exists(UserIni(newName)) || fs::exists(BuiltinIni(newName))) {
-            LH_CORE_WARN("Cannot rename workspace '{}' to '{}': target exists", oldName, newName);
+            LH_LOG(Editor, warn, "Cannot rename workspace '{}' to '{}': target exists", oldName, newName);
             return false;
         }
 
@@ -922,7 +989,7 @@ namespace Luth
         if (s_Settings.activeLayout == oldName)
             s_Settings.activeLayout = newName;
 
-        LH_CORE_INFO("Renamed workspace '{}' -> '{}'", oldName, newName);
+        LH_LOG(Editor, info, "Renamed workspace '{}' -> '{}'", oldName, newName);
         return true;
     }
 
@@ -931,7 +998,7 @@ namespace Luth
         namespace fs = std::filesystem;
 
         if (fs::exists(BuiltinIni(name))) {
-            LH_CORE_WARN("Cannot delete built-in workspace '{}'", name);
+            LH_LOG(Editor, warn, "Cannot delete built-in workspace '{}'", name);
             return false;
         }
 
@@ -946,7 +1013,7 @@ namespace Luth
             s_Settings.activeLayout = "Default";
             LoadWorkspace("Default");
         }
-        LH_CORE_INFO("Deleted workspace '{}'", name);
+        LH_LOG(Editor, info, "Deleted workspace '{}'", name);
         return true;
     }
 
@@ -1010,6 +1077,16 @@ namespace Luth
         Workspace::SaveJson(UserJson(s_Settings.activeLayout), snap);
     }
 
+    void Editor::DeleteSelectedEntities()
+    {
+        const auto& sel = EditorSelection::GetSelectedEntities();
+        if (sel.empty() || !s_ActiveScene) return;
+
+        auto cmd = std::make_unique<EntityDestroyMultipleCommand>(s_ActiveScene.get(), sel);
+        if (!cmd->IsEmpty())
+            CommandHistory::Execute(std::move(cmd));
+    }
+
     void Editor::ProcessShortcuts()
     {
         bool ctrl = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl);
@@ -1040,13 +1117,27 @@ namespace Luth
                     CommandHistory::Execute(std::make_unique<EntityDuplicateCommand>(sel.GetScene(), sel));
             }
         }
+
+        // Delete — fires when an entity-editing context holds input: Hierarchy focused, or the
+        // Scene viewport focused/hovered. Centralized here (not per-panel) so the two can't
+        // double-fire, gated on !WantTextInput so it doesn't delete while renaming/typing. Runs
+        // before panels draw → no scene-tree iteration active, so the delete is immediate.
+        if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+        {
+            auto* hier  = GetPanel<HierarchyPanel>();
+            auto* scene = GetPanel<ScenePanel>();
+            const bool hierActive  = hier && hier->IsFocused();
+            const bool sceneActive = scene && (scene->IsViewportFocused() || scene->IsViewportHovered());
+            if (hierActive || sceneActive)
+                DeleteSelectedEntities();
+        }
     }
 
     void Editor::DrawMenuBar()
     {
         if (ImGui::BeginMenuBar()) {
             if (ImGui::BeginMenu("File")) {
-                if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN "  Open Project..."))
+                if (ImGui::MenuItem(ICON_FOLDER_OPEN "  Open Project..."))
                 {
                     auto path = FileDialog::OpenFile("Luth Project (*.luthproj)\0*.luthproj\0All Files (*.*)\0*.*\0");
                     if (path.has_value())
@@ -1055,7 +1146,7 @@ namespace Luth
                         ProjectLauncher::SetPendingProject(path.value());
                     }
                 }
-                if (ImGui::MenuItem(ICON_FA_CUBE "  Project Launcher..."))
+                if (ImGui::MenuItem(ICON_CUBE "  Project Launcher..."))
                     ShowProjectLauncher();
 
                 ImGui::Separator();
@@ -1303,6 +1394,10 @@ namespace Luth
         // Reload editor settings from the new project directory
         LoadSettings();
 
+        // Load this project's persisted scene-view camera poses so the last-scene auto-load
+        // below restores it at the camera it was left at.
+        s_SceneViews.Load(SceneViewsPath());
+
         // Clear scene state
         s_ScenePath.clear();
         s_IsDirty = false;
@@ -1360,6 +1455,6 @@ namespace Luth
         const std::string projName = FileSystem::ProjectPath().filename().string();
         EventBus::Enqueue<ProjectChangedSignal>(BusType::MainThread, projPath, projName);
 
-        LH_CORE_INFO("Editor: Project changed, panels refreshed");
+        LH_LOG(Editor, info, "Editor: Project changed, panels refreshed");
     }
 }

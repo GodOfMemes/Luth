@@ -7,6 +7,7 @@
 #include "luth/scene/Scene.h"
 #include "luthien/Editor.h"
 #include "luthien/EditorCamera.h"
+#include "luthien/EditorColors.h"
 #include "luthien/EditorSelection.h"
 #include "luthien/PlayModeController.h"
 #include "luthien/ProjectLauncher.h"
@@ -73,6 +74,28 @@ namespace
             out.gridFadeEnd       = s.gridFadeEnd;
             out.gridLineThickness = s.gridLineThickness;
 
+            // Gizmo toggles (settings) + palette (EditorColors, unpacked IM_COL32 → linear Vec4).
+            auto colToVec4 = [](ImU32 c) {
+                return Vec4(((c >> IM_COL32_R_SHIFT) & 0xFFu) / 255.0f,
+                            ((c >> IM_COL32_G_SHIFT) & 0xFFu) / 255.0f,
+                            ((c >> IM_COL32_B_SHIFT) & 0xFFu) / 255.0f,
+                            ((c >> IM_COL32_A_SHIFT) & 0xFFu) / 255.0f);
+            };
+            out.lightsSelected  = s.lightsSelected;   out.lightsAll  = s.lightsAll;
+            out.camerasSelected = s.camerasSelected;  out.camerasAll = s.camerasAll;
+            out.boundsSelected  = s.boundsSelected;   out.boundsAll  = s.boundsAll;
+            out.bonesSelected   = s.bonesSelected;    out.bonesAll   = s.bonesAll;
+            out.fogSelected     = s.fogSelected;      out.fogAll     = s.fogAll;
+            out.windSelected    = s.windSelected;     out.windAll    = s.windAll;
+            out.gizmoAlphaUnselected   = s.gizmoAlphaUnselected;
+            out.gizmoCameraColor       = colToVec4(EditorColors::GizmoCamera);
+            out.gizmoAABBColor         = colToVec4(EditorColors::GizmoAABB);
+            out.gizmoAABBSelectedColor = colToVec4(EditorColors::GizmoAABBSelected);
+            out.gizmoBoneLineColor     = colToVec4(EditorColors::GizmoBoneLine);
+            out.gizmoBoneJointColor    = colToVec4(EditorColors::GizmoBoneJoint);
+            out.gizmoFogColor          = colToVec4(EditorColors::GizmoFog);
+            out.gizmoWindColor         = colToVec4(EditorColors::GizmoWind);
+
             out.previewAnimationInEditor = s.previewAnimationInEditor;
 
             out.physicsShapesSelected   = s.physicsShapesSelected;
@@ -102,7 +125,7 @@ namespace
         // floating toast widget without touching the engine call site.
         void OnFrameDebuggerNotice(const std::string& message) override
         {
-            LH_CORE_INFO("[FrameDebugger] {}", message);
+            LH_LOG(Editor, info, "[FrameDebugger] {}", message);
         }
 
         // Project launcher

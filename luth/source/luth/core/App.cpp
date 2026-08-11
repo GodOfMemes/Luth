@@ -19,6 +19,7 @@
 #include "luth/scene/systems/PlayerControllerSystem.h"
 #include "luth/scene/systems/PhysicsSystem.h"
 #include "luth/scene/systems/RenderingSystem.h"
+#include "luth/scene/systems/DebugGizmos.h"
 #include "luth/scene/systems/PickingSystem.h"
 #include "luth/jobs/JobSystem.h"
 #include "luth/jobs/MainThreadPump.h"
@@ -26,9 +27,13 @@
 #include "luth/renderer/Renderer.h"
 #include "luth/renderer/shader/ShaderLibrary.h"
 #include "luth/renderer/backend/vulkan/PipelineCache.h"
+#include "luth/renderer/backend/vulkan/VulkanSwapchain.h"
+#include "luth/renderer/subsystems/GeometrySubsystem.h"
 #include "luth/jobs/IOThread.h"
 #include "luth/memory/MemoryTracker.h"
 #include "luth/memory/TaggedPageAllocator.h"
+#include "luth/memory/GPUTaggedPageAllocator.h"
+#include "luth/renderer/backend/vulkan/VulkanAllocator.h"
 #include "luth/scene/systems/AnimationSystem.h"
 #include "luth/core/time/Timer.h"
 
@@ -38,6 +43,75 @@
 
 namespace Luth
 {
+    namespace
+    {
+#if defined(TRACY_ENABLE)
+        // Tracy stores the plot-name POINTER, not a copy — names must be process-stable string literals,
+        // never runtime-built strings. Indexed by Memory::Category.
+        const char* const kMemPlotNames[] = {
+            "Mem General", "Mem Rendering", "Mem Scene", "Mem Jobs", "Mem Resources",
+            "Mem Editor", "Mem FrameLinear", "Mem FrameTagged", "Mem GPU",
+        };
+        static_assert(sizeof(kMemPlotNames) / sizeof(kMemPlotNames[0]) == (size_t)Memory::Category::Count,
+                      "kMemPlotNames out of sync with Memory::Category");
+
+        void ConfigureProfilingPlots()
+        {
+            for (const char* n : kMemPlotNames)
+                LH_PROFILE_PLOT_CONFIG(n, LH_PLOT_FORMAT_MEMORY, true, true, 0);
+            LH_PROFILE_PLOT_CONFIG("Mem Total",          LH_PLOT_FORMAT_MEMORY, true, true, 0);
+            LH_PROFILE_PLOT_CONFIG("GPU Mem Used",        LH_PLOT_FORMAT_MEMORY, true, true, 0);
+            LH_PROFILE_PLOT_CONFIG("GPU Heap In-Flight",  LH_PLOT_FORMAT_MEMORY, true, true, 0);
+        }
+#endif
+
+        // Once-per-frame Tracy plots of stats the engine already collects. Engine-side so runtime
+        // (non-editor) builds plot too; compiles away without TRACY_ENABLE.
+        void EmitFrameProfilingPlots()
+        {
+        #if defined(TRACY_ENABLE)
+            static bool configured = false;
+            if (!configured) { ConfigureProfilingPlots(); configured = true; }
+
+            const JobSystem::Stats js = JobSystem::GetStats();
+            LH_PROFILE_PLOT("Jobs/Frame",        (i64)js.JobsExecuted);
+            LH_PROFILE_PLOT("Steal Attempts",    (i64)js.StealAttempts);
+            LH_PROFILE_PLOT("Steal Successes",   (i64)js.StealSuccesses);
+            LH_PROFILE_PLOT("Fiber Yields",      (i64)js.FiberYields);
+            LH_PROFILE_PLOT("Fibers In Use",     (i64)js.TotalFibers - (i64)js.FreeFibers);
+            LH_PROFILE_PLOT("Peak Fibers",       (i64)js.PeakFibers);
+            LH_PROFILE_PLOT("High Queue Depth",  (i64)js.HighQueueSize);
+            LH_PROFILE_PLOT("Game Stage (ms)",   (double)js.GameStageMs);
+            LH_PROFILE_PLOT("Render Stage (ms)", (double)js.RenderStageMs);
+
+            // Bottleneck-triage plots: present stall, PSO-compile hitches, and the two silent
+            // draw/asset-drop counters.
+            LH_PROFILE_PLOT("Present Acquire (ms)", VulkanSwapchain::GetLastAcquireMs());
+            LH_PROFILE_PLOT("Present (ms)",         VulkanSwapchain::GetLastPresentMs());
+
+            const PipelineCache::CompileStats pso = PipelineCache::ConsumeFrameStats();
+            LH_PROFILE_PLOT("PSO Compiles/Frame", (i64)pso.count);
+            LH_PROFILE_PLOT("PSO Compile (ms)",   pso.totalMs);
+
+            LH_PROFILE_PLOT("GPU Objects Dropped",  (i64)GeometrySubsystem::GetDroppedObjectCount());
+            LH_PROFILE_PLOT("IO Callbacks Dropped", (i64)IOThread::GetDroppedCallbackCount());
+
+            const Memory::MemoryTracker::Snapshot mem = Memory::MemoryTracker::GetSnapshot();
+            LH_PROFILE_PLOT("Mem Total", (i64)mem.TotalCurrent);
+            for (u32 i = 0; i < (u32)Memory::Category::Count; ++i)
+                LH_PROFILE_PLOT(kMemPlotNames[i], (i64)mem.Categories[i].Current);
+
+            // VMA stats walk allocations — throttle so the per-frame cost stays negligible.
+            static u32 frame = 0;
+            if ((frame++ % 8) == 0)
+            {
+                LH_PROFILE_PLOT("GPU Mem Used", (i64)VulkanAllocator::GetStats().UsedBytes);
+                LH_PROFILE_PLOT("GPU Heap In-Flight", (i64)Memory::GPUTaggedPageAllocator::Get().GetStats().BytesInFlight);
+            }
+        #endif
+        }
+    }
+
     // ── Engine Root Discovery ──
 
     static fs::path DiscoverEngineRoot()
@@ -286,6 +360,21 @@ namespace Luth
                     cp.gridFadeStart     = viewState.gridFadeStart;
                     cp.gridFadeEnd       = viewState.gridFadeEnd;
                     cp.gridLineThickness = viewState.gridLineThickness;
+
+                    cp.lightsSelected  = viewState.lightsSelected;   cp.lightsAll  = viewState.lightsAll;
+                    cp.camerasSelected = viewState.camerasSelected;  cp.camerasAll = viewState.camerasAll;
+                    cp.boundsSelected  = viewState.boundsSelected;   cp.boundsAll  = viewState.boundsAll;
+                    cp.bonesSelected   = viewState.bonesSelected;    cp.bonesAll   = viewState.bonesAll;
+                    cp.fogSelected     = viewState.fogSelected;      cp.fogAll     = viewState.fogAll;
+                    cp.windSelected    = viewState.windSelected;     cp.windAll    = viewState.windAll;
+                    cp.gizmoAlphaUnselected   = viewState.gizmoAlphaUnselected;
+                    cp.gizmoCameraColor       = viewState.gizmoCameraColor;
+                    cp.gizmoAABBColor         = viewState.gizmoAABBColor;
+                    cp.gizmoAABBSelectedColor = viewState.gizmoAABBSelectedColor;
+                    cp.gizmoBoneLineColor     = viewState.gizmoBoneLineColor;
+                    cp.gizmoBoneJointColor    = viewState.gizmoBoneJointColor;
+                    cp.gizmoFogColor          = viewState.gizmoFogColor;
+                    cp.gizmoWindColor         = viewState.gizmoWindColor;
                 }
                 rs->SetCameraParams(cp);
             }
@@ -342,6 +431,7 @@ namespace Luth
 
             // ── Step 7: Advance Frame ──
             m_FrameData.Advance();
+            EmitFrameProfilingPlots();   // plot the frame's accumulated counters before they reset
             JobSystem::ResetFrameStats();
         }
 
@@ -370,6 +460,12 @@ namespace Luth
         SystemRegistry::Update<PhysicsSystem>();
         if (app->m_RunGameSystems)
             SystemRegistry::Update<AnimationSystem>();
+
+        // Editor in-world gizmos (lights/cameras/bounds/bones/fog/wind) → DebugDraw. Game-stage producer:
+        // shares DebugDraw's single-writer slot, reads post-Animation transforms, gated per category
+        // by CameraParams (all-off in a runtime build). DebugDrawSubsystem flushes them in the scene view.
+        if (auto* rs = SystemRegistry::GetSystem<RenderingSystem>())
+            Gizmos::Draw(*app->m_Scene, rs->GetCameraParams(), rs->GetWindSettings());
 
         // CaptureSnapshot must run after all ECS mutations for the frame —
         // it freezes the state Render(N-1) will read next iteration.

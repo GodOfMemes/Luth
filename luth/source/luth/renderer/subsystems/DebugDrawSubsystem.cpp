@@ -16,28 +16,31 @@ namespace Luth
 {
     void DebugDrawSubsystem::Init(RenderPipeline& pipeline)
     {
+        LH_PROFILE_FUNCTION();
         m_Pipeline = &pipeline;
 
         auto loadSpv = [](const char* relPath) -> std::vector<u32> {
             auto sh = ShaderLibrary::LoadEngine(relPath);
             return sh ? sh->GetSpirV() : std::vector<u32>{};
         };
-        m_VertSpv = loadSpv("shaders/debugDraw.vert");
-        m_FragSpv = loadSpv("shaders/debugDraw.frag");
+        m_VertSpv = loadSpv("shaders/debugDraw_vert.slang");
+        m_FragSpv = loadSpv("shaders/debugDraw.slang");
 
         if (m_VertSpv.empty() || m_FragSpv.empty())
         {
-            LH_CORE_ERROR("DebugDrawSubsystem: shader SPIR-V empty after asset load!");
+            LH_LOG(Renderer, error, "DebugDrawSubsystem: shader SPIR-V empty after asset load!");
         }
     }
 
     void DebugDrawSubsystem::BuildPipelines()
     {
+        LH_PROFILE_FUNCTION();
         BuildLinePipeline();
     }
 
     void DebugDrawSubsystem::BuildLinePipeline()
     {
+        LH_PROFILE_FUNCTION();
         if (m_VertSpv.empty() || m_FragSpv.empty()) return;
 
         // No descriptor set — viewProj rides on the push constant; vertex data binds as VBO.
@@ -83,13 +86,15 @@ namespace Luth
 
     void DebugDrawSubsystem::Shutdown()
     {
+        LH_PROFILE_FUNCTION();
         m_LinePipeline.reset();
     }
 
     bool DebugDrawSubsystem::OnShaderReloaded(const std::string& name, const std::vector<u32>& spv)
     {
-        if      (name == "debugDraw.vert") m_VertSpv = spv;
-        else if (name == "debugDraw.frag") m_FragSpv = spv;
+        LH_PROFILE_FUNCTION();
+        if      (name == "debugDraw_vert.slang") m_VertSpv = spv;
+        else if (name == "debugDraw.slang") m_FragSpv = spv;
         else return false;
 
         if (auto* raw = m_LinePipeline.release(); raw)
@@ -100,6 +105,7 @@ namespace Luth
 
     RG::ResourceHandle DebugDrawSubsystem::AddDebugDrawPass(RG::RenderGraph& rg, RG::ResourceHandle ldrOutput)
     {
+        LH_PROFILE_FUNCTION();
         if (!m_LinePipeline) return ldrOutput;
 
         // Read the lines for the frame the render stage is consuming. Span is valid until

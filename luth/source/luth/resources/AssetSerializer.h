@@ -42,6 +42,7 @@ namespace Luth
         u32 IndexCount;
         u32 MaterialIndex;
         u32 IsSkinned;    // bool as u32 for alignment
+        u32 IsDeformable; // V5+: static wind-deformable opt-in (bool as u32)
         // Followed by:
         // - Vertex Data (VertexCount * sizeof(Vertex) or sizeof(SkinnedVertex))
         // - Index Data (IndexCount * sizeof(u32))
@@ -54,11 +55,15 @@ namespace Luth
         u32 IsSkinned;       // V2+: model-level skinned flag
         u32 BoneCount;       // V2+: number of bones in skeleton
         u32 AnimationCount;  // V2+: number of animation clips
+        u32 NodeCount;       // V4+: scene-graph nodes (static models only)
+        u32 CameraCount;     // V4+: imported cameras
+        u32 LightCount;      // V4+: imported lights
         // Followed by:
         // - Material UUIDs [MaterialCount]
         // - MeshHeader + Data [MeshCount]
         // - (V2+) Skeleton bones [BoneCount]
-        // - (V2+) Animation clips [AnimationCount]
+        // - (V2+) Animation clip UUIDs [AnimationCount]
+        // - (V4+) Nodes [NodeCount], Cameras [CameraCount], Lights [LightCount]
     };
 
     struct ShaderHeader

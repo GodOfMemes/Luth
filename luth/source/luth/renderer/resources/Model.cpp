@@ -72,12 +72,12 @@ namespace Luth
                 : static_cast<u32>(data.Vertices.size());
             auto mesh = Mesh::Create(vb, ib, vertCount, data.IsSkinned);
 
-            // Per-mesh BLAS — static built once over the source VB; skinned built over the deformed
-            // positions buffer (filled by the per-frame skinning compute) with ALLOW_UPDATE so
-            // each frame's MODE_UPDATE refit is cheap. Built unconditionally on Vulkan backends;
-            // factory returns null on non-Vulkan backends (graceful — TLAS skips meshes with no BLAS).
-            if (data.IsSkinned)
-                mesh->SetBlas(VKAccelerationStructure::CreateSkinnedBLAS(*mesh, data.SkinnedVertices));
+            // Per-mesh BLAS — rigid built once over the source VB; deformable (skinned OR static
+            // wind-deformable) built over the deformed buffer (filled per-frame by the deform compute)
+            // with ALLOW_UPDATE so each frame's MODE_UPDATE refit is cheap. Built unconditionally on
+            // Vulkan backends; factory returns null on non-Vulkan backends (graceful — TLAS skips it).
+            if (data.IsSkinned || data.IsDeformable)
+                mesh->SetBlas(VKAccelerationStructure::CreateDeformableBLAS(*mesh));
             else
                 mesh->SetBlas(VKAccelerationStructure::CreateStaticBLAS(*mesh));
 
@@ -85,6 +85,20 @@ namespace Luth
         }
 
         CacheModelInfo();
+    }
+
+    std::vector<Mat4> Model::ComputeNodeWorldTransforms() const
+    {
+        std::vector<Mat4> world(m_Nodes.size());
+        for (size_t i = 0; i < m_Nodes.size(); ++i) {
+            const auto& n = m_Nodes[i];
+            Mat4 local = Math::Translate(Mat4(1.0f), n.Translation)
+                       * Math::ToMat4(n.Rotation)
+                       * Math::Scale(Mat4(1.0f), n.Scale);
+            // Nodes are topological — a parent's world matrix is finalized before its children read it.
+            world[i] = (n.ParentIndex >= 0) ? world[n.ParentIndex] * local : local;
+        }
+        return world;
     }
 
     ModelInfo Model::GetModelInfo() const

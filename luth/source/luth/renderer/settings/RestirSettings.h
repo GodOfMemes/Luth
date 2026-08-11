@@ -11,6 +11,7 @@ namespace Luth
     struct RestirSettings
     {
         bool enabled = true;
+        bool halfResolution = false;     // trace + denoise DI (diffuse + specular) half-res + bilateral upscale
         u32  candidateCount = 32;        // initial RIS candidates (M)
         u32  temporalMCap = 20;          // history clamp multiplier (prev.M <= mCap * curr.M)
         f32  temporalDepthThreshold = 0.05f;
@@ -18,5 +19,7 @@ namespace Luth
         u32  spatialNeighbours = 5;
         u32  spatialRadius = 16;
         f32  spatialDepthThreshold = 0.1f;
+        bool specular = true;            // #154 — demodulated specular DI (metals/specular from point lights)
+        f32  specularIntensity = 1.0f;   // composite scale, baked into restirParams.z (pbr.frag remod)
     };
 }

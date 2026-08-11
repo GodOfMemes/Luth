@@ -32,7 +32,18 @@ namespace Luth
         u32  meshIndex   = 0;
         u32  boneOffset  = 0;        // Pre-resolved from Animation / Parent chain
         bool isSkinned   = false;
+        bool isDeformable = false;   // static wind-deformable (reads the deformed buffer like skinned)
         u32  entity      = 0;        // entt::entity underlying value — cast at the use site
+
+        // Per-entity wind response (Component::Wind). Defaults == "no component" → full global response.
+        bool windRespond        = true;
+        f32  windStrengthMul    = 1.0f;
+        f32  windPhaseOffset    = 0.0f;
+        f32  windGustMul        = 1.0f;
+        f32  windDetailMul      = 1.0f;
+        bool windDirOverride    = false;
+        Vec3 windOverrideDir    = Vec3(1.0f, 0.0f, 0.0f);
+        bool windOverrideIsWorld = true;
     };
 
     // ── Lighting snapshots ──
@@ -66,6 +77,17 @@ namespace Luth
         f32  range = 10.0f;
     };
 
+    struct SpotLightSnapshot
+    {
+        Vec3 position{ 0.0f };
+        Vec3 direction{ 0.0f, -1.0f, 0.0f };   // entity -Z axis
+        Vec3 color{ 1.0f };
+        f32  intensity = 1.0f;
+        f32  range = 10.0f;
+        f32  innerConeAngleDeg = 25.0f;        // half-angles; gatherer converts to cosines
+        f32  outerConeAngleDeg = 45.0f;
+    };
+
     // ── Volumetric fog snapshots ──
     // worldMatrix bakes the entity's WorldTransform * fog local-offset/rotation so the injection
     // shader gets a single volume-to-world transform per row. extentsOrRadius carries Box
@@ -91,6 +113,7 @@ namespace Luth
     {
         std::span<const MeshDrawSnapshot>   meshes;
         std::span<const PointLightSnapshot> pointLights;
+        std::span<const SpotLightSnapshot>  spotLights;
         std::span<const FogVolumeSnapshot>  fogVolumes;
         DirectionalLightSnapshot            directionalLight;
         std::span<const char* const>        tagsByEntity;   // debug-only; empty when frame-debugger not capturing
@@ -99,6 +122,7 @@ namespace Luth
         {
             meshes = {};
             pointLights = {};
+            spotLights = {};
             fogVolumes = {};
             directionalLight = {};
             tagsByEntity = {};

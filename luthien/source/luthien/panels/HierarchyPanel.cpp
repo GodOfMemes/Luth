@@ -22,7 +22,7 @@ namespace Luth
     HierarchyPanel::HierarchyPanel()
     {
         m_WindowID = "Hierarchy";
-        LH_CORE_INFO("Created Hierarchy panel");
+        LH_LOG(Editor, info, "Created Hierarchy panel");
     }
 
     void HierarchyPanel::OnInit()
@@ -43,8 +43,8 @@ namespace Luth
     void HierarchyPanel::OnDraw(const EditorSnapshot& /*snapshot*/)
     {
         LH_PROFILE_FUNCTION();
-        ImGui::PushFont(Editor::GetFASolid());
-        if (BeginWindow(ICON_FA_LIST "  Hierarchy") && m_Context)
+        ImGui::PushFont(Editor::GetIconRegular());
+        if (BeginWindow(ICON_LIST "  Hierarchy") && m_Context)
         {
             // Sync primary selection from EditorSelection (may have changed via viewport)
             m_Selection = EditorSelection::GetSelectedEntity();
@@ -52,19 +52,10 @@ namespace Luth
             DrawTopBar();
             ImGui::Separator();
 
-            // Handle Global Shortcuts (Delete, F2, Esc)
+            // Hierarchy shortcuts (F2, Esc). Delete is centralized in Editor::ProcessShortcuts
+            // so it also fires from the Scene viewport and acts on the whole selection.
             if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows))
             {
-                if (ImGui::IsKeyPressed(ImGuiKey_Delete) && m_Selection) {
-                    Entity sel = m_Selection;
-                    m_DeferredActions.push_back([this, sel]() {
-                        if (sel && sel.IsValid()) {
-                            CommandHistory::Execute(std::make_unique<EntityDestroyCommand>(m_Context.get(), sel));
-                            SetSelectedEntity({});
-                        }
-                    });
-                }
-                
                 if (ImGui::IsKeyPressed(ImGuiKey_F2) && m_Selection)
                     RenameEntity(m_Selection);
 
@@ -90,7 +81,9 @@ namespace Luth
             // Main Hierarchy Area
             if (ImGui::BeginChild("EntityList"))
             {
-                // 1. Iterate Root Entities (Ordered)
+                // 1. Iterate Root Entities (Ordered). m_VisibleOrder is rebuilt here in display
+                // order so a deferred shift-range select can resolve the span after the full walk.
+                m_VisibleOrder.clear();
                 for (auto entity : m_Context->GetRootEntities()) {
                     DrawEntityNode(entity);
                 }
@@ -141,7 +134,7 @@ namespace Luth
     void HierarchyPanel::DrawTopBar()
     {
         ImGui::AlignTextToFramePadding();
-        if (ImGui::Button(ICON_FA_PLUS))
+        if (ImGui::Button(ICON_PLUS))
             ImGui::OpenPopup("HierarchyCreateMenu");
 
         if (ImGui::BeginPopup("HierarchyCreateMenu"))
@@ -152,7 +145,7 @@ namespace Luth
 
         ImGui::SameLine();
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-        ImGui::InputTextWithHint("##Search", ICON_FA_MAGNIFYING_GLASS " Search...", m_SearchFilter, IM_ARRAYSIZE(m_SearchFilter));
+        ImGui::InputTextWithHint("##Search", ICON_SEARCH " Search...", m_SearchFilter, IM_ARRAYSIZE(m_SearchFilter));
     }
 
     void HierarchyPanel::DrawEntityNode(Entity entity)
@@ -164,13 +157,25 @@ namespace Luth
 
         const std::string& name = entity.GetName();
 
-        // Determine icon based on entity components
-        const char* icon = ICON_FA_CIRCLE_DOT;
-        if (entity.HasComponent<Camera>())               icon = ICON_FA_VIDEO;
-        else if (entity.HasComponent<DirectionalLight>()) icon = ICON_FA_SUN;
-        else if (entity.HasComponent<PointLight>())       icon = ICON_FA_LIGHTBULB;
-        else if (entity.HasComponent<Animation>())        icon = ICON_FA_PERSON_RUNNING;
-        else if (entity.HasComponent<MeshRenderer>())     icon = ICON_FA_CUBE;
+        // Icon + category tint from the entity's defining component. Order is priority:
+        // bone/camera/light identify the entity; animation outranks mesh (skinned
+        // characters read as animated); physics/FX are fallbacks. Default = neutral cube.
+        const char* icon       = ICON_CUBE;
+        ImVec4      iconTint    = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+        bool        iconFilled  = false;   // lights + camera read better in the Fill weight
+        if      (entity.HasComponent<Bone>())               { icon = ICON_BONE_FILL;              iconTint = EditorColors::EntityBone;    iconFilled = true; }
+        else if (entity.HasComponent<Camera>())             { icon = ICON_VIDEO_CAMERA_FILL;      iconTint = EditorColors::EntityCamera;  iconFilled = true; }
+        else if (entity.HasComponent<DirectionalLight>())   { icon = ICON_LIGHT_DIRECTIONAL_FILL; iconTint = EditorColors::EntityLight;   iconFilled = true; }
+        else if (entity.HasComponent<PointLight>())         { icon = ICON_LIGHT_POINT_FILL;       iconTint = EditorColors::EntityLight;   iconFilled = true; }
+        else if (entity.HasComponent<SpotLight>())          { icon = ICON_LIGHT_SPOT_FILL;        iconTint = EditorColors::EntityLight;   iconFilled = true; }
+        else if (entity.HasComponent<Animation>() ||
+                 entity.HasComponent<AnimationController>()) { icon = ICON_ANIMATION;              iconTint = EditorColors::EntityAnim; }
+        else if (entity.HasComponent<MeshRenderer>())       { icon = ICON_MESH;                   iconTint = EditorColors::EntityMesh; }
+        else if (entity.HasComponent<RigidBody>() ||
+                 entity.HasComponent<Collider>() ||
+                 entity.HasComponent<CharacterController>()) { icon = ICON_PHYSICS;                iconTint = EditorColors::EntityPhysics; }
+        else if (entity.HasComponent<FogVolume>())          { icon = ICON_FOG;                    iconTint = EditorColors::EntityFX; }
+        else if (entity.HasComponent<Wind>())               { icon = ICON_WIND;                   iconTint = EditorColors::EntityFX; }
         
         // Filter: skip subtrees with no matching descendants
         if (strlen(m_SearchFilter) > 0 && !SubtreeMatchesFilter(entity, m_SearchFilter))
@@ -178,6 +183,9 @@ namespace Luth
             ImGui::PopID();
             return;
         }
+
+        // Record this row in display order (pre-order) for shift-range select.
+        m_VisibleOrder.push_back(entity);
 
         ImGuiTreeNodeFlags flags =
             ImGuiTreeNodeFlags_OpenOnArrow |
@@ -247,8 +255,23 @@ namespace Luth
         }
         else
         {
-            // Standard Node
-            opened = ImGui::TreeNodeEx("##Node", flags, "%s  %s", icon, name.c_str());
+            // Arrow-only node spans the row and stays the "last item" for the hover /
+            // context-menu / drag-drop logic below. Glyph (category-tinted) and name are
+            // drawn via the window draw list so neither becomes an ImGui item.
+            opened = ImGui::TreeNodeEx("##Node", flags, "");
+
+            const ImVec2 rMin = ImGui::GetItemRectMin();
+            const float  gx   = rMin.x + ImGui::GetTreeNodeToLabelSpacing();
+            const float  gy   = rMin.y + (ImGui::GetItemRectSize().y - ImGui::GetFontSize()) * 0.5f;
+            const ImU32  iconCol = dimThisRow ? ImGui::GetColorU32(ImGuiCol_TextDisabled) : ImGui::GetColorU32(iconTint);
+            const ImU32  nameCol = dimThisRow ? ImGui::GetColorU32(ImGuiCol_TextDisabled) : ImGui::GetColorU32(ImGuiCol_Text);
+            ImFont*      gFont = iconFilled ? Editor::GetIconFill() : Editor::GetIconRegular();
+            ImDrawList*  dl   = ImGui::GetWindowDrawList();
+            dl->AddText(gFont, gFont->FontSize, ImVec2(gx, gy), iconCol, icon);
+            ImGui::PushFont(gFont);
+            const float iconW = ImGui::CalcTextSize(icon).x;
+            ImGui::PopFont();
+            dl->AddText(ImVec2(gx + iconW + ImGui::GetStyle().ItemInnerSpacing.x, gy), nameCol, name.c_str());
         }
 
         // invariant: hover-gated selection is required because TreeNodeEx fires
@@ -263,7 +286,10 @@ namespace Luth
         // Context Menu (still tied to the tree-node "last item")
         if (ImGui::BeginPopupContextItem())
         {
-            SetSelectedEntity(entity); // Select on right click
+            // Right-clicking a member of a multi-selection keeps that selection (so context-menu
+            // Delete acts on all); right-clicking elsewhere selects just this entity.
+            if (!EditorSelection::IsSelected(entity))
+                SetSelectedEntity(entity);
             DrawContextMenu(entity);   // Pass clicked entity as parent
             ImGui::EndPopup();
         }
@@ -273,9 +299,9 @@ namespace Luth
         HandleDragDropTarget(entity);
 
         // Right-aligned visibility eye — overlaps the tree node via AllowItemOverlap.
-        const float eyeBtnW = ImGui::CalcTextSize(ICON_FA_EYE).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        const float eyeBtnW = ImGui::CalcTextSize(ICON_EYE).x + ImGui::GetStyle().FramePadding.x * 2.0f;
         ImGui::SameLine(ImGui::GetContentRegionMax().x - eyeBtnW);
-        const char* eyeIcon = isActive ? ICON_FA_EYE : ICON_FA_EYE_SLASH;
+        const char* eyeIcon = isActive ? ICON_EYE : ICON_EYE_SLASH;
         if (!isActive) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
         const bool eyeClicked = ImGui::SmallButton(eyeIcon);
         if (!isActive) ImGui::PopStyleColor();
@@ -296,12 +322,19 @@ namespace Luth
             bool ctrlHeld  = ImGui::IsKeyDown(ImGuiKey_LeftCtrl)  || ImGui::IsKeyDown(ImGuiKey_RightCtrl);
             bool shiftHeld = ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift);
 
-            if (ctrlHeld)
+            if (ctrlHeld) {
                 EditorSelection::ToggleEntity(entity);
-            else if (shiftHeld)
-                EditorSelection::AddEntity(entity);
-            else
+                m_RangeAnchor = entity;
+            }
+            else if (shiftHeld) {
+                // Deferred: the full visible-row list isn't built until the tree walk finishes.
+                Entity target = entity;
+                m_DeferredActions.push_back([this, target]() { SelectRangeTo(target); });
+            }
+            else {
                 SetSelectedEntity(entity);
+                m_RangeAnchor = entity;
+            }
 
             m_Selection = EditorSelection::GetSelectedEntity();
 
@@ -349,7 +382,7 @@ namespace Luth
             ImGui::SetDragDropPayload("HIERARCHY_ENTITY", &entity, sizeof(Entity));
             
             // Preview
-            ImGui::Text(ICON_FA_CUBE " %s", entity.GetName().c_str());
+            ImGui::Text(ICON_CUBE " %s", entity.GetName().c_str());
             
             ImGui::EndDragDropSource();
         }
@@ -606,6 +639,23 @@ namespace Luth
                     SetSelectedEntity(light);
                 });
             }
+            if (ImGui::MenuItem("Spot Light"))
+            {
+                UUID parentUUID = (parent && parent.IsValid())
+                    ? parent.GetComponent<Component::ID>().Value : UUID::Invalid();
+                m_DeferredActions.push_back([this, parentUUID]() {
+                    CommandHistory::BeginCompound("Create Spot Light");
+                    auto cmd = std::make_unique<EntityCreateCommand>(m_Context.get(), "Spot Light", parentUUID);
+                    auto* rawCmd = cmd.get();
+                    CommandHistory::Execute(std::move(cmd));
+                    Entity light = rawCmd->GetCreatedEntity();
+                    if (light.IsValid())
+                        CommandHistory::Execute(std::make_unique<ComponentAddCommand<SpotLight>>(
+                            "Add SpotLight", m_Context.get(), (entt::entity)light));
+                    CommandHistory::EndCompound();
+                    SetSelectedEntity(light);
+                });
+            }
             ImGui::EndMenu();
         }
 
@@ -618,13 +668,9 @@ namespace Luth
 
         if (ImGui::MenuItem("Delete", "Del", false, m_Selection.operator bool()))
         {
-            Entity sel = m_Selection;
-            m_DeferredActions.push_back([this, sel]() {
-                if (sel && sel.IsValid()) {
-                    CommandHistory::Execute(std::make_unique<EntityDestroyCommand>(m_Context.get(), sel));
-                    SetSelectedEntity({});
-                }
-            });
+            // Deferred: deletion runs after the tree walk to avoid mutating the scene mid-iteration.
+            // Routes through the shared helper so it removes the whole selection as one undo.
+            m_DeferredActions.push_back([]() { Editor::DeleteSelectedEntities(); });
         }
     }
 
@@ -632,6 +678,34 @@ namespace Luth
     {
         m_Selection = entity;
         EditorSelection::SelectEntity(entity);
+    }
+
+    void HierarchyPanel::SelectRangeTo(Entity target)
+    {
+        auto indexOf = [&](Entity e) -> int {
+            for (int i = 0; i < (int)m_VisibleOrder.size(); ++i)
+                if (m_VisibleOrder[i] == e) return i;
+            return -1;
+        };
+
+        const int ti = indexOf(target);
+        const int ai = (m_RangeAnchor && m_RangeAnchor.IsValid()) ? indexOf(m_RangeAnchor) : -1;
+        if (ti < 0) return;
+
+        // No usable anchor (first action, or anchor scrolled into a collapsed/filtered subtree):
+        // fall back to a plain single select and seed the anchor here.
+        if (ai < 0) { SetSelectedEntity(target); m_RangeAnchor = target; return; }
+
+        // Replace selection with the inclusive span; add anchor→target so the target ends primary.
+        // Anchor stays put so a subsequent shift-click re-pivots from the same row.
+        EditorSelection::ClearSelection();
+        const int step = (ti >= ai) ? 1 : -1;
+        for (int i = ai; ; i += step) {
+            if (m_VisibleOrder[i].IsValid())
+                EditorSelection::AddEntity(m_VisibleOrder[i]);
+            if (i == ti) break;
+        }
+        m_Selection = EditorSelection::GetSelectedEntity();
     }
 
     void HierarchyPanel::RenameEntity(Entity entity)

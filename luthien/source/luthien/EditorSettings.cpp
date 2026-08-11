@@ -29,7 +29,7 @@ namespace Luth
 
         if (!std::filesystem::exists(path))
         {
-            LH_CORE_WARN("EditorSettings file not found at '{}', using defaults", path.string());
+            LH_LOG(Editor, warn, "EditorSettings file not found at '{}', using defaults", path.string());
             return settings;
         }
 
@@ -56,13 +56,25 @@ namespace Luth
             settings.thumbnailSize              = j.value("thumbnailSize", settings.thumbnailSize);
             settings.texturePreviewFooterHeight = j.value("texturePreviewFooterHeight", settings.texturePreviewFooterHeight);
             settings.showControlsOverlay = j.value("showControlsOverlay", settings.showControlsOverlay);
-            settings.showBoneDebug       = j.value("showBoneDebug", settings.showBoneDebug);
-            settings.showLightGizmos     = j.value("showLightGizmos", settings.showLightGizmos);
-            settings.showCameraGizmos    = j.value("showCameraGizmos", settings.showCameraGizmos);
-            settings.showAABBGizmos      = j.value("showAABBGizmos", settings.showAABBGizmos);
+            settings.lightsSelected  = j.value("gizmoLightsSelected",  settings.lightsSelected);
+            settings.lightsAll       = j.value("gizmoLightsAll",       settings.lightsAll);
+            settings.camerasSelected = j.value("gizmoCamerasSelected", settings.camerasSelected);
+            settings.camerasAll      = j.value("gizmoCamerasAll",      settings.camerasAll);
+            settings.boundsSelected  = j.value("gizmoBoundsSelected",  settings.boundsSelected);
+            settings.boundsAll       = j.value("gizmoBoundsAll",       settings.boundsAll);
+            settings.bonesSelected   = j.value("gizmoBonesSelected",   settings.bonesSelected);
+            settings.bonesAll        = j.value("gizmoBonesAll",        settings.bonesAll);
+            settings.fogSelected     = j.value("gizmoFogSelected",     settings.fogSelected);
+            settings.fogAll          = j.value("gizmoFogAll",          settings.fogAll);
+            settings.windSelected    = j.value("gizmoWindSelected",    settings.windSelected);
+            settings.windAll         = j.value("gizmoWindAll",         settings.windAll);
+            settings.gizmoAlphaUnselected = j.value("gizmoAlphaUnselected", settings.gizmoAlphaUnselected);
+            settings.gizmoIconScale       = j.value("gizmoIconScale", settings.gizmoIconScale);
             settings.showGrid            = j.value("showGrid", settings.showGrid);
             settings.showTriIndicatorOverlay = j.value("showTriIndicatorOverlay", settings.showTriIndicatorOverlay);
             settings.lastDebugMode       = (u8)j.value("lastDebugMode", (int)settings.lastDebugMode);
+            settings.renderPanelTab      = j.value("renderPanelTab", settings.renderPanelTab);
+            settings.renderDenoiserTab   = j.value("renderDenoiserTab", settings.renderDenoiserTab);
 
             LoadVec4(j, "outlineColor", settings.outlineColor);
             settings.outlineWidth         = j.value("outlineWidth", settings.outlineWidth);
@@ -106,11 +118,11 @@ namespace Luth
                         settings.panelOpen[it.key()] = it.value().get<bool>();
             }
 
-            LH_CORE_INFO("Loaded editor settings from '{}'", path.string());
+            LH_LOG(Editor, info, "Loaded editor settings from '{}'", path.string());
         }
         catch (const std::exception& e)
         {
-            LH_CORE_ERROR("Failed to load editor settings: {}", e.what());
+            LH_LOG(Editor, error, "Failed to load editor settings: {}", e.what());
         }
 
         return settings;
@@ -139,13 +151,25 @@ namespace Luth
             j["thumbnailSize"]              = settings.thumbnailSize;
             j["texturePreviewFooterHeight"] = settings.texturePreviewFooterHeight;
             j["showControlsOverlay"] = settings.showControlsOverlay;
-            j["showBoneDebug"]       = settings.showBoneDebug;
-            j["showLightGizmos"]     = settings.showLightGizmos;
-            j["showCameraGizmos"]    = settings.showCameraGizmos;
-            j["showAABBGizmos"]      = settings.showAABBGizmos;
+            j["gizmoLightsSelected"]  = settings.lightsSelected;
+            j["gizmoLightsAll"]       = settings.lightsAll;
+            j["gizmoCamerasSelected"] = settings.camerasSelected;
+            j["gizmoCamerasAll"]      = settings.camerasAll;
+            j["gizmoBoundsSelected"]  = settings.boundsSelected;
+            j["gizmoBoundsAll"]       = settings.boundsAll;
+            j["gizmoBonesSelected"]   = settings.bonesSelected;
+            j["gizmoBonesAll"]        = settings.bonesAll;
+            j["gizmoFogSelected"]     = settings.fogSelected;
+            j["gizmoFogAll"]          = settings.fogAll;
+            j["gizmoWindSelected"]    = settings.windSelected;
+            j["gizmoWindAll"]         = settings.windAll;
+            j["gizmoAlphaUnselected"] = settings.gizmoAlphaUnselected;
+            j["gizmoIconScale"]       = settings.gizmoIconScale;
             j["showGrid"]            = settings.showGrid;
             j["showTriIndicatorOverlay"] = settings.showTriIndicatorOverlay;
             j["lastDebugMode"]       = (int)settings.lastDebugMode;
+            j["renderPanelTab"]      = settings.renderPanelTab;
+            j["renderDenoiserTab"]   = settings.renderDenoiserTab;
 
             j["outlineColor"]         = ToJson(settings.outlineColor);
             j["outlineWidth"]         = settings.outlineWidth;
@@ -189,11 +213,11 @@ namespace Luth
             std::ofstream file(path);
             file << j.dump(4);
 
-            LH_CORE_INFO("Saved editor settings to '{}'", path.string());
+            LH_LOG(Editor, info, "Saved editor settings to '{}'", path.string());
         }
         catch (const std::exception& e)
         {
-            LH_CORE_ERROR("Failed to save editor settings: {}", e.what());
+            LH_LOG(Editor, error, "Failed to save editor settings: {}", e.what());
         }
     }
 }

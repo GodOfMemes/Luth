@@ -9,13 +9,34 @@
 #include "luth/core/time/Time.h"
 #include "luth/jobs/JobSystem.h"
 #include "luth/memory/GPUTaggedPageAllocator.h"
+#include "luth/renderer/material/MaterialLayoutGuard.h"
+#include "luth/resources/FileSystem.h"
 
 namespace Luth
 {
     void GlobalSubsystem::Init(RenderPipeline& pipeline)
     {
+        LH_PROFILE_FUNCTION();
         m_Pipeline = &pipeline;
         VkDevice device = VulkanContext::Get().GetDevice();
+
+        // Loud init-time guard: GlobalUniforms (Set 0 UBO) must stay byte-identical to globals.slang's
+        // std140 mirror — a reordered/inserted field silently desyncs every shader that reads the UBO.
+        #define LH_GU(f) MaterialLayoutGuard::CppField{ #f, offsetof(GlobalUniforms, f) }
+        static constexpr MaterialLayoutGuard::CppField kGuFields[] = {
+            LH_GU(viewProjection), LH_GU(prevViewProjection), LH_GU(view), LH_GU(projection),
+            LH_GU(cameraPos), LH_GU(time), LH_GU(lightSpaceMatrix), LH_GU(cascadeSplitsViewZ),
+            LH_GU(shadowBias), LH_GU(shadowNormalBias), LH_GU(cascadeTexelSize), LH_GU(iblIntensity),
+            LH_GU(skyboxIntensity), LH_GU(debugVisualizeCascades), LH_GU(cascadeBlendWidth), LH_GU(viewportSize),
+            LH_GU(nearZ), LH_GU(farZ), LH_GU(distanceFogColorDensity), LH_GU(distanceFogParams),
+            LH_GU(heightFogColorDensity), LH_GU(heightFogParams), LH_GU(volTemporalParams), LH_GU(prevViewParams),
+            LH_GU(volNoiseParams), LH_GU(volNoiseWind), LH_GU(volScatterParams), LH_GU(specAaParams),
+            LH_GU(taaParams), LH_GU(prevJitter), LH_GU(rtShadowParams), LH_GU(restirParams),
+            LH_GU(pathTraceParams), LH_GU(reflParams), LH_GU(invViewProjection),
+        };
+        #undef LH_GU
+        MaterialLayoutGuard::Validate(FileSystem::EngineAssetsPath("shaders/common/globals.slang"),
+                                      "GlobalUniforms", kGuFields, sizeof(GlobalUniforms));
 
         // Set 0 layout: 0 = GlobalUBO, 1-3 = IBL samplers, 4 = GTAO sampler, 5 = GTAO UBO, 6 = TLAS.
         VkDescriptorSetLayoutBinding bindings[7] = {};
@@ -23,10 +44,10 @@ namespace Luth
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[0].descriptorCount = 1;
-        // COMPUTE added so VolumetricSubsystem's inject pass can sample camera/CSM uniforms.
-        // RAYGEN added so rt_sun_shadows.rgen can read ubo.viewProjection / ubo.rtShadowParams.
+        // COMPUTE added so VolumetricSubsystem's inject pass + rt_sun_shadows.comp can sample
+        // camera/CSM uniforms (viewProjection / rtShadowParams) via rayQuery-in-compute.
         bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT
-                               | VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+                               | VK_SHADER_STAGE_COMPUTE_BIT;
 
         for (u32 i = 1; i <= 4; ++i)
         {
@@ -76,6 +97,7 @@ namespace Luth
 
     void GlobalSubsystem::Shutdown()
     {
+        LH_PROFILE_FUNCTION();
         if (m_GlobalSetLayout)
         {
             vkDestroyDescriptorSetLayout(VulkanContext::Get().GetDevice(), m_GlobalSetLayout, nullptr);
@@ -92,6 +114,7 @@ namespace Luth
     void GlobalSubsystem::UpdateUBO(const CameraParams& camera, const CascadeData& cascades,
                                     const DirectionalLightShadowParams& shadowParams)
     {
+        LH_PROFILE_FUNCTION();
         m_FrameCascades     = cascades;
         m_FrameShadowParams = shadowParams;
 
@@ -135,7 +158,7 @@ namespace Luth
             ubo.prevViewParams = Vec4(pNearZ, pFarZ, 0.0f, 0.0f);
             vr->prevNearZ      = camera.nearZ;
             vr->prevFarZ       = camera.farZ;
-            // Cache prev/curr jitter. ubo.prevJitter feeds slim_gbuffer.frag's source-side de-jitter
+            // Cache prev/curr jitter. ubo.prevJitter feeds slim_gbuffer.slang's source-side de-jitter
             // (consumed in the next commit); resolve's push-constant jitterDelta still rides
             // ViewResources::prevJitter directly until that move lands.
             vr->prevJitter    = vr->currentJitter;
@@ -206,7 +229,10 @@ namespace Luth
         const bool restirGiActive = m_Pipeline->GetRestirGi().IsEnabled()
                                  && vr && vr->restirGiDI
                                  && m_Pipeline->GetRt().GetTlas() != VK_NULL_HANDLE;
-        ubo.restirParams = Vec4(restirActive ? 1.0f : 0.0f, restirGiActive ? 1.0f : 0.0f, 0.0f, 0.0f);
+        // .z = ReSTIR-DI specular gate × intensity (#154); 0 when DI inactive or the specular toggle is off.
+        const RestirSettings& restirS = m_Pipeline->GetSystem().GetRestirSettings();
+        const float specZ = (restirActive && restirS.specular) ? restirS.specularIntensity : 0.0f;
+        ubo.restirParams = Vec4(restirActive ? 1.0f : 0.0f, restirGiActive ? 1.0f : 0.0f, specZ, 0.0f);
 
         // Path-traced reference mode (informational — PT bypasses pbr.frag; the megakernel reads its own
         // push constants). x gates nothing in pbr.frag; carried for debug viz + frame-debugger UBO dumps.
@@ -300,6 +326,7 @@ namespace Luth
 
     void GlobalSubsystem::WriteView(ViewResources& vr, const GlobalViewWriteContext& ctx)
     {
+        LH_PROFILE_FUNCTION();
         if (vr.globalDescriptorSet[0] == VK_NULL_HANDLE) return;
 
         VkDevice device = VulkanContext::Get().GetDevice();

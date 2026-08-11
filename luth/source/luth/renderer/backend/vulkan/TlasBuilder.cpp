@@ -9,6 +9,7 @@
 #include "luth/memory/GPUTaggedPageAllocator.h"
 #include "luth/renderer/resources/Model.h"
 #include "luth/renderer/resources/Mesh.h"
+#include "luth/renderer/material/Material.h"
 #include "luth/resources/AssetManager.h"
 
 #include <vma/vk_mem_alloc.h>
@@ -36,12 +37,12 @@ namespace Luth
             return out;
         }
 
-        // Cheap u64 mix — translation-only hash. Catches the common motion case (entities sliding
-        // around). Misses rotation-only changes on non-translating meshes — if RT shadows expose
-        // this, bump to full 64-byte matrix hash; cost is still < 10 µs for ~100 instances.
-        // materialUUID is folded in because the geometry table (C.3) carries each instance's material
-        // slot — a runtime material reassignment on a static mesh must force a rebuild or GI would
-        // shade the secondary hit with the stale material's albedo. see arch/rendering-pipeline.md
+        // Cheap u64 mix over the full world matrix — rotation + scale + translation. Mirrors
+        // PathTraceSubsystem::ComputeResetHash so a static-mesh rotate/scale (no translation delta)
+        // still rebuilds; ~10 µs for ~100 instances. materialUUID is folded in because the geometry
+        // table carries each instance's material slot — a runtime material reassignment on a static
+        // mesh must force a rebuild or GI would shade the secondary hit with the stale material's
+        // albedo. see arch/rendering-pipeline.md
         u64 HashInstances(std::span<const MeshDrawSnapshot> instances)
         {
             u64 h = 0xcbf29ce484222325ull; // FNV-1a basis
@@ -49,34 +50,39 @@ namespace Luth
             {
                 h ^= static_cast<u64>(inst.entity);
                 h *= 0x100000001b3ull;
-                // Translation row of the column-major matrix is the 4th column (m[3].xyz).
-                u32 t0, t1, t2;
-                std::memcpy(&t0, &inst.worldMatrix[3][0], 4);
-                std::memcpy(&t1, &inst.worldMatrix[3][1], 4);
-                std::memcpy(&t2, &inst.worldMatrix[3][2], 4);
-                h ^= t0;            h *= 0x100000001b3ull;
-                h ^= t1;            h *= 0x100000001b3ull;
-                h ^= t2;            h *= 0x100000001b3ull;
+                // Full world matrix (16 floats) — rotation + scale + translation.
+                const f32* wm = &inst.worldMatrix[0][0];
+                for (int j = 0; j < 16; ++j)
+                {
+                    u32 b; std::memcpy(&b, &wm[j], 4);
+                    h ^= b; h *= 0x100000001b3ull;
+                }
                 h ^= static_cast<u64>(inst.meshIndex);
                 h *= 0x100000001b3ull;
                 h ^= inst.materialUUID.GetHalf0(); h *= 0x100000001b3ull;
                 h ^= inst.materialUUID.GetHalf1(); h *= 0x100000001b3ull;
+                // Fold RenderMode so an in-place opaque<->cutout edit (same UUID) forces a rebuild —
+                // the per-instance TLAS opaque flag (ST1) depends on it.
+                if (inst.materialUUID.IsValid())
+                    if (auto mat = AssetManager::GetAsset<Material>(inst.materialUUID))
+                    { h ^= static_cast<u64>(mat->GetRenderMode()); h *= 0x100000001b3ull; }
             }
             return h;
         }
 
         // GPU geometry-table entry — one per packed TLAS instance, indexed by instanceCustomIndex.
-        // Mirrors the GeomEntry buffer_reference struct in restir_gi_initial.comp (std430, 24 B).
-        // BDAs point at the ORIGINAL (full-layout) vertex/index buffers — UVs live there for both
-        // static (52 B) and skinned (84 B) verts; the deformed positions-only VB is BLAS-only.
+        // Mirrors the GtGeomEntry buffer_reference struct in common/material.slang (std430, 24 B).
+        // Static meshes point vertexBDA at the original VB; skinned meshes point it at the per-mesh
+        // deformed vertex buffer — both the 52 B Vertex layout — so ray hits read post-skin
+        // normals/tangents/UVs, not bind pose. Stride is sizeof(Vertex) for both.
         struct GPUGeometryEntry
         {
-            VkDeviceAddress vertexBDA;     // original VB device address
+            VkDeviceAddress vertexBDA;     // VB (static) or deformed vertex buffer (skinned)
             VkDeviceAddress indexBDA;      // uint32 index buffer device address
             u32             materialSlot;  // index into the Material SSBO
-            u32             vertexStride;  // bytes: sizeof(Vertex)=52 or sizeof(SkinnedVertex)=84
+            u32             vertexStride;  // bytes: sizeof(Vertex) = 52 (both tiers)
         };
-        static_assert(sizeof(GPUGeometryEntry) == 24, "GPUGeometryEntry must match common/geom_table.glsl GtGeomEntry (24 B)");
+        static_assert(sizeof(GPUGeometryEntry) == 24, "GPUGeometryEntry must match common/material.slang GtGeomEntry (24 B)");
 
         struct ResolvedMesh
         {
@@ -99,7 +105,7 @@ namespace Luth
 
     void TlasBuilder::RefitSkinnedBLASes(VkCommandBuffer cmd,
                                          std::span<const MeshDrawSnapshot> instances,
-                                         u32 /*frameAbs*/)
+                                         u32 frameAbs)
     {
         auto& ctx = VulkanContext::Get();
         const auto& rt = ctx.GetRtFn();
@@ -120,9 +126,9 @@ namespace Luth
         u64 totalScratch = 0;
         for (const auto& inst : instances)
         {
-            if (!inst.isSkinned) continue;
+            if (!inst.isSkinned && !inst.isDeformable) continue;
             ResolvedMesh r = Resolve(inst);
-            if (!r.blas || !r.blas->IsSkinned()) continue;
+            if (!r.blas || !r.blas->IsDeformable()) continue;
             const u64 sz = AlignUp(r.blas->GetUpdateScratchSize(), scratchAlign);
             entries.push_back({ r.blas, r.mesh, totalScratch, sz });
             totalScratch += sz;
@@ -174,8 +180,8 @@ namespace Luth
             geom.geometryType                            = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
             geom.geometry.triangles.sType                = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
             geom.geometry.triangles.vertexFormat         = VK_FORMAT_R32G32B32_SFLOAT;
-            geom.geometry.triangles.vertexData.deviceAddress = e.blas->GetDeformedBda();
-            geom.geometry.triangles.vertexStride         = sizeof(Vec3);
+            geom.geometry.triangles.vertexData.deviceAddress = e.blas->GetDeformedBdaCurr(frameAbs);
+            geom.geometry.triangles.vertexStride         = sizeof(Vertex);
             geom.geometry.triangles.maxVertex            = vertCount - 1;
             geom.geometry.triangles.indexType            = VK_INDEX_TYPE_UINT32;
             geom.geometry.triangles.indexData.deviceAddress = ib ? ib->GetDeviceAddress() : 0;
@@ -238,31 +244,60 @@ namespace Luth
             ResolvedMesh r = Resolve(inst);
             if (!r.blas || r.blas->GetDeviceAddress() == 0) continue;
 
-            VkAccelerationStructureInstanceKHR vkInst{};
-            vkInst.transform                              = ToVkTransform(inst.worldMatrix);
-            vkInst.instanceCustomIndex                    = static_cast<u32>(packed.size()) & 0x00FFFFFFu;
-            vkInst.mask                                   = 0xFF;
-            vkInst.instanceShaderBindingTableRecordOffset = 0;
-            vkInst.flags                                  = 0;
-            vkInst.accelerationStructureReference         = r.blas->GetDeviceAddress();
-            packed.push_back(vkInst);
-
-            // Original full-layout VB/IB (UVs at +24 for both static + skinned) — NOT the BLAS's
-            // positions-only deformed VB. Skinned secondary hits read bind-pose attributes (known
-            // approximation; the hit POINT rides the deformed TLAS, only n_s/UV are bind-pose).
-            auto vb = std::dynamic_pointer_cast<VKVertexBuffer>(r.mesh->GetVertexBuffer());
-            auto ib = std::dynamic_pointer_cast<VKIndexBuffer>(r.mesh->GetIndexBuffer());
-            u32 matSlot = 0;  // slot 0 = reserved white material
+            // Resolve the material once: slot (geom table) + render mode → visibility mask + opaque flag.
+            // Transparent/Fade pack with the GLASS mask only — shadow-class rays cull to SOLID (glass
+            // never blocks light), world-class rays (GI bounce / reflections / PT) trace SOLID|GLASS and
+            // auto-confirm glass as a surface: emissive glass feeds the GI bounce and shows in reflections
+            // (unblended approximation). Masks mirror common/material.slang's GT_VIS_*. HashInstances
+            // folds RenderMode, so a runtime mode flip re-masks via the rebuild. see arch/rendering-pipeline.md
+            constexpr u32 kVisSolid = 0x01;
+            constexpr u32 kVisGlass = 0x02;
+            u32  matSlot     = 0;  // slot 0 = reserved white material
+            bool cutout      = false;
+            bool transparent = false;
             if (inst.materialUUID.IsValid())
             {
                 auto it = materialSlotMap.find(inst.materialUUID);
                 if (it != materialSlotMap.end()) matSlot = it->second;
+                if (auto mat = AssetManager::GetAsset<Material>(inst.materialUUID))
+                {
+                    const Material::RenderMode mode = mat->GetRenderMode();
+                    transparent = mode == Material::RenderMode::Transparent || mode == Material::RenderMode::Fade;
+                    cutout      = mode == Material::RenderMode::Cutout;
+                }
             }
+
+            VkAccelerationStructureInstanceKHR vkInst{};
+            vkInst.transform                              = ToVkTransform(inst.worldMatrix);
+            vkInst.instanceCustomIndex                    = static_cast<u32>(packed.size()) & 0x00FFFFFFu;
+            vkInst.mask                                   = transparent ? kVisGlass : (kVisSolid | kVisGlass);
+            vkInst.instanceShaderBindingTableRecordOffset = 0;
+            // Cutout -> FORCE_NO_OPAQUE so rayQuery yields candidates for the shader alpha test; everything
+            // else (transparent included) -> FORCE_OPAQUE to hardware-auto-confirm.
+            vkInst.flags                                  = cutout
+                ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
+                : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+            vkInst.accelerationStructureReference         = r.blas->GetDeviceAddress();
+            packed.push_back(vkInst);
+
+            // Skinned meshes source attributes from the deformed vertex buffer (post-skin pos/normal/
+            // tangent + passthrough UVs, interleaved Vertex layout) so ray hits shade with the same
+            // deformed basis raster sees; static meshes read the original VB. Both are the 52 B Vertex
+            // layout, so GatherHitGeometry reads either unchanged.
+            auto ib = std::dynamic_pointer_cast<VKIndexBuffer>(r.mesh->GetIndexBuffer());
             GPUGeometryEntry ge{};
-            ge.vertexBDA    = vb ? vb->GetDeviceAddress() : 0;
+            if (r.blas->IsDeformable())
+            {
+                ge.vertexBDA = r.blas->GetDeformedBdaCurr(frameAbs);
+            }
+            else
+            {
+                auto vb = std::dynamic_pointer_cast<VKVertexBuffer>(r.mesh->GetVertexBuffer());
+                ge.vertexBDA = vb ? vb->GetDeviceAddress() : 0;
+            }
             ge.indexBDA     = ib ? ib->GetDeviceAddress() : 0;
             ge.materialSlot = matSlot;
-            ge.vertexStride = r.mesh->IsSkinned() ? sizeof(SkinnedVertex) : sizeof(Vertex);
+            ge.vertexStride = sizeof(Vertex);
             geomEntries.push_back(ge);
         }
 

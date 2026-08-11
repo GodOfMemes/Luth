@@ -21,7 +21,7 @@ namespace Luth
         // Interactive 3D preview pinned in the footer (sub-task O).
         ImTextureID headerThumb = UI::ThumbnailCache::Get(model.Handle, AssetType::Model);
         const auto& headerInfo = model.GetCachedModelInfo();
-        UI::InspectorHeader(headerThumb, ICON_FA_CUBE, 48.0f, [&]() {
+        UI::InspectorHeader(headerThumb, ICON_CUBE, 48.0f, [&]() {
             const ImVec4 nameCol = { 0.4f, 0.8f, 1.0f, 1.0f };
             ImGui::TextColored(nameCol, "%s (Model)", model.GetName().c_str());
             ImGui::TextDisabled("%d meshes  ·  %d verts  ·  %s",
@@ -84,6 +84,9 @@ namespace Luth
                 UI::Property("Import Normals", m_Settings.ImportNormals);
                 UI::Property("Import Tangents", m_Settings.ImportTangents);
                 UI::Property("Optimize Mesh", m_Settings.OptimizeMesh);
+                UI::Property("Mark Deformable", m_Settings.MarkDeformable);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Route this model's STATIC meshes through the GPU deform seam so global\nwind bends them, RT-correct. Ignored for skinned. Needs Apply (reimport).");
 
                 ImGui::Separator();
                 ImGui::TextDisabled("Skinning");
@@ -99,6 +102,12 @@ namespace Luth
                 int physicsBakeInt = static_cast<int>(m_Settings.PhysicsBake);
                 if (UI::PropertyCombo("Bake Mode", physicsBakeInt, physicsBakeModes, IM_ARRAYSIZE(physicsBakeModes)))
                     m_Settings.PhysicsBake = static_cast<ModelImportSettings::PhysicsBakeMode>(physicsBakeInt);
+
+                ImGui::Separator();
+                ImGui::TextDisabled("Scene (static models)");
+
+                UI::Property("Import Cameras", m_Settings.ImportCameras);
+                UI::Property("Import Lights", m_Settings.ImportLights);
 
                 UI::EndProperties();
             }

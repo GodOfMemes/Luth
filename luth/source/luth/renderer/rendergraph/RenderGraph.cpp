@@ -1,9 +1,11 @@
 #include "luthpch.h"
 #include "luth/renderer/rendergraph/RenderGraph.h"
+#include "luth/renderer/rendergraph/RenderGraphSnapshot.h"
 #include "luth/renderer/rendergraph/IArchiveSink.h"
 #include "luth/core/diagnostics/Log.h"
 #include "luth/core/diagnostics/Profiler.h"
 #include "luth/renderer/backend/vulkan/VulkanContext.h"
+#include "luth/renderer/backend/vulkan/GpuTracy.h"
 #include "luth/renderer/backend/vulkan/VulkanAllocator.h"
 #include "luth/renderer/backend/vulkan/VulkanBackend.h"
 #include "luth/renderer/backend/vulkan/GpuCheckpoint.h"
@@ -47,6 +49,17 @@ namespace Luth::RG
         return m_Graph.RegisterWrite(m_PassIndex, resource, ResourceState::ComputeWrite);
     }
 
+    ResourceHandle RenderPassBuilder::ReadStorageImageFragment(ResourceHandle resource)
+    {
+        m_Graph.RegisterRead(m_PassIndex, resource, ResourceState::FragmentStorageRead);
+        return resource;
+    }
+
+    ResourceHandle RenderPassBuilder::WriteStorageImageFragment(ResourceHandle resource)
+    {
+        return m_Graph.RegisterWrite(m_PassIndex, resource, ResourceState::FragmentStorageWrite);
+    }
+
     ResourceHandle RenderPassBuilder::Write(ResourceHandle resource, VkAttachmentLoadOp loadOp, VkAttachmentStoreOp storeOp, VkClearValue clearValue)
     {
         ResourceHandle newHandle = m_Graph.RegisterWrite(m_PassIndex, resource, ResourceState::ColorAttachment);
@@ -80,6 +93,22 @@ namespace Luth::RG
     BufferHandle RenderPassBuilder::WriteBuffer(BufferHandle buffer)
     {
         return m_Graph.RegisterBufferWrite(m_PassIndex, buffer, ResourceState::StorageBufferWrite);
+    }
+
+    BufferHandle RenderPassBuilder::ReadBufferFragment(BufferHandle buffer)
+    {
+        m_Graph.RegisterBufferRead(m_PassIndex, buffer, ResourceState::FragmentStorageRead);
+        return buffer;
+    }
+
+    BufferHandle RenderPassBuilder::WriteBufferFragment(BufferHandle buffer)
+    {
+        return m_Graph.RegisterBufferWrite(m_PassIndex, buffer, ResourceState::FragmentStorageWrite);
+    }
+
+    BufferHandle RenderPassBuilder::WriteBufferTransfer(BufferHandle buffer)
+    {
+        return m_Graph.RegisterBufferWrite(m_PassIndex, buffer, ResourceState::TransferDst);
     }
 
     void RenderPassBuilder::SetHasSideEffect()
@@ -257,7 +286,7 @@ namespace Luth::RG
             s_dumped = true;
             std::ofstream(s_dumpPath) << DumpGraphDot();
             std::ofstream(std::string(s_dumpPath) + ".json") << DumpGraphJson();
-            LH_CORE_INFO("RenderGraph dumped to {} (+ .json)", s_dumpPath);
+            LH_LOG(Renderer, info, "RenderGraph dumped to {} (+ .json)", s_dumpPath);
         }
     }
 
@@ -487,14 +516,14 @@ namespace Luth::RG
             if (m_Passes.size() != s_lastSig)
             {
                 s_lastSig = m_Passes.size();
-                LH_CORE_INFO("[RG] barrier trace — {} passes", m_Passes.size());
+                LH_LOG(Renderer, info, "[RG] barrier trace — {} passes", m_Passes.size());
                 for (u32 i = 0; i < m_Passes.size(); ++i)
                 {
                     const auto& p = m_Passes[i];
                     if (p.culled) continue;
                     auto line = [&](const char* kind, const std::string& rname, u32 prod,
                                     ResourceState before, ResourceState after, bool xq, BarrierReason reason) {
-                        LH_CORE_INFO("[RG]   {}[{}] {} {}: {} -> {}  producer={}  xq={}  reason={}",
+                        LH_LOG(Renderer, info, "[RG]   {}[{}] {} {}: {} -> {}  producer={}  xq={}  reason={}",
                             p.name, i, kind, rname, ToString(before), ToString(after),
                             prod == UINT32_MAX ? std::string("-") : std::to_string(prod), xq ? 1 : 0, ToString(reason));
                     };
@@ -541,6 +570,10 @@ namespace Luth::RG
                                                                 VK_ACCESS_2_SHADER_READ_BIT };
             case ResourceState::StorageBufferRead:      return { VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT };
             case ResourceState::StorageBufferWrite:     return { VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT };
+            // Fragment-stage storage (PPLL). Write carries READ too — the store path is RMW
+            // (imageAtomicExchange on heads, atomicAdd on the node counter).
+            case ResourceState::FragmentStorageRead:    return { VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT };
+            case ResourceState::FragmentStorageWrite:   return { VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT };
             case ResourceState::IndirectRead:           return { VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT };
             case ResourceState::AccelerationStructureBuild:
                 return { VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
@@ -570,6 +603,8 @@ namespace Luth::RG
             case ResourceState::ComputeRead:            return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             case ResourceState::ComputeWrite:           return VK_IMAGE_LAYOUT_GENERAL;
             case ResourceState::ComputeReadStorage:     return VK_IMAGE_LAYOUT_GENERAL;
+            case ResourceState::FragmentStorageRead:    return VK_IMAGE_LAYOUT_GENERAL;
+            case ResourceState::FragmentStorageWrite:   return VK_IMAGE_LAYOUT_GENERAL;
             // Buffer states have no image layout — return UNDEFINED (never used for image barriers)
             default:                                    return VK_IMAGE_LAYOUT_UNDEFINED;
         }
@@ -591,6 +626,8 @@ namespace Luth::RG
             case ResourceState::ComputeReadStorage:         return "ComputeReadStorage";
             case ResourceState::StorageBufferRead:          return "StorageBufferRead";
             case ResourceState::StorageBufferWrite:         return "StorageBufferWrite";
+            case ResourceState::FragmentStorageRead:        return "FragmentStorageRead";
+            case ResourceState::FragmentStorageWrite:       return "FragmentStorageWrite";
             case ResourceState::IndirectRead:               return "IndirectRead";
             case ResourceState::AccelerationStructureBuild: return "AccelerationStructureBuild";
             case ResourceState::AccelerationStructureRead:  return "AccelerationStructureRead";
@@ -606,6 +643,57 @@ namespace Luth::RG
             case BarrierReason::Waw:   return "WAW";
             case BarrierReason::Final: return "FINAL";
             default:                   return "?";
+        }
+    }
+
+    // ── Barrier inspector capture ──
+    static std::atomic<bool> s_BarrierCapture{ false };
+    void RenderGraph::SetBarrierCapture(bool e) { s_BarrierCapture.store(e, std::memory_order_relaxed); }
+    bool RenderGraph::BarrierCapture()          { return s_BarrierCapture.load(std::memory_order_relaxed); }
+
+    void RenderGraph::CaptureBarrierRecords(RenderGraphSnapshot& snap) const
+    {
+        for (u32 i = 0; i < (u32)m_Passes.size(); ++i)
+        {
+            const PassNode& p = m_Passes[i];
+
+            auto pushImage = [&](const Barrier& b, bool isPost)
+            {
+                BarrierRecord r;
+                r.resource  = (b.resource.index > 0 && b.resource.index <= m_Resources.size())
+                            ? m_Resources[b.resource.index - 1].desc.name : "?";
+                r.before    = ToString(b.before);
+                r.after     = ToString(b.after);
+                r.reason    = ToString(b.reason);
+                r.passIndex = i;
+                r.isImage   = true;
+                r.isPost    = isPost;
+                r.redundant = (b.before == b.after);
+                snap.numImageBarriers++;
+                if (r.redundant) snap.numRedundantBarriers++;
+                if (i < snap.passes.size()) snap.passes[i].numImageBarriers++;
+                snap.barriers.push_back(std::move(r));
+            };
+
+            for (const Barrier& b : p.preBarriers)  pushImage(b, false);
+            for (const Barrier& b : p.postBarriers) pushImage(b, true);
+
+            for (const BufferBarrier& b : p.bufferPreBarriers)
+            {
+                BarrierRecord r;
+                r.resource  = (b.resource.index > 0 && b.resource.index <= m_Buffers.size())
+                            ? m_Buffers[b.resource.index - 1].desc.name : "?";
+                r.before    = ToString(b.before);
+                r.after     = ToString(b.after);
+                r.reason    = ToString(b.reason);
+                r.passIndex = i;
+                r.isImage   = false;
+                r.redundant = (b.before == b.after);
+                snap.numBufferBarriers++;
+                if (r.redundant) snap.numRedundantBarriers++;
+                if (i < snap.passes.size()) snap.passes[i].numBufferBarriers++;
+                snap.barriers.push_back(std::move(r));
+            }
         }
     }
 
@@ -753,7 +841,7 @@ namespace Luth::RG
                 JobSystem::Execute([](JobSystem::JobArgs args) {
                     RenderPassJob* j = (RenderPassJob*)args.data;
                     RenderPassJob::Execute(j);
-                }, &state.job, &perPassCounter, "RGPassRecord");
+                }, &state.job, &perPassCounter, pass.name.c_str());
                 JobSystem::WaitForCounter(&perPassCounter);
             }
             else
@@ -761,7 +849,7 @@ namespace Luth::RG
                 JobSystem::Execute([](JobSystem::JobArgs args) {
                     RenderPassJob* j = (RenderPassJob*)args.data;
                     RenderPassJob::Execute(j);
-                }, &state.job, &recordCounter, "RGPassRecord");
+                }, &state.job, &recordCounter, pass.name.c_str());
             }
         }
 
@@ -819,6 +907,12 @@ namespace Luth::RG
                 PFN_vkCmdEndDebugUtilsLabelEXT end;
                 ~PassLabelScope() { if (end) end(cmd); }
             } passLabelScope{ primaryCmd, dbgFn.vkCmdBeginDebugUtilsLabelEXT ? dbgFn.vkCmdEndDebugUtilsLabelEXT : nullptr };
+
+            // Per-pass GPU zone — brackets the same region as the debug-utils label. AsyncCompute passes record
+            // into the compute-queue Tracy context; graphics into the graphics-queue context (collected per frame).
+            LH_PROFILE_GPU_ZONE_TRANSIENT(___tracyGpuPass,
+                (pass.queueFamily == QueueFamily::AsyncCompute) ? vkCtx.GetComputeTracyCtx() : vkCtx.GetGraphicsTracyCtx(),
+                primaryCmd, pass.name.c_str());
 
             // Batched pre-barriers (image + buffer combined into one call). Cross-queue handoffs detected during
             // SolveBarriers carry b.crossQueueSrc — in that case the src stage / access become TOP_OF_PIPE / NONE
@@ -969,10 +1063,16 @@ namespace Luth::RG
 
                 if (timers) timers->WriteTimestamp(primaryCmd, timerPassIdx, true);
 
+                // Pipeline-stats query (graphics only) brackets the render pass from OUTSIDE it, spanning
+                // the secondary via inheritedQueries. Gated by the runtime toggle; off costs nothing.
+                const bool doStats = timers && timers->StatsSupported() && GPUTimerPool::StatsEnabled();
+                if (doStats) timers->BeginStats(primaryCmd, timerPassIdx);
+
                 DynamicRendering::BeginRendering(primaryCmd, rpInfo);
                 vkCmdExecuteCommands(primaryCmd, 1, &state.job.CommandBuffer);
                 DynamicRendering::EndRendering(primaryCmd);
 
+                if (doStats) timers->EndStats(primaryCmd, timerPassIdx);
                 if (timers) timers->WriteTimestamp(primaryCmd, timerPassIdx, false);
 
                 if (m_ArchiveSink) m_ArchiveSink->OnPassExecuted((u32)i, *this, primaryCmd, pass.queueFamily);

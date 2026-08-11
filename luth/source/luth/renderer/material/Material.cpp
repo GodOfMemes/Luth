@@ -30,12 +30,8 @@ namespace Luth
         m_GPUData.specularIndex    = GetIndex(MapType::Specular);
         m_GPUData.thicknessIndex   = GetIndex(MapType::Thickness);
 
-        float uniformMetal;
-        m_GPUData.metalness = GetUniformData("u_Metalness", &uniformMetal, sizeof(float))
-            ? uniformMetal : m_GPUData.metalness;
-        float uniformRough;
-        m_GPUData.roughness = GetUniformData("u_Roughness", &uniformRough, sizeof(float))
-            ? uniformRough : m_GPUData.roughness;
+        // metalness/roughness are direct GPUData fields (set via accessors / deserialize); the legacy
+        // u_* uniform channel never reached the GPU (no Set-1 block in pbr). alphaCutoff stays derived.
         m_GPUData.alphaCutoff = (m_RenderMode == RenderMode::Cutout) ? m_AlphaCutoff : 0.0f;
 
         // Flags layout documented on GPUMaterialData. Existing bits 0-4 unchanged for byte-identical
@@ -63,11 +59,29 @@ namespace Luth
         PackUV(MapType::Normal,    18);
         PackUV(MapType::Metalness, 20);
         PackUV(MapType::Occlusion, 22);
+
+        // bits 8-15: RT graph eval variant (0 = stock decode; raster uses a per-material shader instead).
+        m_GPUData.flags |= (m_GraphVariant & 0xFFu) << 8;
     }
 
     void Material::Serialize(nlohmann::json& json) const
     {
+        LH_PROFILE_FUNCTION();
         json["shader"] = m_ShaderUUID.ToString();
+        if (m_GraphShaderUUID.IsValid())
+            json["graph_shader"] = m_GraphShaderUUID.ToString();   // only present when the material carries a graph
+        if (HasGraph())
+        {
+            nlohmann::json g;
+            for (const auto& n : m_Graph.nodes)
+                g["nodes"].push_back({ {"id", n.id}, {"type", static_cast<int>(n.type)},
+                    {"value", { n.value.x, n.value.y, n.value.z, n.value.w }},
+                    {"tex", n.tex}, {"pos", { n.pos.x, n.pos.y }} });
+            for (const auto& l : m_Graph.links)
+                g["links"].push_back({ {"from", l.fromNode}, {"fromSlot", l.fromSlot},
+                    {"to", l.toNode}, {"toSlot", l.toSlot} });
+            json["graph"] = std::move(g);
+        }
 
         json["render_mode"] = static_cast<int>(m_RenderMode);
         json["alpha_cutoff"] = m_AlphaCutoff;
@@ -78,6 +92,14 @@ namespace Luth
 
         // Serialize color
         json["color"] = { m_GPUData.color.r, m_GPUData.color.g, m_GPUData.color.b, m_GPUData.color.a };
+
+        // Serialize emissive (rgb = linear factor, a = HDR strength) — direct GPUData field like color.
+        json["emissive"] = { m_GPUData.emissive.r, m_GPUData.emissive.g,
+                             m_GPUData.emissive.b, m_GPUData.emissive.a };
+
+        // Serialize metalness/roughness — direct GPUData fields (the u_* uniform channel is dead).
+        json["metalness"] = m_GPUData.metalness;
+        json["roughness"] = m_GPUData.roughness;
 
         // Serialize Uniforms
         nlohmann::json uniformsJson;
@@ -124,8 +146,40 @@ namespace Luth
 
     void Material::Deserialize(const nlohmann::json& json)
     {
+        LH_PROFILE_FUNCTION();
         m_ShaderUUID = UUID::FromString(json["shader"].get<std::string>());
-        
+        m_GraphShaderUUID = json.contains("graph_shader")
+            ? UUID::FromString(json["graph_shader"].get<std::string>()) : UUID::Invalid();
+
+        m_Graph = {};
+        if (json.contains("graph") && json["graph"].is_object())
+        {
+            const auto& g = json["graph"];
+            if (g.contains("nodes"))
+                for (const auto& n : g["nodes"])
+                {
+                    MatNode node;
+                    node.id   = n.value("id", 0u);
+                    node.type = static_cast<MatNodeType>(n.value("type", 0));
+                    if (n.contains("value") && n["value"].is_array() && n["value"].size() == 4)
+                        node.value = Vec4(n["value"][0], n["value"][1], n["value"][2], n["value"][3]);
+                    node.tex  = n.value("tex", 0u);
+                    if (n.contains("pos") && n["pos"].is_array() && n["pos"].size() == 2)
+                        node.pos = Vec2(n["pos"][0], n["pos"][1]);
+                    m_Graph.nodes.push_back(node);
+                }
+            if (g.contains("links"))
+                for (const auto& l : g["links"])
+                {
+                    MatLink link;
+                    link.fromNode = l.value("from", 0u);
+                    link.fromSlot = static_cast<u8>(l.value("fromSlot", 0));
+                    link.toNode   = l.value("to", 0u);
+                    link.toSlot   = static_cast<u8>(l.value("toSlot", 0));
+                    m_Graph.links.push_back(link);
+                }
+        }
+
         if (json.contains("uniforms"))
             m_CachedUniformJSON = json["uniforms"];
 
@@ -142,6 +196,24 @@ namespace Luth
 
         if (json.contains("color") && json["color"].is_array() && json["color"].size() == 4)
             m_GPUData.color = Vec4(json["color"][0], json["color"][1], json["color"][2], json["color"][3]);
+        else if (m_CachedUniformJSON.is_object() && m_CachedUniformJSON.contains("u_AlbedoColor")
+                 && m_CachedUniformJSON["u_AlbedoColor"].is_array() && m_CachedUniformJSON["u_AlbedoColor"].size() == 4)
+        {
+            // Legacy import: base color landed in the dead u_* uniform channel. Recover it.
+            const auto& c = m_CachedUniformJSON["u_AlbedoColor"];
+            m_GPUData.color = Vec4(c[0], c[1], c[2], c[3]);
+        }
+
+        // Metalness/roughness — direct fields; fall back to the legacy (dead) u_* uniform JSON so
+        // materials imported before these became direct fields recover their factors.
+        f32 legacyMetal = m_GPUData.metalness, legacyRough = m_GPUData.roughness;
+        if (m_CachedUniformJSON.is_object())
+        {
+            legacyMetal = m_CachedUniformJSON.value("u_Metalness", legacyMetal);
+            legacyRough = m_CachedUniformJSON.value("u_Roughness", legacyRough);
+        }
+        m_GPUData.metalness = json.value("metalness", legacyMetal);
+        m_GPUData.roughness = json.value("roughness", legacyRough);
 
         m_Maps.clear();
         for (const auto& texJson : json["textures"]) {
@@ -152,10 +224,30 @@ namespace Luth
             tex.useTexture = static_cast<bool>(texJson.value("useTexture", 0));
             m_Maps.push_back(tex);
         }
+
+        // Emissive factor (rgb) + HDR strength (a). Direct GPUData field, mirrors color.
+        if (json.contains("emissive") && json["emissive"].is_array() && json["emissive"].size() == 4)
+        {
+            m_GPUData.emissive = Vec4(json["emissive"][0], json["emissive"][1],
+                                      json["emissive"][2], json["emissive"][3]);
+        }
+        else
+        {
+            // Migration for files predating the emissive field. Preserve the prior "emissive texture
+            // emits at full" behavior so existing emissive-textured assets don't go dark in the RT
+            // path; default to no emission otherwise. Gated on key-absence only — never overrides a
+            // deliberate factor from a newer save (those always carry the "emissive" key).
+            bool hasEmissiveTex = false;
+            for (const auto& m : m_Maps)
+                if (m.type == MapType::Emissive && m.Uuid.IsValid()) { hasEmissiveTex = true; break; }
+            m_GPUData.emissive = hasEmissiveTex ? Vec4(1.0f, 1.0f, 1.0f, 1.0f)
+                                                : Vec4(0.0f, 0.0f, 0.0f, 1.0f);
+        }
     }
 
     void Material::InitializeStorage()
     {
+        LH_PROFILE_FUNCTION();
         auto shader = GetShader();
         if (!shader) return;
 
@@ -205,6 +297,7 @@ namespace Luth
 
     bool Material::SetUniformData(const std::string& name, const void* data, uint32_t size)
     {
+        LH_PROFILE_FUNCTION();
         if (m_UniformStorage.empty()) InitializeStorage();
         if (m_UniformStorage.empty()) return false;
 
@@ -231,6 +324,7 @@ namespace Luth
 
     bool Material::GetUniformData(const std::string& name, void* outData, uint32_t size) const
     {
+        LH_PROFILE_FUNCTION();
         if (m_UniformStorage.empty()) return false;
         auto shader = GetShader();
         if (!shader) return false;

@@ -105,7 +105,6 @@ project "Luth"
       "ImGuizmo",
       "Tracy",
       --"vulkan-1",
-      "shaderc_shared",
       "spirv-cross",
       "Jolt",
       --"ws2_32",
@@ -116,6 +115,11 @@ project "Luth"
       links { "vulkan-1", "ws2_32", "dbghelp" }
    filter "system:linux"
       links { "vulkan", "pthread" }
+      linkoptions
+      {
+         "-Wl,-rpath-link," .. LibraryDir["vulkan"],
+         "-l:libslang-compiler.so.0.2026.1.2"
+      }
    filter {}
 
    filter "configurations:Debug"

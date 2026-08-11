@@ -21,7 +21,7 @@ namespace Luth
         if (s_Running) return;
         s_Running = true;
         s_Thread = std::thread(ThreadEntryPoint);
-        LH_CORE_INFO("I/O Thread Initialized");
+        LH_LOG(Jobs, info, "I/O Thread Initialized");
     }
 
     void IOThread::Shutdown()
@@ -66,7 +66,7 @@ namespace Luth
             if (file.is_open())
                 file.write((const char*)wreq.Data.data(), wreq.Data.size());
             else
-                LH_CORE_ERROR("IOThread: Failed to write file: {0}", wreq.Path);
+                LH_LOG(Jobs, error, "IOThread: Failed to write file: {0}", wreq.Path);
         }
     }
 
@@ -86,6 +86,9 @@ namespace Luth
 
     static IOCallbackSlot s_CallbackSlots[MAX_IO_CALLBACKS];
     static std::atomic<u32> s_NextSlot = 0;
+    static std::atomic<u32> s_DroppedReads = 0;
+
+    u32 IOThread::GetDroppedCallbackCount() { return s_DroppedReads.load(std::memory_order_relaxed); }
 
     static IOCallbackSlot* AcquireSlot()
     {
@@ -160,7 +163,7 @@ namespace Luth
                     if (file.is_open())
                         file.write((const char*)wreq.Data.data(), wreq.Data.size());
                     else
-                        LH_CORE_ERROR("IOThread: Failed to write file: {0}", wreq.Path);
+                        LH_LOG(Jobs, error, "IOThread: Failed to write file: {0}", wreq.Path);
                 }
             }
 
@@ -174,13 +177,14 @@ namespace Luth
                 IOCallbackSlot* slot = AcquireSlot();
                 if (!slot)
                 {
-                    LH_CORE_ERROR("IOThread: All callback slots busy. Dropping callback for: {0}", req.Path);
+                    s_DroppedReads.fetch_add(1, std::memory_order_relaxed);
+                    LH_LOG(Jobs, error, "IOThread: All callback slots busy. Dropping callback for: {0}", req.Path);
                     continue;
                 }
 
                 if (!file.is_open())
                 {
-                    LH_CORE_ERROR("IOThread: Failed to open file: {0}", req.Path);
+                    LH_LOG(Jobs, error, "IOThread: Failed to open file: {0}", req.Path);
                     slot->Callback = req.Callback;
                     slot->Data.clear();
                     JobSystem::Execute(IOCallbackJob, slot, nullptr, "IOCallback");

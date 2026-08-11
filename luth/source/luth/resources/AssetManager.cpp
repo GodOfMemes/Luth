@@ -49,8 +49,9 @@ namespace Luth
 
     void AssetManager::LoadAsync(UUID handle)
     {
+        LH_PROFILE_FUNCTION();
         std::lock_guard<std::mutex> lock(s_AssetMutex);
-        
+
         // Check if already loaded or currently loading
         if (s_Assets.find(handle) != s_Assets.end()) return;
         if (s_LoadingAssets.find(handle) != s_LoadingAssets.end()) return;
@@ -58,7 +59,7 @@ namespace Luth
         const auto& info = AssetDatabase::GetMetadata(handle);
         if (info.Path.empty())
         {
-            LH_CORE_ERROR("AssetManager: UUID {0} not found in DB", handle.ToString());
+            LH_LOG(Assets, error, "AssetManager: UUID {0} not found in DB", handle.ToString());
             return;
         }
 
@@ -73,6 +74,8 @@ namespace Luth
 
     std::shared_ptr<Asset> AssetManager::LoadImmediate(UUID handle)
     {
+        LH_PROFILE_FUNCTION();
+
         // Check cache first
         if (auto asset = GetAsset<Asset>(handle)) return asset;
 
@@ -93,8 +96,16 @@ namespace Luth
 
         if (!artifactReady) return nullptr;
 
-        // 2. Load Data from Artifact
+        // 2. Load Data from Artifact. A present-but-incompatible artifact (an older schema after a
+        // format-version bump) fails to deserialize — regenerate it once from source so a schema bump
+        // self-heals instead of silently failing every load until the artifact cache is wiped.
         auto data = DeserializeArtifact(info.Type, artifactPath);
+        if (!data && s_Importers.find(info.Type) != s_Importers.end())
+        {
+            LH_LOG(Assets, warn, "AssetManager: artifact incompatible (schema bump?) -- reimporting {0}", info.Path.string());
+            if (s_Importers[info.Type]->Import(info.Path, artifactPath))
+                data = DeserializeArtifact(info.Type, artifactPath);
+        }
         if (!data) return nullptr;
 
         // 3. Create Asset (Main Thread)
@@ -110,6 +121,8 @@ namespace Luth
 
     void AssetManager::Import(UUID handle)
     {
+        LH_PROFILE_FUNCTION();
+
         const auto& info = AssetDatabase::GetMetadata(handle);
         if (info.Path.empty()) return;
 
@@ -117,10 +130,10 @@ namespace Luth
         
         if (s_Importers.find(info.Type) != s_Importers.end())
         {
-            LH_CORE_INFO("Importing Asset: {0}", info.Path.string());
+            LH_LOG(Assets, debug, "Importing Asset: {0}", info.Path.string());
             if (!s_Importers[info.Type]->Import(info.Path, artifactPath))
             {
-                LH_CORE_ERROR("Failed to import asset: {0}", info.Path.string());
+                LH_LOG(Assets, error, "Failed to import asset: {0}", info.Path.string());
             }
         }
     }
@@ -151,6 +164,7 @@ namespace Luth
 
     u32 AssetManager::Trim(bool force)
     {
+        LH_PROFILE_FUNCTION();
         std::lock_guard<std::mutex> lock(s_AssetMutex);
         f32 currentTime = Time::GetTime();
         const f32 timeout = 5.0f;
@@ -174,11 +188,13 @@ namespace Luth
 
     void AssetManager::ImportDirty()
     {
+        LH_PROFILE_FUNCTION();
+
         const auto& dirtyAssets = AssetDatabase::GetDirtyAssets();
         if (dirtyAssets.empty()) return;
 
         std::vector<UUID> assetsToImport = dirtyAssets;
-        LH_CORE_INFO("Importing {} assets...", assetsToImport.size());
+        LH_LOG(Assets, info, "Importing {} assets...", assetsToImport.size());
 
         JobSystem::Counter importCounter(0);
         JobSystem::Dispatch((u32)assetsToImport.size(), 1, [](JobSystem::JobArgs args) {
@@ -193,6 +209,7 @@ namespace Luth
 
     std::unique_ptr<AssetData> AssetManager::DeserializeArtifact(AssetType type, const fs::path& artifactPath)
     {
+        LH_PROFILE_FUNCTION();
         if (type == AssetType::Texture) {
             auto d = std::make_unique<TextureAssetData>();
             if (AssetSerializer::DeserializeTexture(artifactPath, *d)) return d;
@@ -222,6 +239,7 @@ namespace Luth
 
     std::shared_ptr<Asset> AssetManager::FinalizeAsset(AssetType type, AssetData* data, const fs::path& sourcePath)
     {
+        LH_PROFILE_FUNCTION();
         if (type == AssetType::Texture) {
             auto* d = static_cast<TextureAssetData*>(data);
             return Texture::Create(d->Width, d->Height, d->Format, d->Pixels.data(), d->Settings);
@@ -230,8 +248,9 @@ namespace Luth
             auto* d = static_cast<ModelAssetData*>(data);
             if (d->IsSkinned)
                 return Model::Create(d->Meshes, d->Materials, d->SkeletonData, d->AnimationClipUUIDs, true);
-            else
-                return Model::Create(d->Meshes, d->Materials);
+            auto model = Model::Create(d->Meshes, d->Materials);
+            model->SetSceneGraph(std::move(d->Nodes), std::move(d->Cameras), std::move(d->Lights));
+            return model;
         }
         else if (type == AssetType::Material) {
             auto* d = static_cast<MaterialAssetData*>(data);
@@ -280,7 +299,7 @@ namespace Luth
             {
                 // Font and Scene types are handled directly — not an error
                 if (req->Type != AssetType::Font && req->Type != AssetType::Scene)
-                    LH_CORE_ERROR("AssetManager: No importer for type {0}", (int)req->Type);
+                    LH_LOG(Assets, error, "AssetManager: No importer for type {0}", (int)req->Type);
             }
         }
 

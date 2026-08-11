@@ -13,36 +13,33 @@ namespace Luth
     class ViewportRenderer;
     class GizmoController;
 
-    // ImGui-DrawList overlays projected into the Scene viewport: light icons, camera frustums,
-    // bone debug lines, world-space AABBs. Each overlay is gated by a flag in EditorSettings.
-    // World-space line segments are clipped against the camera near-plane before being drawn.
+    // 2D billboarded selection icons for lights, cameras, fog volumes, and wind, drawn over the Scene
+    // viewport and gated by EditorSettings scopes. The icons double as click-to-select hit targets. The
+    // in-world wireframe gizmos (ranges, frustums, AABBs, skeletons, fog shells, wind arrows) render via
+    // the engine's GPU debug-draw (luth/scene/systems/DebugGizmos), not here.
     class ViewportOverlays
     {
     public:
         ViewportOverlays(ViewportRenderer& viewport, GizmoController& gizmo)
             : m_Viewport(viewport), m_Gizmo(gizmo) {}
 
-        // Draws all four world-space overlays gated by EditorSettings flags.
+        // Draws all selection-icon overlays gated by EditorSettings scopes.
         void DrawAll(const std::shared_ptr<Scene>& scene,
                      const EditorCamera& camera,
                      Entity selected);
 
     private:
-        void DrawBoneDebug(const EditorCamera& camera, Entity selected);
         void DrawLights(const std::shared_ptr<Scene>& scene,
                         const EditorCamera& camera, Entity selected);
         void DrawCameras(const std::shared_ptr<Scene>& scene,
                          const EditorCamera& camera, Entity selected);
-        void DrawAABBs(const std::shared_ptr<Scene>& scene,
-                       const EditorCamera& camera);
+        void DrawFog(const std::shared_ptr<Scene>& scene,
+                     const EditorCamera& camera, Entity selected);
+        void DrawWind(const std::shared_ptr<Scene>& scene,
+                      const EditorCamera& camera, Entity selected);
 
         ImVec2 ProjectToScreen(const EditorCamera& camera, const Vec3& worldPos) const;
-        bool   IsInViewport(const ImVec2& p) const;
         static ImU32 LightColorToImU32(const Vec3& color, float alpha = 0.85f);
-        bool   ClipLineToNearPlane(const EditorCamera& camera, Vec3& a, Vec3& b) const;
-        void   DrawClippedLine(ImDrawList* drawList, const EditorCamera& camera,
-                               const Vec3& worldA, const Vec3& worldB,
-                               ImU32 color, float thickness = 1.0f);
 
         ViewportRenderer& m_Viewport;
         GizmoController&  m_Gizmo;

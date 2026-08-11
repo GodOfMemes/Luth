@@ -16,6 +16,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Luth
@@ -47,6 +48,10 @@ namespace Luth
         void BuildGPUObjectBuffer(const RenderSnapshot& snapshot);
         u32  EnsureMaterialRegistered(std::shared_ptr<Material> material);
 
+        // Perf observability: meshes skipped last build because the per-frame GPU object cap
+        // (k_MaxGPUObjects) was hit — a silent draw-drop. >0 means raise the cap or add culling/LOD.
+        static u32 GetDroppedObjectCount();
+
         // Render-graph contributions.
         void AddCullPass(RG::RenderGraph& rg,
                          RG::BufferHandle objectBuffer, RG::BufferHandle indirectBuffer,
@@ -64,7 +69,8 @@ namespace Luth
                                            RG::ResourceHandle rtShadowMask,
                                            RG::ResourceHandle diHandle,
                                            RG::ResourceHandle giDIHandle,
-                                           RG::ResourceHandle reflHandle);
+                                           RG::ResourceHandle reflHandle,
+                                           RG::ResourceHandle diSpecHandle);
 
         // ---- Accessors ----
         VkDescriptorSetLayout       GetSet5Layout()         const { return m_ObjectSSBODescLayout; }
@@ -93,6 +99,10 @@ namespace Luth
         void BuildPBRPipelines(const std::vector<VkDescriptorSetLayout>& geoLayouts);
         void BuildDepthPrepassPipelines(const std::vector<VkDescriptorSetLayout>& geoLayouts);
         void BuildSlimGBufferPipelines(const std::vector<VkDescriptorSetLayout>& geoLayouts);
+
+        // Maps a node-graph material's fragment-shader UUID to its SPIR-V (cached). Invalid → the stock
+        // m_PBRFragSpv; an unresolved UUID also falls back to stock so a not-yet-loaded graph never stalls.
+        const std::vector<u32>& ResolveFragSpv(const UUID& fragShaderUUID);
 
         RenderPipeline* m_Pipeline = nullptr;
 
@@ -128,10 +138,14 @@ namespace Luth
         std::vector<u32>            m_DepthPrepassVertSpv;
         std::vector<u32>            m_DepthPrepassSkinnedVertSpv;
 
-        // Slim G-buffer pipelines + SPV. Depth-EQUAL against prepass depth, no depth write,
-        // full PBR vtx stride. Opaque-only iteration; cutouts deferred.
+        // Slim G-buffer pipelines + SPV. Opaque: depth-EQUAL against prepass depth, no depth write.
+        // Cutout: shares the shaders but tests LESS_OR_EQUAL + writes its own depth (the opaque-only
+        // prepass omits cutout) + alpha-tests in slim_gbuffer.slang — so RT shadows/reflections + GTAO
+        // reconstruct from the holed cutout surface, not the geometry behind it. Full PBR vtx stride.
         std::unique_ptr<VKPipeline> m_SlimGBufferPipeline;
         std::unique_ptr<VKPipeline> m_SlimGBufferSkinnedPipeline;
+        std::unique_ptr<VKPipeline> m_SlimGBufferCutoutPipeline;
+        std::unique_ptr<VKPipeline> m_SlimGBufferCutoutSkinnedPipeline;
         std::vector<u32>            m_SlimGBufferVertSpv;
         std::vector<u32>            m_SlimGBufferSkinnedVertSpv;
         std::vector<u32>            m_SlimGBufferFragSpv;
@@ -142,5 +156,18 @@ namespace Luth
         std::vector<u32> m_PBRVertSpv;
         std::vector<u32> m_PBRFragSpv;
         std::vector<u32> m_PBRSkinnedVertSpv;
+
+        // Shaded-wireframe overlay: flat line-polygon pipelines redrawn over the lit fill (static + skinned).
+        std::unique_ptr<VKPipeline> m_WireframeOverlayPipeline;
+        std::unique_ptr<VKPipeline> m_WireframeOverlaySkinnedPipeline;
+        std::vector<u32>            m_WireframeOverlayFragSpv;
+
+        // Per-material node-graph fragment SPIR-V, keyed by the material's graph-shader UUID. Populated
+        // lazily from ShaderLibrary in ResolveFragSpv; the stock pbr fragment is never stored here.
+        std::unordered_map<UUID, std::vector<u32>, UUIDHash> m_GraphFragSpv;
+
+        // Materials whose graph has been lowered + compiled this run (once-guard for the lazy codegen
+        // trigger in EnsureMaterialRegistered). An editor edit clears a material's entry to re-emit.
+        std::unordered_set<UUID, UUIDHash> m_GraphCompiled;
     };
 }

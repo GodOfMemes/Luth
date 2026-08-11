@@ -23,7 +23,7 @@ namespace Luth
         s_AssetsRoot.clear();
         s_HasProject = false;
 
-        LH_CORE_INFO("FileSystem: Engine root = {}", s_EngineRoot.string());
+        LH_LOG(Assets, info, "FileSystem: Engine root = {}", s_EngineRoot.string());
     }
 
     // ── Phase 2: Set project root (called when user selects a project) ──
@@ -34,8 +34,8 @@ namespace Luth
         s_AssetsRoot  = s_ProjectRoot / "assets";
         s_HasProject  = true;
 
-        LH_CORE_INFO("FileSystem: Project root = {}", s_ProjectRoot.string());
-        LH_CORE_INFO("FileSystem: Assets root  = {}", s_AssetsRoot.string());
+        LH_LOG(Assets, info, "FileSystem: Project root = {}", s_ProjectRoot.string());
+        LH_LOG(Assets, info, "FileSystem: Assets root  = {}", s_AssetsRoot.string());
 
         EnsureBaseStructure();
     }
@@ -180,18 +180,10 @@ namespace Luth
             { ".tga",     AssetType::Texture  },
             { ".mat",     AssetType::Material },
             { ".physmat", AssetType::PhysicsMaterial },
-            // .glsl is reserved for #include headers (common/*.glsl) loaded by the shader compiler's
-            // Includer at compile time, NOT standalone shader assets — kept out of the asset map so
-            // the asset DB skips importing them.
-            { ".vert",    AssetType::Shader   },
-            { ".frag",    AssetType::Shader   },
-            { ".comp",    AssetType::Shader   },
-            { ".rgen",    AssetType::Shader   },
-            { ".rmiss",   AssetType::Shader   },
-            { ".rchit",   AssetType::Shader   },
-            { ".rahit",   AssetType::Shader   },
-            { ".rint",    AssetType::Shader   },
-            { ".rcall",   AssetType::Shader   },
+            // .slang carries its stage in a [shader("...")] attribute, not the extension; the importer
+            // resolves it via reflection. Shared common/*.slang include modules have no [shader] entry,
+            // so the importer skips them (no standalone artifact).
+            { ".slang",   AssetType::Shader   },
             { ".ttf",     AssetType::Font     },
             { ".luth",    AssetType::Scene    },
             { ".anim",    AssetType::Animation },
@@ -202,7 +194,14 @@ namespace Luth
             [](unsigned char c) { return std::tolower(c); });
 
         auto it = extensionMap.find(ext);
-        return (it != extensionMap.end()) ? it->second : AssetType::None;
+        AssetType type = (it != extensionMap.end()) ? it->second : AssetType::None;
+
+        // common/*.slang are import-only modules (like common/*.glsl includes) — compiling a no-entry
+        // module standalone collides in Slang's cache; consumers resolve the import from disk. Skip it.
+        if (type == AssetType::Shader && ext == ".slang" && path.parent_path().filename() == "common")
+            return AssetType::None;
+
+        return type;
     }
 
     void FileSystem::CreateDirectories(const fs::path& path) {

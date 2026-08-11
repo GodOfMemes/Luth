@@ -5,6 +5,7 @@
 
 #include <imgui.h>
 #include <entt/entt.hpp>
+#include <vector>
 
 namespace Luth
 {
@@ -28,16 +29,18 @@ namespace Luth
 
         // Runs ImGuizmo manipulator + drag-undo coalesce + Q/W/E/R shortcuts.
         // Early-returns when selected is null/invalid (matches pre-refactor behavior).
+        // acceptsShortcuts gates the Q/W/E/R tool switches — fed by viewport hover.
         void DrawManipulator(const Mat4& view, const Mat4& proj,
                              const ImVec2* bounds, const Vec2& size,
                              Entity& selected, Scene* scene,
-                             bool isFocused, bool cameraFlying);
+                             bool acceptsShortcuts, bool cameraFlying);
 
-        // Renders a world-placed icon + hit-tests click-to-select for that entity.
-        // hasValidSelection gates the ImGuizmo::IsOver() guard (stale otherwise).
+        // Renders a world-placed icon + hit-tests click-to-select for that entity. Billboard size
+        // scales with the camera→icon world distance (clamped), times the Gizmos > Icon Size setting;
+        // pass that distance. hasValidSelection gates the ImGuizmo::IsOver() guard (stale otherwise).
         void DrawGizmoIcon(ImDrawList* drawList, ImVec2 screenPos, const char* icon,
                            ImU32 color, entt::entity entity,
-                           bool isHovered, bool hasValidSelection);
+                           bool isHovered, bool hasValidSelection, float distance);
 
         bool         WasIconClicked() const { return m_IconClicked; }
         entt::entity IconEntity()     const { return m_IconEntity; }
@@ -51,6 +54,12 @@ namespace Luth
         Vec3 m_StartPos{};
         Vec3 m_StartRot{};
         Vec3 m_StartScale{};
+
+        // Multi-select drag: root-filtered selection + each entity's start TRS, captured on drag
+        // start. The gizmo's per-frame world-space delta is applied to all of them (pivot = the
+        // active/primary entity); committed as one compound undo at drag end.
+        struct GizmoDragStart { Entity entity; Vec3 pos, rot, scale; };
+        std::vector<GizmoDragStart> m_DragStarts;
 
         // Icon click wins over pick result when both fire in the same frame.
         bool         m_IconClicked = false;

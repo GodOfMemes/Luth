@@ -19,12 +19,14 @@
 #include "luth/renderer/subsystems/GeometrySubsystem.h"
 #include "luth/renderer/subsystems/GTAOSubsystem.h"
 #include "luth/renderer/subsystems/VolumetricSubsystem.h"
+#include "luth/renderer/subsystems/TransparencySubsystem.h"
 #include "luth/renderer/subsystems/PostProcessSubsystem.h"
 #include "luth/renderer/subsystems/EditorOverlaysSubsystem.h"
 #include "luth/renderer/subsystems/DebugDrawSubsystem.h"
 #include "luth/renderer/subsystems/RtSubsystem.h"
 #include "luth/renderer/subsystems/RtRestirSubsystem.h"
 #include "luth/renderer/subsystems/RtRestirGiSubsystem.h"
+#include "luth/renderer/subsystems/SlangParityGuard.h"
 #include "luth/renderer/subsystems/PathTraceSubsystem.h"
 #include "luth/renderer/subsystems/ReflectionsSubsystem.h"
 #include "luth/renderer/subsystems/SkinningSubsystem.h"
@@ -98,9 +100,11 @@ namespace Luth
         // sampler (4) are stable — replicated across all slots at WriteView time.
         std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> globalDescriptorSet{};
 
-        // Bloom half-res ping-pong textures (RGBA16F).
-        std::shared_ptr<Texture> bloomA;
-        std::shared_ptr<Texture> bloomB;
+        // Bloom pyramid mips (RGBA16F STORAGE+SAMPLED). mip[0] is half-res, each subsequent mip
+        // halves again. Prefilter writes mip[0]; downsample fills 1..N-1; upsample accumulates
+        // additively back down into mip[0], which the composite samples. see arch/rendering-pipeline.md.
+        static constexpr u32 kBloomMipCount = 6;
+        std::array<std::shared_ptr<Texture>, kBloomMipCount> bloomMip{};
 
         // GTAO half-res storage textures.
         std::shared_ptr<Texture> gtaoLinearDepth;
@@ -123,13 +127,14 @@ namespace Luth
         std::shared_ptr<Texture> volInScatterHistA;
         std::shared_ptr<Texture> volInScatterHistB;
 
-        // Bloom extract / blur / composite — bind view's SceneColor +
-        // bloomA/B + shared PP UBO. Cycled — UpdateUBO writes binding 2 of
-        // all 4 sets atomically against the per-frame slot.
-        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> bloomExtractDescSet{};
-        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> bloomBlurHDescSet{};
-        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> bloomBlurVDescSet{};
-        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> compositeDescSet{};
+        // Bloom pyramid descriptor sets. Prefilter is cycled — binding 0 (scene/TAA source) is
+        // rebound per frame by UpdateBloomCompositeInput (UAB). Down/up sets are single: they
+        // reference only stable per-view mip textures, written once per resize. Composite stays
+        // cycled (UpdateUBO writes its UBO binding 2 against the per-frame slot).
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT>   bloomPrefilterDescSet{};
+        std::array<VkDescriptorSet, kBloomMipCount - 1>     bloomDownDescSet{};
+        std::array<VkDescriptorSet, kBloomMipCount - 1>     bloomUpDescSet{};
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT>   compositeDescSet{};
 
         // GTAO compute passes.
         VkDescriptorSet gtaoPrefilterDescSet = VK_NULL_HANDLE;
@@ -178,6 +183,21 @@ namespace Luth
         // alloc time, propagates to all slots. b0/b1/b2 rebound each frame by UploadLightingResources.
         std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> lightDescSet{};
 
+        // Set 6 (transparent pass-local). Cycled — b0 (fog atlas sampler3D) parity-rewrites per
+        // frame like volCompositeDescSet's b1; b1/b2 (OIT heads + nodes) written when the PPLL lands.
+        std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> transparentDescSet{};
+
+        // PPLL OIT — heads: R32_Uint storage image (per-pixel list head; cleared per frame by
+        // OITClear, so no bootstrap clear). nodes: Garlic device-local large-tagged buffer
+        // `{count, pad[3], OITNode[W*H*budget]}` — ReSTIR-reservoir lifecycle (reserved tag, freed
+        // only on resize / budget change / release). oitLayersCached mirrors volQualityCached so a
+        // runtime budget change reallocates. Resolve set: b0 heads + b1 nodes (single, stable).
+        std::shared_ptr<Texture> oitHeads;
+        Memory::GPUSubRegion     oitNodes{};
+        u32                      oitNodesTag = 0;
+        u32                      oitLayersCached = ~0u;
+        VkDescriptorSet          oitResolveDescSet = VK_NULL_HANDLE;
+
         // Cluster debug viz: single set, 1 binding = SceneDepth sampler. Stable per-view; written
         // by WriteClusterVizView at AllocateViewResources time.
         VkDescriptorSet clusterVizDescSet = VK_NULL_HANDLE;
@@ -217,8 +237,8 @@ namespace Luth
         std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> rtShadowPassDescSet{};
 
         // ReSTIR DI (Bitterli 2020). restirReservoir[2] is a ping-pong pair of Garlic device-local
-        // large-tagged buffers (w*h*32 B each) reused across frames — freed only on resize via
-        // FreeTag. Tags stay in NextReservoirTag's reserved high range, disjoint from the per-frame
+        // large-tagged buffers (w*h*32 B each) reused across frames — destroyed on resize via
+        // FreeTagAndDestroy. Tags stay in NextReservoirTag's reserved high range, disjoint from the per-frame
         // FreeTag(N-2) sweep. Temporal reuse reads last frame's reservoir (prev) while writing this
         // frame's (curr); parity = frameAbs & 1u picks which slot is curr — Set 2 b2/b4 rebound
         // per frame to swap. restirDI is viewport-sized rgba16f STORAGE+SAMPLED (demodulated diffuse
@@ -233,6 +253,10 @@ namespace Luth
         Memory::GPUSubRegion restirSpatial{};
         u32 restirSpatialTag = 0;
         std::shared_ptr<Texture> restirDI;
+        // Demodulated specular DI (#154) — rgb = Li·[D·G/(4·NoL·NoV)]·NdotL·W (F0-free, remodulated by
+        // pbr.frag's split-sum envBRDF at Set 3 b8). Shade writes it at Set 2 b8; the DiSpecular SVGF
+        // channel denoises it. Same shape as restirDI; written every frame so no bootstrap clear.
+        std::shared_ptr<Texture> restirDISpec;
         std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> restirDescSet{};
 
         // ReSTIR GI (Ouyang 2021) — sibling of the DI reservoirs above, w*h*64 B each (GIReservoir is
@@ -284,6 +308,19 @@ namespace Luth
         std::shared_ptr<Texture> svgfGiAtrous[2];
         VkDescriptorSet svgfGiMomentsDescSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
         VkDescriptorSet svgfGiAtrousDescSet[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        // Half-res GI: svgfGi* history + reservoirs allocate at half extent; the à-trous final writes
+        // svgfGiHalf, a bilateral upscale resolves it into the full-res svgfGiDenoised. giHalfCached
+        // drives EnsureViewResources realloc on a runtime toggle.
+        std::shared_ptr<Texture> svgfGiHalf;
+        u32 giHalfCached = ~0u;
+        VkDescriptorSet giUpscaleDescSet = VK_NULL_HANDLE;   // half-res GI bilateral-upscale set (Set 1)
+        // Half-res DI (both channels): à-trous finals write svgfDiHalf / svgfDiSpecHalf; bilateral upscales
+        // resolve them into the full-res svgfDenoised / svgfDiSpecDenoised. diHalfCached drives realloc.
+        std::shared_ptr<Texture> svgfDiHalf;
+        std::shared_ptr<Texture> svgfDiSpecHalf;
+        u32 diHalfCached = ~0u;
+        VkDescriptorSet diUpscaleDescSet     = VK_NULL_HANDLE;   // half-res DI diffuse upscale set
+        VkDescriptorSet diSpecUpscaleDescSet = VK_NULL_HANDLE;   // half-res DI specular upscale set
 
         // RT-reflection specular SVGF (rt-renderer D.1) — flat parallel to the GI SVGF fields. A third
         // SvgfDenoiser instance (DenoiserChannel::Reflections) denoises reflRadiance via the hit-distance
@@ -299,6 +336,24 @@ namespace Luth
         std::shared_ptr<Texture> svgfSpecAtrous[2];
         VkDescriptorSet svgfSpecMomentsDescSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
         VkDescriptorSet svgfSpecAtrousDescSet[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        // Half-res reflections: the à-trous final writes svgfSpecHalf; a bilateral upscale resolves it into
+        // the full-res svgfSpecDenoised. reflHalfCached drives realloc. Mirrors the svgfDiSpecHalf trio.
+        std::shared_ptr<Texture> svgfSpecHalf;
+
+        // ReSTIR-DI specular SVGF (#154) — flat parallel to the spec fields above. A 4th SvgfDenoiser
+        // instance (DenoiserChannel::DiSpecular) denoises restirDISpec via the SURFACE-MOTION reproject
+        // (direct point-light specular is surface-attached, not a reflection's virtual image — so it reuses
+        // svgf_reproject.slang, not the hit-distance spec variant); svgfDiSpecDenoised feeds pbr.frag Set 3
+        // b8. Same shapes/clears as the GI SVGF. see arch/rendering-pipeline.md
+        std::shared_ptr<Texture> svgfDiSpecDenoised;
+        VkDescriptorSet svgfDiSpecPassthroughDescSet = VK_NULL_HANDLE;
+        std::shared_ptr<Texture> svgfDiSpecColorHist[2];
+        std::shared_ptr<Texture> svgfDiSpecMoments[2];
+        std::shared_ptr<Texture> svgfDiSpecGeom[2];
+        VkDescriptorSet svgfDiSpecReprojectDescSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        std::shared_ptr<Texture> svgfDiSpecAtrous[2];
+        VkDescriptorSet svgfDiSpecMomentsDescSet[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        VkDescriptorSet svgfDiSpecAtrousDescSet[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
         // Path-traced reference mode (rt-renderer C.5). ptAccum = viewport-sized RGBA32F STORAGE — the
         // in-place fp32 progressive running mean, kept GENERAL, only ever touched by the PT megakernel
@@ -322,6 +377,8 @@ namespace Luth
         // (D.1 S3) lands beside the GI SVGF fields above.
         std::shared_ptr<Texture> reflRadiance;
         VkDescriptorSet          reflDescSet = VK_NULL_HANDLE;
+        VkDescriptorSet          reflUpscaleDescSet = VK_NULL_HANDLE;   // half-res reflection bilateral-upscale set
+        u32                      reflHalfCached = ~0u;                  // last-applied halfResolution; drives realloc
     };
 
     // Orchestrates per-frame render-graph assembly and execution. Created by RenderingSystem and
@@ -423,6 +480,10 @@ namespace Luth
         const GeometrySubsystem& GetGeometry() const { return m_Geometry; }
         GTAOSubsystem&           GetGTAO()         { return m_GTAO; }
         const GTAOSubsystem&     GetGTAO()   const { return m_GTAO; }
+        VolumetricSubsystem&         GetVolumetric()        { return m_Volumetric; }
+        const VolumetricSubsystem&   GetVolumetric()  const { return m_Volumetric; }
+        TransparencySubsystem&       GetTransparency()       { return m_Transparency; }
+        const TransparencySubsystem& GetTransparency() const { return m_Transparency; }
         PostProcessSubsystem&       GetPostProcess()       { return m_PostProcess; }
         const PostProcessSubsystem& GetPostProcess() const { return m_PostProcess; }
 
@@ -483,18 +544,21 @@ namespace Luth
         GeometrySubsystem       m_Geometry;
         GTAOSubsystem           m_GTAO;
         VolumetricSubsystem     m_Volumetric;
+        TransparencySubsystem   m_Transparency;
         PostProcessSubsystem    m_PostProcess;
         EditorOverlaysSubsystem m_EditorOverlays;
         DebugDrawSubsystem      m_DebugDraw;
         RtSubsystem             m_Rt;
         RtRestirSubsystem       m_Restir;
         RtRestirGiSubsystem     m_RestirGi;
+        SlangParityGuard        m_SlangParity;   // GLSL vs Slang bindless-SPIR-V parity guard (default-OFF)
         PathTraceSubsystem      m_PathTrace;
         ReflectionsSubsystem    m_Reflections;
         SkinningSubsystem       m_Skinning;
         std::unique_ptr<IDenoiser> m_Denoise;     // DI SVGF; swappable to NRD/RELAX via the settings toggle
         std::unique_ptr<IDenoiser> m_DenoiseGi;   // GI SVGF — second instance (DenoiserChannel::Gi)
         std::unique_ptr<IDenoiser> m_DenoiseRefl; // specular SVGF — third instance (DenoiserChannel::Reflections)
+        std::unique_ptr<IDenoiser> m_DenoiseDiSpec; // ReSTIR-DI specular SVGF — 4th instance (DenoiserChannel::DiSpecular)
 
     public:
         EditorOverlaysSubsystem&       GetEditorOverlays()       { return m_EditorOverlays; }
@@ -517,6 +581,8 @@ namespace Luth
         const IDenoiser&               GetDenoiseGi()      const { return *m_DenoiseGi; }
         IDenoiser&                     GetDenoiseRefl()          { return *m_DenoiseRefl; }
         const IDenoiser&               GetDenoiseRefl()    const { return *m_DenoiseRefl; }
+        IDenoiser&                     GetDenoiseDiSpec()        { return *m_DenoiseDiSpec; }
+        const IDenoiser&               GetDenoiseDiSpec()  const { return *m_DenoiseDiSpec; }
 
     private:
         // ---- Graph snapshot + GPU timers + named-texture registry ----

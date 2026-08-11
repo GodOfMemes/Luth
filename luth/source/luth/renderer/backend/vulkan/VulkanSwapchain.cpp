@@ -1,4 +1,6 @@
 #include "luthpch.h"
+#include <chrono>
+#include <atomic>
 #include "VulkanSwapchain.h"
 #include "VulkanContext.h"
 #include "luth/core/diagnostics/Log.h"
@@ -56,6 +58,7 @@ namespace Luth
 
     void VulkanSwapchain::Recreate(u32 width, u32 height)
     {
+        LH_PROFILE_MESSAGE(("Swapchain recreate " + std::to_string(width) + "x" + std::to_string(height)).c_str());
         vkDeviceWaitIdle(VulkanContext::Get().GetDevice());
         Cleanup();
         CreateSwapchain(width, height);
@@ -65,7 +68,7 @@ namespace Luth
     void VulkanSwapchain::CreateSurface()
     {
         if (glfwCreateWindowSurface(VulkanContext::Get().GetInstance(), (GLFWwindow*)m_WindowHandle, nullptr, &m_Surface) != VK_SUCCESS) {
-            LH_CORE_CRITICAL("Failed to create window surface!");
+            LH_LOG(Renderer, critical, "Failed to create window surface!");
         }
 
         // Surface presentation support is not spec-guaranteed (true on desktop GPUs in practice).
@@ -73,7 +76,7 @@ namespace Luth
         VkBool32 presentSupport = VK_FALSE;
         vkGetPhysicalDeviceSurfaceSupportKHR(ctx.GetPhysicalDevice(), ctx.GetGraphicsFamily(), m_Surface, &presentSupport);
         if (!presentSupport)
-            LH_CORE_CRITICAL("Graphics queue family does not support presentation on this surface");
+            LH_LOG(Renderer, critical, "Graphics queue family does not support presentation on this surface");
     }
 
     void VulkanSwapchain::CreateSwapchain(u32 width, u32 height)
@@ -151,7 +154,7 @@ namespace Luth
         createInfo.oldSwapchain = VK_NULL_HANDLE;
 
         if (vkCreateSwapchainKHR(device, &createInfo, nullptr, &m_Swapchain) != VK_SUCCESS) {
-            LH_CORE_CRITICAL("Failed to create swapchain!");
+            LH_LOG(Renderer, critical, "Failed to create swapchain!");
         }
 
         vkGetSwapchainImagesKHR(device, m_Swapchain, &imageCount, nullptr);
@@ -180,10 +183,16 @@ namespace Luth
             createInfo.subresourceRange.layerCount = 1;
 
             if (vkCreateImageView(VulkanContext::Get().GetDevice(), &createInfo, nullptr, &m_ImageViews[i]) != VK_SUCCESS) {
-                LH_CORE_CRITICAL("Failed to create image views!");
+                LH_LOG(Renderer, critical, "Failed to create image views!");
             }
         }
     }
+
+    // Perf observability: CPU time in the last acquire / present (present-bound signal).
+    static std::atomic<f64> s_LastAcquireMs{ 0.0 };
+    static std::atomic<f64> s_LastPresentMs{ 0.0 };
+    f64 VulkanSwapchain::GetLastAcquireMs() { return s_LastAcquireMs.load(std::memory_order_relaxed); }
+    f64 VulkanSwapchain::GetLastPresentMs() { return s_LastPresentMs.load(std::memory_order_relaxed); }
 
     u32 VulkanSwapchain::AcquireNextImage(VkSemaphore signalSemaphore)
     {
@@ -200,7 +209,9 @@ namespace Luth
         }
 
         uint32_t imageIndex = 0;
+        const auto acqStart = std::chrono::high_resolution_clock::now();
         VkResult result = vkAcquireNextImageKHR(VulkanContext::Get().GetDevice(), m_Swapchain, UINT64_MAX, signalSemaphore, VK_NULL_HANDLE, &imageIndex);
+        s_LastAcquireMs.store(std::chrono::duration<f64, std::milli>(std::chrono::high_resolution_clock::now() - acqStart).count(), std::memory_order_relaxed);
 
         if (result == VK_ERROR_OUT_OF_DATE_KHR)
         {
@@ -211,7 +222,7 @@ namespace Luth
         }
         if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
         {
-            LH_CORE_ERROR("Failed to acquire swap chain image (VkResult={})", (int)result);
+            LH_LOG(Renderer, error, "Failed to acquire swap chain image (VkResult={})", (int)result);
             return UINT32_MAX;
         }
 
@@ -233,7 +244,9 @@ namespace Luth
         presentInfo.pSwapchains = swapChains;
         presentInfo.pImageIndices = &m_CurrentFrameIndex;
 
+        const auto presStart = std::chrono::high_resolution_clock::now();
         VkResult result = VulkanContext::Get().Present(presentInfo);
+        s_LastPresentMs.store(std::chrono::duration<f64, std::milli>(std::chrono::high_resolution_clock::now() - presStart).count(), std::memory_order_relaxed);
 
         // Defer rebuild — Present runs on the render fiber; vkDeviceWaitIdle would stall the worker (V2).
         // Acquire (main thread) consumes the flag. SUBOPTIMAL is benign (cosmetic scaling).
@@ -243,7 +256,7 @@ namespace Luth
         }
         else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
         {
-            LH_CORE_ERROR("Failed to present swapchain image (VkResult={})", (int)result);
+            LH_LOG(Renderer, error, "Failed to present swapchain image (VkResult={})", (int)result);
         }
 
         return result;

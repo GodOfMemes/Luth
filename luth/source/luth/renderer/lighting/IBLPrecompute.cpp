@@ -72,6 +72,8 @@ namespace Luth
     {
         IBLResult Precompute(const std::filesystem::path& hdrPath)
         {
+            LH_PROFILE_FUNCTION();
+
             IBLResult result;
             VkDevice device = VulkanContext::Get().GetDevice();
 
@@ -96,7 +98,7 @@ namespace Luth
             if (!hdrData)
             {
                 if (!hdrPath.empty())
-                    LH_CORE_WARN("IBL: No HDR environment found at '{}'. IBL disabled.", hdrPath.string());
+                    LH_LOG(Renderer, warn, "IBL: No HDR environment found at '{}'. IBL disabled.", hdrPath.string());
                 result.irradianceMap  = std::make_shared<VKTexture>(1, 1, TextureFormat::RGBA16F, 6,
                     VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, 1);
                 result.prefilteredMap = std::make_shared<VKTexture>(1, 1, TextureFormat::RGBA16F, 6,
@@ -105,7 +107,7 @@ namespace Luth
             }
             else
             {
-                LH_CORE_INFO("IBL: Loaded HDR environment {}x{} from '{}'", hdrW, hdrH, hdrPath.string());
+                LH_LOG(Renderer, info, "IBL: Loaded HDR environment {}x{} from '{}'", hdrW, hdrH, hdrPath.string());
 
                 // Local pool sized for the 8 sets used below: equirect (1), irradiance (1),
                 // prefilter mips (5), BRDF LUT (1). Destroyed at the end of this branch — all
@@ -117,6 +119,7 @@ namespace Luth
                 auto hdrStaging = std::make_shared<VKTexture>((u32)hdrW, (u32)hdrH, TextureFormat::RGBA32F,
                     1, 0, 1, VkImageUsageFlags(0));
                 {
+                    LH_PROFILE_SCOPE("UploadHDR");
                     VkDeviceSize imageSize = (VkDeviceSize)hdrW * hdrH * 4 * sizeof(float);
                     VkBuffer stagingBuffer;
                     VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
@@ -157,7 +160,8 @@ namespace Luth
 
                 // ---- 4. Equirect → Cubemap conversion ----
                 {
-                    auto sh = ShaderLibrary::LoadEngine("shaders/equirect_to_cubemap.comp");
+                    LH_PROFILE_SCOPE("EquirectToCubemap");
+                    auto sh = ShaderLibrary::LoadEngine("shaders/equirect_to_cubemap.slang");
                     auto spv = sh ? sh->GetSpirV() : std::vector<u32>{};
 
                     VkDescriptorSetLayoutBinding layoutBindings[2] = {};
@@ -296,11 +300,12 @@ namespace Luth
 
                 // ---- 5. Irradiance convolution (32x32 cubemap) ----
                 {
+                    LH_PROFILE_SCOPE("IrradianceConvolve");
                     const u32 irrSize = 32;
                     result.irradianceMap = std::make_shared<VKTexture>(irrSize, irrSize, TextureFormat::RGBA16F, 6,
                         VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, 1, VK_IMAGE_USAGE_STORAGE_BIT);
 
-                    auto sh = ShaderLibrary::LoadEngine("shaders/irradiance_convolve.comp");
+                    auto sh = ShaderLibrary::LoadEngine("shaders/irradiance_convolve.slang");
                     auto spv = sh ? sh->GetSpirV() : std::vector<u32>{};
 
                     VkDescriptorSetLayoutBinding layoutBindings[2] = {};
@@ -385,12 +390,13 @@ namespace Luth
 
                 // ---- 6. Pre-filtered environment map (128x128, 5 mip levels) ----
                 {
+                    LH_PROFILE_SCOPE("PrefilterEnv");
                     const u32 pfSize = 128;
                     const u32 pfMips = 5;
                     result.prefilteredMap = std::make_shared<VKTexture>(pfSize, pfSize, TextureFormat::RGBA16F, 6,
                         VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, pfMips, VK_IMAGE_USAGE_STORAGE_BIT);
 
-                    auto sh = ShaderLibrary::LoadEngine("shaders/prefilter_env.comp");
+                    auto sh = ShaderLibrary::LoadEngine("shaders/prefilter_env.slang");
                     auto spv = sh ? sh->GetSpirV() : std::vector<u32>{};
 
                     VkDescriptorSetLayoutBinding layoutBindings[2] = {};
@@ -491,11 +497,12 @@ namespace Luth
 
                 // ---- 7. BRDF LUT (512x512, RG16F) ----
                 {
+                    LH_PROFILE_SCOPE("BRDFLut");
                     const u32 lutSize = 512;
                     result.brdfLut = std::make_shared<VKTexture>(lutSize, lutSize, TextureFormat::RG16F, 1, 0, 1,
                         VK_IMAGE_USAGE_STORAGE_BIT);
 
-                    auto sh = ShaderLibrary::LoadEngine("shaders/brdf_lut.comp");
+                    auto sh = ShaderLibrary::LoadEngine("shaders/brdf_lut.slang");
                     auto spv = sh ? sh->GetSpirV() : std::vector<u32>{};
 
                     VkDescriptorSetLayoutBinding layoutBinding = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
@@ -584,15 +591,15 @@ namespace Luth
                 };
                 result.skyboxVB = std::make_shared<VKVertexBuffer>(cubeVertices, sizeof(cubeVertices));
 
-                if (auto sh = ShaderLibrary::LoadEngine("shaders/skybox.vert"))
+                if (auto sh = ShaderLibrary::LoadEngine("shaders/skybox_vert.slang"))
                     result.skyboxVertSpv = sh->GetSpirV();
-                if (auto sh = ShaderLibrary::LoadEngine("shaders/skybox.frag"))
+                if (auto sh = ShaderLibrary::LoadEngine("shaders/skybox.slang"))
                     result.skyboxFragSpv = sh->GetSpirV();
                 if (result.skyboxVertSpv.empty() || result.skyboxFragSpv.empty())
-                    LH_CORE_ERROR("Failed to compile skybox shaders!");
+                    LH_LOG(Renderer, error, "Failed to compile skybox shaders!");
             }
 
-            LH_CORE_INFO("IBL: Precomputation complete (irradiance 32x32, prefiltered 128x128, BRDF LUT 512x512)");
+            LH_LOG(Renderer, info, "IBL: Precomputation complete (irradiance 32x32, prefiltered 128x128, BRDF LUT 512x512)");
             return result;
         }
     }

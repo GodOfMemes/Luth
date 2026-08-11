@@ -5,6 +5,7 @@
 #include "luth/core/diagnostics/Log.h"
 #include "luth/resources/AssetManager.h"
 #include <fstream>
+#include <nlohmann/json.hpp>
 
 namespace Luth
 {
@@ -23,10 +24,14 @@ namespace Luth
 
     std::unordered_map<UUID, u64, UUIDHash> AssetDatabase::s_ArtifactHashes;
 
+    std::unordered_set<UUID, UUIDHash> AssetDatabase::s_SelfWrites;
+    std::mutex AssetDatabase::s_SelfWriteMutex;
+
     // ── Phase 1: Engine-only init (register shaders, fonts) ──
 
     void AssetDatabase::InitEngine(const std::filesystem::path& engineAssetsRoot)
     {
+        LH_PROFILE_FUNCTION();
         std::lock_guard<std::mutex> lock(s_Mutex);
 
         s_EngineAssetsRoot = engineAssetsRoot;
@@ -37,7 +42,7 @@ namespace Luth
 
         if (engineAssetsRoot.empty() || !fs::exists(engineAssetsRoot))
         {
-            LH_CORE_WARN("AssetDatabase: Engine assets root not found: {}", engineAssetsRoot.string());
+            LH_LOG(Assets, warn, "AssetDatabase: Engine assets root not found: {}", engineAssetsRoot.string());
             return;
         }
 
@@ -50,6 +55,15 @@ namespace Luth
 
             AssetType type = FileSystem::ClassifyFileType(path);
             if (type == AssetType::None) continue;
+
+            // Slang modules under common/ + registry/ are pulled in via the compiler's search path, never as
+            // standalone shader assets — skip them so the scan never mints a meta + fails to compile an
+            // entry-less module (e.g. mat_graph_registry, material_bindings_*).
+            if (path.extension() == ".slang")
+            {
+                const std::string parent = path.parent_path().filename().string();
+                if (parent == "common" || parent == "registry") continue;
+            }
 
             UUID uuid = UUID::Invalid();
             fs::path metaPath = path;
@@ -65,7 +79,7 @@ namespace Luth
             if (!uuid.IsValid())
             {
                 uuid = MetaFile::Create(path, type);
-                LH_CORE_INFO("AssetDatabase: Generated meta for engine asset {}", path.filename().string());
+                LH_LOG(Assets, debug, "AssetDatabase: Generated meta for engine asset {}", path.filename().string());
             }
 
             s_Assets[uuid] = { path, type };
@@ -91,13 +105,14 @@ namespace Luth
         // Ensure engine artifact cache directory exists
         fs::create_directories(FileSystem::EnginePath("Library/Artifacts"));
 
-        LH_CORE_INFO("AssetDatabase: Registered {} engine assets", engineAssetCount);
+        LH_LOG(Assets, info, "AssetDatabase: Registered {} engine assets", engineAssetCount);
     }
 
     // ── Phase 2: Load project assets (called when user selects a project) ──
 
     void AssetDatabase::LoadProject(const std::filesystem::path& projectAssetsRoot)
     {
+        LH_PROFILE_FUNCTION();
         std::lock_guard<std::mutex> lock(s_Mutex);
 
         s_ProjectRoot = fs::absolute(projectAssetsRoot).parent_path();
@@ -109,7 +124,7 @@ namespace Luth
 
         if (!fs::exists(projectAssetsRoot))
         {
-            LH_CORE_WARN("AssetDatabase: Project assets root does not exist: {}", projectAssetsRoot.string());
+            LH_LOG(Assets, warn, "AssetDatabase: Project assets root does not exist: {}", projectAssetsRoot.string());
             return;
         }
 
@@ -121,15 +136,18 @@ namespace Luth
         std::vector<fs::path> metaFiles;
         std::vector<fs::path> assetFiles;
 
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(projectAssetsRoot))
         {
-            if (!entry.is_regular_file()) continue;
+            LH_PROFILE_SCOPE("ScanFiles");
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(projectAssetsRoot))
+            {
+                if (!entry.is_regular_file()) continue;
 
-            const auto& path = entry.path();
-            if (path.extension() == ".meta")
-                metaFiles.push_back(path);
-            else
-                assetFiles.push_back(path);
+                const auto& path = entry.path();
+                if (path.extension() == ".meta")
+                    metaFiles.push_back(path);
+                else
+                    assetFiles.push_back(path);
+            }
         }
 
         u32 projectAssetCount = 0;
@@ -150,13 +168,13 @@ namespace Luth
                 if (meta.Load(metaPath))
                     uuid = meta.GetUUID();
                 else
-                    LH_CORE_ERROR("AssetDatabase: Failed to load meta file: {}", metaPath.string());
+                    LH_LOG(Assets, error, "AssetDatabase: Failed to load meta file: {}", metaPath.string());
             }
 
             if (!uuid.IsValid())
             {
                 uuid = MetaFile::Create(path, type);
-                LH_CORE_INFO("AssetDatabase: Generated meta file for {} -> UUID {}", path.filename().string(), uuid.ToString());
+                LH_LOG(Assets, debug, "AssetDatabase: Generated meta file for {} -> UUID {}", path.filename().string(), uuid.ToString());
             }
 
             s_Assets[uuid] = { path, type };
@@ -169,7 +187,7 @@ namespace Luth
                 u64 currentHash = CalculateAssetHash(path, metaPath);
                 if (s_ArtifactHashes[uuid] != currentHash || !fs::exists(GetArtifactPath(uuid)))
                 {
-                    LH_CORE_INFO("AssetDatabase: Re-importing {}", path.filename().string());
+                    LH_LOG(Assets, debug, "AssetDatabase: Re-importing {}", path.filename().string());
                     s_ArtifactHashes[uuid] = currentHash;
                     fs::path artifact = GetArtifactPath(uuid);
                     if (fs::exists(artifact)) fs::remove(artifact);
@@ -185,12 +203,12 @@ namespace Luth
             assetPath.replace_extension("");
             if (!fs::exists(assetPath))
             {
-                LH_CORE_WARN("AssetDatabase: Deleting orphaned meta file: {}", path.filename().string());
+                LH_LOG(Assets, warn, "AssetDatabase: Deleting orphaned meta file: {}", path.filename().string());
                 fs::remove(path);
             }
         }
 
-        LH_CORE_INFO("AssetDatabase: Scanned {} project assets", projectAssetCount);
+        LH_LOG(Assets, info, "AssetDatabase: Scanned {} project assets", projectAssetCount);
         SaveLibraryState_Unlocked();
     }
 
@@ -198,6 +216,7 @@ namespace Luth
 
     void AssetDatabase::UnloadProject()
     {
+        LH_PROFILE_FUNCTION();
         StopWatching();
 
         std::lock_guard<std::mutex> lock(s_Mutex);
@@ -223,7 +242,7 @@ namespace Luth
         s_ArtifactHashes.clear();
         s_ProjectRoot.clear();
 
-        LH_CORE_INFO("AssetDatabase: Project unloaded, {} engine assets remain", s_Assets.size());
+        LH_LOG(Assets, info, "AssetDatabase: Project unloaded, {} engine assets remain", s_Assets.size());
     }
 
     // ── Shutdown ──
@@ -360,17 +379,6 @@ namespace Luth
             mix(static_cast<u64>(fs::last_write_time(meta).time_since_epoch().count()));
         }
 
-        // For .vert shaders, include the companion .frag in the hash so that
-        // cold-start reimport detects when only the .frag changed.
-        if (source.extension() == ".vert") {
-            fs::path fragPath = source;
-            fragPath.replace_extension(".frag");
-            if (fs::exists(fragPath)) {
-                mix(static_cast<u64>(fs::last_write_time(fragPath).time_since_epoch().count()));
-                mix(fs::file_size(fragPath));
-            }
-        }
-
         return hash;
     }
 
@@ -386,27 +394,88 @@ namespace Luth
         return s_Exts.contains(lower);
     }
 
+    // Minimal percent-decode for glTF URIs (handles %20 etc.); leaves malformed escapes intact.
+    static std::string PercentDecode(const std::string& s)
+    {
+        auto hex = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '%' && i + 2 < s.size()) {
+                int hi = hex(s[i + 1]), lo = hex(s[i + 2]);
+                if (hi >= 0 && lo >= 0) { out.push_back(static_cast<char>(hi * 16 + lo)); i += 2; continue; }
+            }
+            out.push_back(s[i]);
+        }
+        return out;
+    }
+
+    // glTF (text .gltf) keeps geometry in a sibling binary buffer named by buffers[].uri; Assimp loads
+    // it directly (not via the texture resolver), so it must sit next to the model or import fails.
+    // Copy each external (non-data:) buffer, preserving its relative subpath under destDir. (.glb
+    // embeds its buffer; .obj/.fbx have no such manifest.)
+    static void CopyGltfBuffers(const fs::path& srcGltf, const fs::path& destDir)
+    {
+        std::ifstream in(srcGltf);
+        if (!in.is_open()) return;
+
+        nlohmann::json gltf;
+        try { in >> gltf; }
+        catch (...) { LH_LOG(Assets, warn, "CopyGltfBuffers: cannot parse {0}", srcGltf.filename().string()); return; }
+
+        if (!gltf.contains("buffers")) return;
+        for (const auto& buf : gltf["buffers"]) {
+            if (!buf.contains("uri") || !buf["uri"].is_string()) continue;
+            std::string uri = buf["uri"].get<std::string>();
+            if (uri.empty() || uri.rfind("data:", 0) == 0) continue; // embedded data URI
+
+            fs::path rel = fs::path(PercentDecode(uri));
+            fs::path src = srcGltf.parent_path() / rel;
+            fs::path dst = destDir / rel;
+            std::error_code ec;
+            if (!fs::exists(src, ec)) {
+                LH_LOG(Assets, warn, "CopyGltfBuffers: referenced buffer missing: {0}", src.string());
+                continue;
+            }
+            fs::create_directories(dst.parent_path(), ec);
+            fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+            if (ec) LH_LOG(Assets, warn, "CopyGltfBuffers: copy failed {0}: {1}", src.string(), ec.message());
+        }
+    }
+
     void AssetDatabase::IngestFile(const fs::path& sourcePath, const fs::path& destDir)
     {
+        LH_PROFILE_FUNCTION();
         try {
             if (!fs::exists(sourcePath)) {
-                LH_CORE_ERROR("IngestFile: source not found: {0}", sourcePath.string());
+                LH_LOG(Assets, error, "IngestFile: source not found: {0}", sourcePath.string());
                 return;
             }
 
             AssetType resType = FileSystem::ClassifyFileType(sourcePath);
             if (resType == AssetType::None) {
-                LH_CORE_WARN("IngestFile: unsupported file type: {0}", sourcePath.string());
+                LH_LOG(Assets, warn, "IngestFile: unsupported file type: {0}", sourcePath.string());
                 return;
             }
 
             fs::path destPath = destDir / sourcePath.filename();
             FileSystem::CreateDirectories(destDir);
             fs::copy_file(sourcePath, destPath, fs::copy_options::overwrite_existing);
-            LH_CORE_INFO("Imported {0} to {1}", sourcePath.filename().string(), destPath.string());
+            LH_LOG(Assets, info, "Imported {0} to {1}", sourcePath.filename().string(), destPath.string());
 
             // For model assets, discover and copy adjacent textures
             if (resType == AssetType::Model) {
+                // glTF references its .bin buffer by relative URI; copy it next to the model first.
+                std::string ext = sourcePath.extension().string();
+                for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+                if (ext == ".gltf")
+                    CopyGltfBuffers(sourcePath, destDir);
+
                 fs::path texDestDir = destDir / (sourcePath.stem().string() + "_Textures");
                 fs::path srcDir = sourcePath.parent_path();
 
@@ -439,7 +508,7 @@ namespace Luth
                     }
                 }
                 if (copiedAny)
-                    LH_CORE_INFO("Copied adjacent textures to {0}", texDestDir.filename().string());
+                    LH_LOG(Assets, info, "Copied adjacent textures to {0}", texDestDir.filename().string());
             }
 
             UUID newUuid = MetaFile::Create(destPath, resType);
@@ -448,13 +517,17 @@ namespace Luth
             if (AssetManager::HasImporter(resType))
                 AssetManager::Import(newUuid);
 
-            LH_CORE_INFO("Created asset {0} with UUID {1}", destPath.filename().string(), newUuid.ToString());
+            LH_LOG(Assets, info, "Created asset {0} with UUID {1}", destPath.filename().string(), newUuid.ToString());
+
+            // Notify subscribers now: pre-registration makes the watcher's later Created event a dedup no-op.
+            for (auto& cb : s_ChangeCallbacks)
+                cb();
         }
         catch (const fs::filesystem_error& err) {
-            LH_CORE_ERROR("IngestFile failed: {0} - {1}", sourcePath.string(), err.what());
+            LH_LOG(Assets, error, "IngestFile failed: {0} - {1}", sourcePath.string(), err.what());
         }
         catch (const std::exception& ex) {
-            LH_CORE_ERROR("IngestFile error: {0} - {1}", sourcePath.string(), ex.what());
+            LH_LOG(Assets, error, "IngestFile error: {0} - {1}", sourcePath.string(), ex.what());
         }
     }
 
@@ -481,7 +554,7 @@ namespace Luth
         });
 
         s_FileWatcher->Start(true);
-        LH_CORE_INFO("AssetDatabase: File watcher started on '{}'", s_ProjectRoot.string());
+        LH_LOG(Assets, info, "AssetDatabase: File watcher started on '{}'", s_ProjectRoot.string());
     }
 
     void AssetDatabase::StopWatching()
@@ -497,8 +570,21 @@ namespace Luth
         s_ChangeCallbacks.push_back(std::move(cb));
     }
 
+    void AssetDatabase::SuppressNextReimport(const UUID& uuid)
+    {
+        std::lock_guard<std::mutex> lock(s_SelfWriteMutex);
+        s_SelfWrites.insert(uuid);
+    }
+
+    bool AssetDatabase::ConsumeSelfWrite(const UUID& uuid)
+    {
+        std::lock_guard<std::mutex> lock(s_SelfWriteMutex);
+        return s_SelfWrites.erase(uuid) > 0;
+    }
+
     void AssetDatabase::ProcessPendingChanges()
     {
+        LH_PROFILE_FUNCTION();
         std::vector<std::pair<fs::path, FileWatcher::FileStatus>> batch;
         {
             std::lock_guard<std::mutex> lock(s_PendingMutex);
@@ -530,7 +616,7 @@ namespace Luth
                         uuid = MetaFile::Create(path, type);
 
                     RegisterAsset_Unlocked(path, uuid, type);
-                    LH_CORE_INFO("AssetDatabase: Hot-added '{}'", path.filename().string());
+                    LH_LOG(Assets, info, "AssetDatabase: Hot-added '{}'", path.filename().string());
 
                     if (AssetManager::HasImporter(type))
                         s_DirtyAssets.push_back(uuid);
@@ -545,6 +631,12 @@ namespace Luth
                     fs::path metaPath = path; metaPath += ".meta";
                     u64 newHash = CalculateAssetHash(path, metaPath);
 
+                    // Editor-originated write (autosave): the in-memory asset is the source of truth; a
+                    // reimport would evict the live instance the inspector edits. Consume BEFORE the
+                    // hash-dedup early-out so a deduped event can't leak the token, and refresh the
+                    // recorded hash so a later genuine external edit still reimports.
+                    if (ConsumeSelfWrite(uuid)) { s_ArtifactHashes[uuid] = newHash; continue; }
+
                     if (s_ArtifactHashes[uuid] == newHash) continue;
                     s_ArtifactHashes[uuid] = newHash;
 
@@ -558,23 +650,8 @@ namespace Luth
                     AssetManager::Evict(uuid);
 
                     s_DirtyAssets.push_back(uuid);
-                    LH_CORE_INFO("AssetDatabase: Hot-modified '{}', queued for reimport", path.filename().string());
+                    LH_LOG(Assets, info, "AssetDatabase: Hot-modified '{}', queued for reimport", path.filename().string());
                     anyChange = true;
-
-                    // If a .frag changed, also mark the paired .vert dirty so its artifact is refreshed
-                    if (path.extension() == ".frag")
-                    {
-                        fs::path vertPath = path;
-                        vertPath.replace_extension(".vert");
-                        UUID vertUuid = GetUUID_Unlocked(vertPath);
-                        if (vertUuid.IsValid())
-                        {
-                            fs::path vertArtifact = GetArtifactPath(vertUuid);
-                            if (fs::exists(vertArtifact)) fs::remove(vertArtifact);
-                            s_DirtyAssets.push_back(vertUuid);
-                            LH_CORE_INFO("AssetDatabase: .frag changed, cascading reimport to paired '{}'", vertPath.filename().string());
-                        }
-                    }
                 }
                 else if (status == FileWatcher::FileStatus::Deleted)
                 {
@@ -588,7 +665,7 @@ namespace Luth
                     if (fs::exists(metaPath)) fs::remove(metaPath);
 
                     UnregisterAsset_Unlocked(uuid);
-                    LH_CORE_INFO("AssetDatabase: Hot-removed '{}'", path.filename().string());
+                    LH_LOG(Assets, info, "AssetDatabase: Hot-removed '{}'", path.filename().string());
                     anyChange = true;
                 }
             }

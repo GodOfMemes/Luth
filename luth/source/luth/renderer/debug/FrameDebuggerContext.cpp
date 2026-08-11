@@ -43,20 +43,20 @@ namespace Luth
         auto& fd = m_Pipeline.GetSystem().GetFrameDebugger();
         if (fd.blitPipeline) return; // Already initialized
 
-        if (auto sh = ShaderLibrary::LoadEngine("shaders/debugBlit.frag"))
+        if (auto sh = ShaderLibrary::LoadEngine("shaders/debugBlit.slang"))
             fd.blitFragSpv = sh->GetSpirV();
-        if (auto sh = ShaderLibrary::LoadEngine("shaders/debugDepth.frag"))
+        if (auto sh = ShaderLibrary::LoadEngine("shaders/debugDepth.slang"))
             fd.depthFragSpv = sh->GetSpirV();
-        if (auto sh = ShaderLibrary::LoadEngine("shaders/debugSlimDecode.frag"))
+        if (auto sh = ShaderLibrary::LoadEngine("shaders/debugSlimDecode.slang"))
             fd.slimDecodeFragSpv = sh->GetSpirV();
-        if (auto sh = ShaderLibrary::LoadEngine("shaders/debugSlimMatID.frag"))
+        if (auto sh = ShaderLibrary::LoadEngine("shaders/debugSlimMatID.slang"))
             fd.slimMatIDFragSpv = sh->GetSpirV();
 
         if (fd.blitFragSpv.empty() || fd.depthFragSpv.empty()
          || fd.slimDecodeFragSpv.empty() || fd.slimMatIDFragSpv.empty()
          || m_Pipeline.GetPostProcess().GetFullscreenVertSpv().empty())
         {
-            LH_CORE_ERROR("Failed to compile debug blit shaders");
+            LH_LOG(Renderer, error, "Failed to compile debug blit shaders");
             return;
         }
 
@@ -414,7 +414,7 @@ namespace Luth
         // Capture the CPU-side data we need by value (the lambda runs inside
         // ImmediateSubmit and must be self-contained).
         VkPolygonMode polyMode = (sys.GetShadeMode() == ShadeMode::Wireframe) ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
-        UUID pbrUUID = ShaderLibrary::Get("pbr.vert")->Handle;
+        UUID pbrUUID = ShaderLibrary::Get("pbr_vert.slang")->Handle;
 
         VulkanContext::Get().ImmediateSubmit([&, this](VkCommandBuffer cmd)
         {
@@ -574,9 +574,9 @@ namespace Luth
                 }
             };
 
-            ReplayBatch(sys.GetDrawList().opaque,      Material::RenderMode::Opaque);
-            ReplayBatch(sys.GetDrawList().cutout,      Material::RenderMode::Cutout);
-            ReplayBatch(sys.GetDrawList().transparent, Material::RenderMode::Transparent);
+            // No transparent batch — the live GeometryPass draws opaque + cutout only.
+            ReplayBatch(sys.GetDrawList().opaque, Material::RenderMode::Opaque);
+            ReplayBatch(sys.GetDrawList().cutout, Material::RenderMode::Cutout);
 
             DynamicRendering::EndRendering(cmd);
 
@@ -808,9 +808,9 @@ namespace Luth
                 }
             };
 
+            // No transparent batch — the live ShadowPass excludes it (RT-excluded tier).
             ReplayBatch(sys.GetDrawList().opaque);
             ReplayBatch(sys.GetDrawList().cutout);
-            ReplayBatch(sys.GetDrawList().transparent);
 
             DynamicRendering::EndRendering(cmd);
 
