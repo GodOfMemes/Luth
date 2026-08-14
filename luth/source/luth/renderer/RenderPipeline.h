@@ -53,6 +53,14 @@ namespace Luth
     struct RenderSnapshot;
     namespace fs = std::filesystem;
 
+
+    /* FIXME:
+       NOTES: For this to work on my laptop I must disable all uses of raytracing,
+        instead of removing or commenting out code that uses raytracing. 
+        I will create a common base named IRenderPipeline and rewrite this to RaytracingRenderPipeline
+    
+    */
+
     // Per-view input to RenderPipeline::Execute. One RenderView per visible viewport. targets is non-owning.
     //
     // viewIndex selects the view's slice of the shared indirect buffer:
