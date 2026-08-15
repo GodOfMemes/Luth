@@ -19,7 +19,7 @@ namespace Luth
     class Renderer
     {
     public:
-        static void Init(void* windowHandle);
+        static void Init(void* windowHandle, RenderFeatures requiredFeatures = RenderFeatures::None);
         static void Shutdown();
 
         // Call before destroying any GPU resources outside the render loop

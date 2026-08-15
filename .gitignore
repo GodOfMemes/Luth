@@ -1,6 +1,9 @@
+.cache/
+
 # Build Artifacts
 bin/
 bin-int/
+build/
 *.exe
 *.lib
 *.dll

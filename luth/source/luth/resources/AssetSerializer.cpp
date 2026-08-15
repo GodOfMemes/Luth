@@ -491,7 +491,7 @@ namespace Luth
         LH_PROFILE_FUNCTION();
         return SerializeAtomic(path, [&](std::ofstream& out) {
             AssetHeader header;
-            header.Version = 2; // V2: single-stage shader asset
+            header.Version = 3; // V3: single-stage shader asset
             header.Type = AssetType::Shader;
             out.write((char*)&header, sizeof(AssetHeader));
 
@@ -518,7 +518,7 @@ namespace Luth
 
         // V2 schema: single-stage shader. V1 artifacts (paired vert+frag) are rejected so they get re-imported
         // under the new schema on first load.
-        if (header.Version != 2) return false;
+        if (header.Version != 3) return false;
 
         ShaderHeader shaderHeader;
         in.read((char*)&shaderHeader, sizeof(ShaderHeader));

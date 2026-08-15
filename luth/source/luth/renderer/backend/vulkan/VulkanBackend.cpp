@@ -9,11 +9,11 @@
 
 namespace Luth
 {
-    void VulkanBackend::Init(void* windowHandle)
+    void VulkanBackend::Init(void* windowHandle, RenderFeatures requiredFeatures)
     {
         LH_PROFILE_FUNCTION();
 
-        VulkanContext::Init(windowHandle);
+        VulkanContext::Init(windowHandle, requiredFeatures);
         PipelineCache::Init();
         m_Swapchain = std::make_unique<VulkanSwapchain>(windowHandle);
         m_Swapchain->Init();

@@ -2,6 +2,7 @@
 
 #include "luth/core/types/LuthTypes.h"
 #include "luth/renderer/QueueRecorders.h"
+#include "luth/renderer/RenderFeatures.h"
 #include <memory>
 
 namespace Luth
@@ -21,7 +22,7 @@ namespace Luth
 
         virtual ~RenderBackend() = default;
 
-        virtual void Init(void* windowHandle) = 0;
+        virtual void Init(void* windowHandle, RenderFeatures requiredFeatures = RenderFeatures::None) = 0;
         virtual void Shutdown() = 0;
 
         // false = skip this frame (caller yields + retries with the same frameIndex).

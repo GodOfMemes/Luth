@@ -13,10 +13,10 @@ namespace Luth
     std::unique_ptr<RenderBackend> Renderer::s_Backend = nullptr;
     FrameData* Renderer::s_FrameData = nullptr;
 
-    void Renderer::Init(void* windowHandle)
+    void Renderer::Init(void* windowHandle, RenderFeatures requiredFeatures)
     {
         s_Backend = RenderBackend::Create();
-        s_Backend->Init(windowHandle);
+        s_Backend->Init(windowHandle, requiredFeatures);
         MaterialSystem::Init();
     }
 

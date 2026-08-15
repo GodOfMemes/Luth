@@ -103,7 +103,7 @@ namespace Luth
 
             slang::CompilerOptionEntry opts[] = {
                 { slang::CompilerOptionName::DebugInformation,
-                  { slang::CompilerOptionValueKind::Int, SLANG_DEBUG_INFO_LEVEL_STANDARD, 0, nullptr, nullptr } },
+                  { slang::CompilerOptionValueKind::Int, SLANG_DEBUG_INFO_LEVEL_NONE/*FIXME: For some reason this doesn't work on my AMD rx6700xt, so disabling this for now STANDARD*/, 0, nullptr, nullptr } },
                 { slang::CompilerOptionName::Optimization,
                   { slang::CompilerOptionValueKind::Int, SLANG_OPTIMIZATION_LEVEL_NONE, 0, nullptr, nullptr } },
                 { slang::CompilerOptionName::VulkanUseEntryPointName,

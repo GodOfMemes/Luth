@@ -18,7 +18,7 @@ namespace Luth
     class VulkanBackend : public RenderBackend
     {
     public:
-        virtual void Init(void* windowHandle) override;
+        virtual void Init(void* windowHandle, RenderFeatures requiredFeatures = RenderFeatures::None) override;
         virtual void Shutdown() override;
 
         virtual bool AcquireImage(u64 frameIndex) override;

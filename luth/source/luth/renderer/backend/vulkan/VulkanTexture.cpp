@@ -188,6 +188,7 @@ namespace Luth
             // TRANSFER_SRC so the frame debugger can vkCmdCopyImage depth attachments into capture archives.
             imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
                             | VK_IMAGE_USAGE_SAMPLED_BIT
+                            | VK_IMAGE_USAGE_TRANSFER_DST_BIT
                             | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         }
         else if (isVolume)
@@ -225,7 +226,7 @@ namespace Luth
                                  && (imageInfo.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
         // Compressed textures upload on the transfer queue then sample on graphics; CONCURRENT makes that
         // cross-family access well-defined (free for BC -- no DCC to preserve).
-        if (isStorage || isSampledDepth || isCompressed)
+        if (!data || isStorage || isSampledDepth || isCompressed)
             VulkanContext::Get().ApplyConcurrentSharing(imageInfo);
 
         m_Allocation = VulkanAllocator::AllocateImage(imageInfo, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, m_Image);

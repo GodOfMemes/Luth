@@ -169,7 +169,7 @@ namespace Luth
         m_Window = Window::Create(ws);
         Input::Init();
 
-        Renderer::Init(m_Window->GetNativeWindow());
+        Renderer::Init(m_Window->GetNativeWindow(), RenderFeatures::RayTracing);
         Renderer::SetFrameData(&m_FrameData);
         ShaderLibrary::Init();
 

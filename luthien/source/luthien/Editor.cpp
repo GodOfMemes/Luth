@@ -181,6 +181,7 @@ namespace Luth
             init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
             init_info.Allocator = nullptr;
             init_info.CheckVkResultFn = nullptr;
+            init_info.MinAllocationSize = 1024ull * 1024ull;
             init_info.UseDynamicRendering = true;
 
             static const VkFormat swapChainFormat = vkRenderer->GetSwapchain().GetImageFormat();
