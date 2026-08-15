@@ -19,12 +19,26 @@
     {
       "name": "windows",
       "displayName": "Windows",
-      "inherits": "defaults"
+      "inherits": "defaults",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "linux",
       "displayName": "Linux",
-      "inherits": "defaults"
+      "inherits": "defaults",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "asan",

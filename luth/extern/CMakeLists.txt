@@ -149,9 +149,8 @@ add_library(bc7enc STATIC source/bc7enc/bc7enc.cpp source/bc7enc/rgbcx.cpp)
 add_library(bc7enc::bc7enc ALIAS bc7enc)
 target_compile_features(bc7enc PUBLIC cxx_std_20)
 target_include_directories(bc7enc PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/source/bc7enc")
-if(MSVC)
-    target_compile_options(bc7enc PRIVATE "$<$<CONFIG:Debug>:/O2>")
-else()
+if(NOT MSVC)
+    # MSVC Debug builds enable /RTC1, which cannot be combined with /O2.
     target_compile_options(bc7enc PRIVATE "$<$<CONFIG:Debug>:-O3>")
 endif()
 
