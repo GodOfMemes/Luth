@@ -5,6 +5,7 @@ on:
     branches: [personal]
   pull_request:
     branches: [personal]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -64,10 +65,7 @@ jobs:
         retention-days: 14
         path: |
           bin/windows-x86_64/Release/Runtime/Luthien.exe
-          bin/windows-x86_64/Release/Runtime/slang-compiler.dll
-          bin/windows-x86_64/Release/Runtime/slang-glslang.dll
-          bin/windows-x86_64/Release/Runtime/slang-glsl-module.dll
-          bin/windows-x86_64/Release/Runtime/slang-rt.dll
+          bin/windows-x86_64/Release/Runtime/slang-*.dll
           bin/windows-x86_64/Release/Luth/Luth.lib
 
     - name: Upload Linux Release artifacts
@@ -78,8 +76,5 @@ jobs:
         retention-days: 14
         path: |
           bin/linux-x86_64/Release/Runtime/Luthien
-          bin/linux-x86_64/Release/Runtime/libslang-compiler.so.0.2026.1.2
-          bin/linux-x86_64/Release/Runtime/libslang-glslang-2026.1.2.so
-          bin/linux-x86_64/Release/Runtime/libslang-glsl-module-2026.1.2.so
-          bin/linux-x86_64/Release/Runtime/libslang-rt.so.0.2026.1.2
+          bin/linux-x86_64/Release/Runtime/libslang-*.so*
           bin/linux-x86_64/Release/Luth/libLuth.a
