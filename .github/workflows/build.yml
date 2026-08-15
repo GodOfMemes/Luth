@@ -2,9 +2,9 @@ name: Build
 
 on:
   push:
-    branches: [feature-linux-support]
+    branches: [personal]
   pull_request:
-    branches: [feature-linux-support]
+    branches: [personal]
 
 jobs:
   build:
@@ -21,78 +21,40 @@ jobs:
       with:
         submodules: recursive
 
-    # No submodule cache: checkout already fetches submodules, and caching
-    # luth/extern/source by .gitmodules hash clobbered vendored in-tree deps
-    # (e.g. imguizmo) with stale copies, reverting committed fixes.
-
-    - name: Setup script permissions
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        chmod +x extern/premake/linux/premake5
-        chmod +x scripts/setup/setup_linux.sh
-        chmod +x scripts/build/build_linux.sh
-
     - name: Install Linux dependencies
       if: matrix.os == 'ubuntu-latest'
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           build-essential \
+          ninja-build \
           xorg-dev \
           libgl1-mesa-dev \
           libvulkan-dev
 
-    - name: Run premake (Windows)
+    - name: Configure Windows
       if: matrix.os == 'windows-latest'
-      shell: cmd
-      run: |
-        cd scripts\setup
-        setup_windows.bat
+      run: cmake --preset windows
 
-    - name: Run premake (Linux)
+    - name: Configure Linux
       if: matrix.os == 'ubuntu-latest'
-      shell: bash
-      run: |
-        cd scripts/setup
-        ./setup_linux.sh
+      run: cmake --preset linux
 
-    - name: Setup MSBuild
+    - name: Build Windows
       if: matrix.os == 'windows-latest'
-      uses: microsoft/setup-msbuild@v1
+      run: cmake --build build/windows --config ${{ matrix.config }} --parallel
 
-    - name: Cache build intermediates (Windows)
-      if: matrix.os == 'windows-latest'
-      uses: actions/cache@v4
-      with:
-        path: bin-int
-        key: build-int-windows-${{ matrix.config }}-${{ hashFiles('**/*.h', '**/*.cpp', '**/*.lua') }}
-        restore-keys: |
-          build-int-windows-${{ matrix.config }}-
-
-    - name: Build ${{ matrix.config }} (Windows)
-      if: matrix.os == 'windows-latest'
-      run: >
-        msbuild Luth.sln
-        /p:Configuration=${{ matrix.config }}
-        /p:Platform=x64
-        /p:WindowsTargetPlatformVersion=10.0
-        /m
-
-    - name: Cache build intermediates (Linux)
+    - name: Build Linux
       if: matrix.os == 'ubuntu-latest'
-      uses: actions/cache@v4
-      with:
-        path: bin-int
-        key: build-int-linux-${{ matrix.config }}-${{ hashFiles('**/*.h', '**/*.cpp', '**/*.lua') }}
-        restore-keys: |
-          build-int-linux-${{ matrix.config }}-
+      run: cmake --build build/linux --config ${{ matrix.config }} --parallel
 
-    - name: Build ${{ matrix.config }} (Linux)
+    - name: Run smoke tests (Windows)
+      if: matrix.os == 'windows-latest'
+      run: ctest --test-dir build/windows -C ${{ matrix.config }} -L smoke --output-on-failure
+
+    - name: Run smoke tests (Linux)
       if: matrix.os == 'ubuntu-latest'
-      run: |
-        CONFIG=$(echo "${{ matrix.config }}" | tr '[:upper:]' '[:lower:]')
-        cd scripts/build
-        ./build_linux.sh -j$(nproc) config=$CONFIG
+      run: ctest --test-dir build/linux -C ${{ matrix.config }} -L smoke --output-on-failure
 
     - name: Upload Release artifacts
       if: matrix.os == 'windows-latest' && matrix.config == 'Release'
@@ -102,5 +64,22 @@ jobs:
         retention-days: 14
         path: |
           bin/windows-x86_64/Release/Runtime/Luthien.exe
-          bin/windows-x86_64/Release/Runtime/shaderc_shared.dll
+          bin/windows-x86_64/Release/Runtime/slang-compiler.dll
+          bin/windows-x86_64/Release/Runtime/slang-glslang.dll
+          bin/windows-x86_64/Release/Runtime/slang-glsl-module.dll
+          bin/windows-x86_64/Release/Runtime/slang-rt.dll
           bin/windows-x86_64/Release/Luth/Luth.lib
+
+    - name: Upload Linux Release artifacts
+      if: matrix.os == 'ubuntu-latest' && matrix.config == 'Release'
+      uses: actions/upload-artifact@v4
+      with:
+        name: luth-release-linux-x64
+        retention-days: 14
+        path: |
+          bin/linux-x86_64/Release/Runtime/Luthien
+          bin/linux-x86_64/Release/Runtime/libslang-compiler.so.0.2026.1.2
+          bin/linux-x86_64/Release/Runtime/libslang-glslang-2026.1.2.so
+          bin/linux-x86_64/Release/Runtime/libslang-glsl-module-2026.1.2.so
+          bin/linux-x86_64/Release/Runtime/libslang-rt.so.0.2026.1.2
+          bin/linux-x86_64/Release/Luth/libLuth.a
