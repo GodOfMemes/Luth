@@ -40,6 +40,11 @@ jobs:
           libgl1-mesa-dev \
           libvulkan-dev
 
+    - uses: TheMrMilchmann/setup-msvc-dev@v4
+      if: matrix.os == 'windows-latest'
+      with:
+        arch: x64
+
     - name: Configure Windows
       if: matrix.os == 'windows-latest'
       run: cmake --preset windows
