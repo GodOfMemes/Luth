@@ -62,3 +62,5 @@ docs/development/epics/*.md
 compile_commands.json
 # Per-effort dev history (local devlog source)
 docs/development/history/
+
+!luth/extern/source/slang/lib/**

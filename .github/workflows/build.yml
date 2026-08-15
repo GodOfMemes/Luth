@@ -11,7 +11,8 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        #os: [windows-latest, ubuntu-latest]
+        os: [windows-latest]
         config: [Debug, Release, Dist]
 
     runs-on: ${{ matrix.os }}
@@ -40,8 +41,7 @@ jobs:
           libgl1-mesa-dev \
           libvulkan-dev
 
-    - uses: TheMrMilchmann/setup-msvc-dev@v4
-      if: matrix.os == 'windows-latest'
+    - uses: TheMrMilchmann/setup-msvc-dev@v4.1.0
       with:
         arch: x64
 
